@@ -666,6 +666,7 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
                 modeli->setStateFrequency (tree->aln->site_state_freq[i]);
 
             modeli->init(FREQ_USER_DEFINED);
+            modeli->normalize_matrix = false; // do not normalize rate matrix
             models->push_back(modeli);
         }
         delete [] rates;

@@ -887,6 +887,8 @@ ModelProtein::ModelProtein(const char *model_name, string model_params, StateFre
 }
 
 void rescaleRates(double *rates, int nrates) {
+    return; // no rescaling so unnormalized rates can be used. I also doubt that is the the correct way to deal with potential numerical issues.
+
     int i;
 
     double max_rate = 0.0;
