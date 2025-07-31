@@ -474,26 +474,21 @@ EigenDecomposition::~EigenDecomposition()
 {
 }
 
-/* make rate matrix with 0.01 expected substitutions per unit time */
+/* make rate matrix with `total_num_subst` expected substitutions per unit time */
 void EigenDecomposition::computeRateMatrix(double **a, double *stateFrqArr_, int num_state) {
 	
-/*
-	if (myrate.isNsSyHeterogenous())
-		return;
-*/
-	int i, j;
 	double delta, temp, sum;
 	double *m = new double[num_state];
 
 	if (!ignore_state_freq)
-	for (i = 0; i < num_state; i++) {
-		for (j = 0; j < num_state; j++) {
+	for (int i = 0; i < num_state; i++) {
+		for (int j = 0; j < num_state; j++) {
 			a[i][j] = stateFrqArr_[j]*a[i][j];
 		}
 	}
 
-	for (i = 0, sum = 0.0; i < num_state; i++) {
-		for (j = 0, temp = 0.0; j < num_state; j++)
+	for (int i = 0, sum = 0.0; i < num_state; i++) {
+		for (int j = 0, temp = 0.0; j < num_state; j++)
             if (j != i)
 			temp += a[i][j];
 		m[i] = temp; /* row sum */
@@ -501,10 +496,10 @@ void EigenDecomposition::computeRateMatrix(double **a, double *stateFrqArr_, int
 	}
 
 	if (normalize_matrix) {
-		delta = total_num_subst / sum; /* 0.01 subst. per unit time */
+		delta = total_num_subst / sum; /* `total_num_subst` subst. per unit time */
 
-		for (i = 0; i < num_state; i++) {
-			for (j = 0; j < num_state; j++) {
+		for (int i = 0; i < num_state; i++) {
+			for (int j = 0; j < num_state; j++) {
 				if (i != j)
 					a[i][j] = delta * a[i][j];
 				else
@@ -512,11 +507,11 @@ void EigenDecomposition::computeRateMatrix(double **a, double *stateFrqArr_, int
 			}
 		}
 	} else {
-		for (i = 0; i < num_state; i++)
+		for (int i = 0; i < num_state; i++)
 			a[i][i] = -m[i];
 	}
 	delete [] m;
-} /* onepamratematrix */
+}
 
 void EigenDecomposition::eliminateZero(double **mat, double *forg, int num, 
 	double **new_mat, double *new_forg, int &new_num) {
