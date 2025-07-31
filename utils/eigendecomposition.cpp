@@ -474,7 +474,9 @@ EigenDecomposition::~EigenDecomposition()
 {
 }
 
-/* make rate matrix with `total_num_subst` expected substitutions per unit time */
+/* make rate matrix with `total_num_subst` expected substitutions per unit time.
+   In case normalize_matrix = false, the rate matrix is not normalized
+*/
 void EigenDecomposition::computeRateMatrix(double **a, double *stateFrqArr_, int num_state) {
 	
 	double delta, temp, sum;
