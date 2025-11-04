@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <iostream>
+#include <chrono>
 #include "lbfgsb/lbfgsb_new.h"
 #include "tools.h"
 
@@ -748,6 +749,7 @@ bool Optimization::restartParameters(double guess[], int ndim, double lower[], d
 }
 
 double Optimization::minimizeMultiDimen(double guess[], int ndim, double lower[], double upper[], bool bound_check[], double gtol, double *hessian) {
+	cout << "Starting BFGS optimization\n";
     int i, iter;
     double fret, minf = 1e+12;
     double *minx = new double [ndim+1];
@@ -918,6 +920,7 @@ double Optimization::derivativeFunk(double x[], double dfx[]) {
 	if (!checkRange(x))
 		return INFINITIVE;
 	*/
+	auto start = chrono::steady_clock::now();
 	int ndim = getNDim();
 	double *h = new double[ndim+1];
     double temp;
@@ -935,6 +938,13 @@ double Optimization::derivativeFunk(double x[], double dfx[]) {
 	for (dim = 1; dim <= ndim; dim++ )
         dfx[dim] = (dfx[dim] - fx) / h[dim];
     delete [] h;
+
+	auto end = chrono::steady_clock::now();
+	
+	cout << "GradientTime="
+		 << chrono::duration_cast<chrono::microseconds>(end - start).count()
+		 << "\n";
+
 	return fx;
 }
 
