@@ -20,6 +20,7 @@
 #include "modelgtr.h"
 #include <stdlib.h>
 #include <string.h>
+#include <set>
 
 //const double MIN_FREQ_RATIO = MIN_FREQUENCY;
 //const double MAX_FREQ_RATIO = 1.0/MIN_FREQUENCY;
@@ -815,7 +816,12 @@ void ModelGTR::readParameters(const char *file_name) {
 		if (in.fail()) {
 			outError("Invalid model name ", file_name);
         }
-		cout << "Reading model parameters from file " << file_name << endl;
+		// Make sure the file reading message is only printed once per file
+		static std::set<std::string> logged_files;
+		const std::string param_file(file_name);
+		if (logged_files.insert(param_file).second) {
+			cout << "Reading model parameters from file " << file_name << endl;
+		}
 		readRates(in);
 		readStateFreq(in);
 		in.close();

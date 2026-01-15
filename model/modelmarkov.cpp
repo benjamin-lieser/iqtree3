@@ -20,6 +20,7 @@
 #include "modelmarkov.h"
 #include <stdlib.h>
 #include <string.h>
+#include <set>
 #include "modelliemarkov.h"
 #include "modelunrest.h"
 
@@ -1799,7 +1800,12 @@ void ModelMarkov::readParameters(const char *file_name, bool adapt_tree) {
     if (!fileExists(file_name))
         outError("File not found ", file_name);
 
-    cout << "Reading model parameters from file " << file_name << endl;
+    // Make sure the file reading message is only printed once per file
+    static std::set<std::string> logged_files;
+    const std::string param_file(file_name);
+    if (logged_files.insert(param_file).second) {
+        cout << "Reading model parameters from file " << file_name << endl;
+    }
 
     // if detect if reading full matrix or half matrix by the first entry
 	try {
