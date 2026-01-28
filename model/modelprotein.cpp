@@ -945,12 +945,12 @@ void ModelProtein::init(const char *model_name, string model_params, StateFreqTy
             size_t num_params = std::count(model_params.begin(), model_params.end(), separator) + 1;
             
             // validate the number of params
-            if (num_params != 189 && num_params != 379)
-                outError("The number of model parameters of a protein model should be 189 (for revesible model) or 379 (for non-revesible model)!");
+            if (num_params != 190 && num_params != 379)
+                outError("The number of model parameters of a protein model should be 190 (for revesible model) or 379 (for non-revesible model)!");
             
             // validate GTR20
-            if (name_upper == "GTR20" && num_params != 189)
-                outError("The GTR20 requires 189 parameters. Please check and try again!");
+            if (name_upper == "GTR20" && num_params != 190)
+                outError("The GTR20 requires 190 parameters. Please check and try again!");
             
             // validate NONREV
             if (name_upper == "NONREV" && num_params != 379)
@@ -959,10 +959,6 @@ void ModelProtein::init(const char *model_name, string model_params, StateFreqTy
             // ----- CONVERT INPUT PARAMS (VIA COMMAND LINE) INTO NEXUS FORMAT -----------
             // replace separator by space
             std::replace(model_params.begin(), model_params.end(), separator, ' ');
-            
-            // if the user specify a reversible model -> add " 1" to provide 190 params as the model specified in a NEXUS file
-            if (num_params == 189)
-                model_params += " 1";
             
             // add dummy state freqs
             string tmp_freq = " "+convertDoubleToString(1.0/num_states);
@@ -974,11 +970,11 @@ void ModelProtein::init(const char *model_name, string model_params, StateFreqTy
         }
         
         readParametersString(model_params);
-        rescaleRates(rates, getNumRateEntries());
+        this->normalize_matrix = false; // since user provides the rates, do not normalize again
         num_params = 0;
     } else if (name_upper == "GTR20") {
         if (!Params::getInstance().link_model) {
-            outWarning("GTR20 model will estimate 189 substitution rates that might be overfitting!");
+            outWarning("GTR20 model will estimate 190 substitution rates that might be overfitting!");
             outWarning("Please only use GTR20 with very large data and always test for model fit!");
         }
         if (freq == FREQ_UNKNOWN)
