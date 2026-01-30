@@ -149,15 +149,14 @@ void Alignment::checkAbsentStates(string msg) {
     delete [] state_freqs;
     if (absent_cnt == num_states)
         outError("Only gaps observed in " + msg);
-    // if (absent_cnt == num_states - 1)
-    //     outWarning("Only one state observed in " + msg);
-    // COMMENTED OUT: partition-specific messages
-    // if (absent_cnt > 0)
-    //     outWarning(convertIntToString(absent_cnt) + " states (see below) not observed in " + msg);
-    // if (!absent_states.empty())
-    //     outWarning("State(s) " + absent_states + " not present in " + msg + " and may cause numerical problems");
-    // if (!rare_states.empty())
-    //     outWarning("State(s) " + rare_states + " rarely appear in " + msg + " and may cause numerical problems");
+    if (absent_cnt == num_states - 1)
+        outWarning("Only one state observed in " + msg);
+    if (absent_cnt > 0)
+        outWarning(convertIntToString(absent_cnt) + " states (see below) not observed in " + msg);
+    if (!absent_states.empty())
+        outWarning("State(s) " + absent_states + " not present in " + msg + " and may cause numerical problems");
+    if (!rare_states.empty())
+        outWarning("State(s) " + rare_states + " rarely appear in " + msg + " and may cause numerical problems");
 }
 
 void Alignment::checkSeqName() {
