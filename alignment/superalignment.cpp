@@ -143,27 +143,30 @@ void SuperAlignment::readFromParams(Params &params) {
     // if AliSim is activated without an input alignment -> just shows "Subset\tType\tModel\tName
     if (Params::getInstance().alisim_active && !Params::getInstance().alisim_inference_mode)
     {
-        cout << "Subset\tType\tModel\tName" << endl;
-        int part = 0;
-        for (auto it = partitions.begin(); it != partitions.end(); it++, part++) {
-            cout << part+1 << "\t" << (*it)->sequence_type << "\t" << (*it)->model_name << "\t" << (*it)->name << endl;
-        }
+        // COMMENTED OUT: partition-specific messages
+        // cout << "Subset\tType\tModel\tName" << endl;
+        // int part = 0;
+        // for (auto it = partitions.begin(); it != partitions.end(); it++, part++) {
+        //     cout << part+1 << "\t" << (*it)->sequence_type << "\t" << (*it)->model_name << "\t" << (*it)->name << endl;
+        // }
     }
     else {
     // Initialize the counter for evaluated NNIs on subtrees
-    cout << "Subset\tType\tSeqs\tSites\tInfor\tInvar\tModel\tName" << endl;
-    int part = 0;
-    for (auto it = partitions.begin(); it != partitions.end(); it++, part++) {
-        cout << part+1 << "\t" << (*it)->sequence_type << "\t" << (*it)->getNSeq()
-        << "\t" << (*it)->getNSite() << "\t" << (*it)->num_informative_sites
-        << "\t" << (*it)->getNSite()-(*it)->num_variant_sites << "\t"
-        << (*it)->model_name << "\t" << (*it)->name << endl;
-        if ((*it)->num_variant_sites == 0) {
-            outWarning("No variant sites in partition " + (*it)->name);
-        } else if ((*it)->num_informative_sites == 0) {
-            outWarning("No parsimony-informative sites in partition " + (*it)->name);
-        }
-    }}
+    // COMMENTED OUT: partition-specific messages
+    // cout << "Subset\tType\tSeqs\tSites\tInfor\tInvar\tModel\tName" << endl;
+    // int part = 0;
+    // for (auto it = partitions.begin(); it != partitions.end(); it++, part++) {
+    //     cout << part+1 << "\t" << (*it)->sequence_type << "\t" << (*it)->getNSeq()
+    //     << "\t" << (*it)->getNSite() << "\t" << (*it)->num_informative_sites
+    //     << "\t" << (*it)->getNSite()-(*it)->num_variant_sites << "\t"
+    //     << (*it)->model_name << "\t" << (*it)->name << endl;
+    //     if ((*it)->num_variant_sites == 0) {
+    //         outWarning("No variant sites in partition " + (*it)->name);
+    //     } else if ((*it)->num_informative_sites == 0) {
+    //         outWarning("No parsimony-informative sites in partition " + (*it)->name);
+    //     }
+    // }
+    }
 }
 
 void SuperAlignment::init(StrVector *sequence_names) {

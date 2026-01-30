@@ -94,7 +94,8 @@ double PartitionModelPlen::optimizeParameters(int fixed_len, bool write_info, do
 //    }
     tree_lh = tree->computeLikelihood();
     
-    cout<<"Initial log-likelihood: "<<tree_lh<<endl;
+    // COMMENTED OUT: partition-specific message
+    // cout<<"Initial log-likelihood: "<<tree_lh<<endl;
     double begin_time = getRealTime();
     int i;
     for(i = 1; i < tree->params->num_param_iterations; i++){
@@ -136,8 +137,9 @@ double PartitionModelPlen::optimizeParameters(int fixed_len, bool write_info, do
             cur_lh = new_cur_lh;
         }
 
-        if (verbose_mode >= VB_MED)
-            cout << "LnL after optimizing individual models: " << cur_lh << endl;
+        // COMMENTED OUT: partition-specific message
+        // if (verbose_mode >= VB_MED)
+        //     cout << "LnL after optimizing individual models: " << cur_lh << endl;
         if (cur_lh <= tree_lh - 1.0) {
             // more info for ASSERTION
             writeInfo(cout);
@@ -149,10 +151,11 @@ double PartitionModelPlen::optimizeParameters(int fixed_len, bool write_info, do
         // Optimizing gene rate
         if(!tree->fixed_rates){
             cur_lh = optimizeGeneRate(gradient_epsilon);
-            if (verbose_mode >= VB_MED) {
-                cout << "LnL after optimizing partition-specific rates: " << cur_lh << endl;
-                writeInfo(cout);
-            }
+            // COMMENTED OUT: partition-specific message
+            // if (verbose_mode >= VB_MED) {
+            //     cout << "LnL after optimizing partition-specific rates: " << cur_lh << endl;
+            //     writeInfo(cout);
+            // }
             ASSERT(cur_lh > tree_lh - 1.0 && "partition rate opt reduces LnL");
         }
         
@@ -169,7 +172,8 @@ double PartitionModelPlen::optimizeParameters(int fixed_len, bool write_info, do
             ASSERT(new_lh > cur_lh - 1.0);
             cur_lh = new_lh;
         }
-        cout<<"Current log-likelihood at step "<<i<<": "<<cur_lh<<endl;
+        // COMMENTED OUT: partition-specific message
+        // cout<<"Current log-likelihood at step "<<i<<": "<<cur_lh<<endl;
         if(fabs(cur_lh-tree_lh) < logl_epsilon) {
             tree_lh = cur_lh;
             break;
@@ -179,16 +183,18 @@ double PartitionModelPlen::optimizeParameters(int fixed_len, bool write_info, do
         tree_lh = cur_lh;
     }
     //    cout <<"OPTIMIZE MODEL has finished"<< endl;
-    if (write_info)
-        writeInfo(cout);
+    // COMMENTED OUT: partition-specific messages
+    // if (write_info)
+    //     writeInfo(cout);
 
     // write linked_models
-    if (verbose_mode <= VB_MIN && write_info) {
-        for (auto it = linked_models.begin(); it != linked_models.end(); it++)
-            it->second->writeInfo(cout);
-    }
+    // if (verbose_mode <= VB_MIN && write_info) {
+    //     for (auto it = linked_models.begin(); it != linked_models.end(); it++)
+    //         it->second->writeInfo(cout);
+    // }
 
-    cout << "Parameters optimization took " << i-1 << " rounds (" << getRealTime()-begin_time << " sec)" << endl << endl;
+    // COMMENTED OUT: partition-specific message
+    // cout << "Parameters optimization took " << i-1 << " rounds (" << getRealTime()-begin_time << " sec)" << endl << endl;
     
     return tree_lh;
 }

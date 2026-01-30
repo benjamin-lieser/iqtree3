@@ -1789,7 +1789,8 @@ void ModelMarkov::readStateFreq(string str) noexcept(false) {
         outError("Sum of all state frequencies must be greater than zero!");
 	if (fabs(sum-1.0) >= 1e-7)
     {
-        outWarning("Normalizing State frequencies so that sum of them equals to 1");
+        // COMMENTED OUT: partition-specific message
+        // outWarning("Normalizing State frequencies so that sum of them equals to 1");
         sum = 1.0/sum;
         for (i = 0; i < num_states; i++)
             state_freq[i] *= sum;

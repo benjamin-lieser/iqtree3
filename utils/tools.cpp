@@ -787,8 +787,9 @@ void normalize_frequencies(double* freqs, int num_states, double total_freqs, bo
     if (fabs(total_freqs-1.0) >= 1e-7)
     {
         total_freqs = 1/total_freqs;
-        if (show_warning)
-            outWarning("Normalizing state frequencies so that sum of them equals to 1");
+        // COMMENTED OUT: partition-specific message
+        // if (show_warning)
+        //     outWarning("Normalizing state frequencies so that sum of them equals to 1");
         for (int i = 0; i < num_states; i++)
             freqs[i] *= total_freqs;
     }

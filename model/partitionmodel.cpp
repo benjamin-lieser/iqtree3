@@ -140,7 +140,8 @@ PartitionModel::PartitionModel(Params &params, PhyloSuperTree *tree, ModelsBlock
                 }
             }
         }
-        cout << "Linking " << mit->first << " model across " << num_parts << " partitions" << endl;
+        // COMMENTED OUT: partition-specific message
+        // cout << "Linking " << mit->first << " model across " << num_parts << " partitions" << endl;
         int nstates = mit->second->num_states;
         double sum_state_freq[nstates];
         // convert counts to frequencies
@@ -151,12 +152,13 @@ PartitionModel::PartitionModel(Params &params, PhyloSuperTree *tree, ModelsBlock
             }
         }
 
-        cout << "Mean state frequencies:";
-        int prec = cout.precision(8);
-        for (int state = 0; state < mit->second->num_states; state++)
-            cout << " " << sum_state_freq[state];
-        cout << endl;
-        cout.precision(prec);
+        // COMMENTED OUT: partition-specific messages
+        // cout << "Mean state frequencies:";
+        // int prec = cout.precision(8);
+        // for (int state = 0; state < mit->second->num_states; state++)
+        //     cout << " " << sum_state_freq[state];
+        // cout << endl;
+        // cout.precision(prec);
 
         for (it = stree->begin(); it != stree->end(); it++)
             if ((*it)->getModel()->getName() == mit->second->getName()) {
@@ -275,18 +277,20 @@ double PartitionModel::computeFunction(double shape) {
 }
 
 double PartitionModel::optimizeLinkedAlpha(bool write_info, double gradient_epsilon) {
-    if (write_info) {
-        cout << "Optimizing linked gamma shape..." << endl;
-    }
+    // COMMENTED OUT: partition-specific message
+    // if (write_info) {
+    //     cout << "Optimizing linked gamma shape..." << endl;
+    // }
 	double negative_lh;
 	double current_shape = linked_alpha;
 	double ferror, optx;
 	optx = minimizeOneDimen(site_rate->getTree()->params->min_gamma_shape, current_shape, MAX_GAMMA_SHAPE, max(gradient_epsilon, TOL_GAMMA_SHAPE), &negative_lh, &ferror);
     double tree_lh = site_rate->getTree()->computeLikelihood();
-    if (write_info) {
-        cout << "Linked alpha across partitions: " << linked_alpha << endl;
-        cout << "Linked alpha log-likelihood: " << tree_lh << endl;
-    }
+    // COMMENTED OUT: partition-specific messages
+    // if (write_info) {
+    //     cout << "Linked alpha across partitions: " << linked_alpha << endl;
+    //     cout << "Linked alpha log-likelihood: " << tree_lh << endl;
+    // }
 	return tree_lh;
     
 }
@@ -662,11 +666,13 @@ double PartitionModel::optimizeLinkedModel(bool write_info, double gradient_epsi
     // return if nothing to be optimized
     if (ndim == 0) return 0.0;
     
-    if (write_info)
-        cout << "Optimizing linked " << model->getName() << " parameters across all partitions (" << ndim << " free parameters)" << endl;
+    // COMMENTED OUT: partition-specific message
+    // if (write_info)
+    //     cout << "Optimizing linked " << model->getName() << " parameters across all partitions (\" << ndim << \" free parameters)\" << endl;
     
-    if (verbose_mode >= VB_MAX)
-        cout << "Optimizing " << model->name << " model parameters..." << endl;
+    // COMMENTED OUT: partition-specific message
+    // if (verbose_mode >= VB_MAX)
+    //     cout << \"Optimizing \" << model->name << \" model parameters...\" << endl;
     
     //if (freq_type == FREQ_ESTIMATE) scaleStateFreq(false);
     
@@ -814,24 +820,26 @@ double PartitionModel::optimizeParameters(int fixed_len, bool write_info, double
                                                                                   logl_epsilon/min(ntrees,10), gradient_epsilon/min(ntrees,10));
             }
             tree_lh += score;
-            if (write_info)
-#ifdef _OPENMP
-#pragma omp critical
-#endif
-            {
-                cout << "Partition " << tree->at(part)->aln->name
-                << " / Model: " << tree->at(part)->getModelName()
-                << " / df: " << tree->at(part)->getModelFactory()->getNParameters(fixed_len)
-                << " / LogL: " << score << endl;
-            }
+            // COMMENTED OUT: partition-specific message
+            // if (write_info)
+// #ifdef _OPENMP
+// #pragma omp critical
+// #endif
+            // {
+            //     cout << \"Partition \" << tree->at(part)->aln->name
+            //     << \" / Model: \" << tree->at(part)->getModelName()
+            //     << \" / df: \" << tree->at(part)->getModelFactory()->getNParameters(fixed_len)
+            //     << \" / LogL: \" << score << endl;
+            // }
         }
         //return ModelFactory::optimizeParameters(fixed_len, write_info);
         
         if (!isLinkedModel())
             break;
 
-        if (verbose_mode >= VB_MED || write_info)
-            cout << step+1 << ". Log-likelihood: " << tree_lh << endl;
+        // COMMENTED OUT: partition-specific message
+        // if (verbose_mode >= VB_MED || write_info)
+        //     cout << step+1 << \". Log-likelihood: \" << tree_lh << endl;
 
         // optimize linked alpha
         if (tree->params->link_alpha) {
@@ -845,21 +853,24 @@ double PartitionModel::optimizeParameters(int fixed_len, bool write_info, double
             tree_lh = new_tree_lh;
         }
         
-        if (verbose_mode >= VB_MED || write_info)
-            cout << step+1 << ". Log-likelihood: " << tree_lh << endl;
+        // COMMENTED OUT: partition-specific message
+        // if (verbose_mode >= VB_MED || write_info)
+        //     cout << step+1 << \". Log-likelihood: \" << tree_lh << endl;
 
         if (tree_lh-logl_epsilon*10 < prev_tree_lh)
             break;
         prev_tree_lh = tree_lh;
     }
     
-    if (verbose_mode >= VB_MED || write_info)
-		cout << "Optimal log-likelihood: " << tree_lh << endl;
+    // COMMENTED OUT: partition-specific message
+    // if (verbose_mode >= VB_MED || write_info)
+	// 	cout << \"Optimal log-likelihood: \" << tree_lh << endl;
     // write linked_models
-    if (verbose_mode <= VB_MIN && write_info) {
-        for (auto it = linked_models.begin(); it != linked_models.end(); it++)
-            it->second->writeInfo(cout);
-    }
+    // COMMENTED OUT: partition-specific message
+    // if (verbose_mode <= VB_MIN && write_info) {
+    //     for (auto it = linked_models.begin(); it != linked_models.end(); it++)
+    //         it->second->writeInfo(cout);
+    // }
     return tree_lh;
 }
 

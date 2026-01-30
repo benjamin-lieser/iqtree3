@@ -172,8 +172,9 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
         else if (tree->aln->seq_type == SEQ_POMO) model_str = "HKY+P";
         else model_str = "JC";
         // if (tree->aln->seq_type != SEQ_POMO && !params.model_joint)
-        if (tree->aln->seq_type != SEQ_POMO && params.model_joint.empty())
-            outWarning("Default model "+model_str + " may be under-fitting. Use option '-m TEST' to determine the best-fit model.");
+        // COMMENTED OUT: partition-specific message
+        // if (tree->aln->seq_type != SEQ_POMO && params.model_joint.empty())
+        //     outWarning("Default model "+model_str + " may be under-fitting. Use option '-m TEST' to determine the best-fit model.");
     }
     // handle continuous gamma model => remove 'C' from model_name to make sure it doesn't cause error when parsing model
     if (model_str.find("+GC") != std::string::npos) {
@@ -201,8 +202,9 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
             break;
         mix_pos = next_mix_pos;
     }
-    if (new_model_str != model_str)
-        cout << "Model " << model_str << " is alias for " << new_model_str << endl;
+    // COMMENTED OUT: partition-specific message
+    // if (new_model_str != model_str)
+    //     cout << "Model " << model_str << " is alias for " << new_model_str << endl;
     model_str = new_model_str;
 
     // for model_joint if set
@@ -221,8 +223,9 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
                 break;
             mix_pos = next_mix_pos;
         }
-        if (new_model_str != curr_model_str)
-            cout << "Model " << curr_model_str << " is alias for " << new_model_str << endl;
+        // COMMENTED OUT: partition-specific message
+        // if (new_model_str != curr_model_str)
+        //     cout << "Model " << curr_model_str << " is alias for " << new_model_str << endl;
         Params::getInstance().model_joint = new_model_str;
     }
 
@@ -704,7 +707,8 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
                      " parsimony-uninformative sites in the alignment");
         }
         if (verbose_mode >= VB_MED)
-            cout << "Ascertainment bias correction: " << unobserved_ptns.size() << " unobservable uninformative patterns"<< endl;
+            // COMMENTED OUT: partition-specific message
+            // cout << "Ascertainment bias correction: " << unobserved_ptns.size() << " unobservable uninformative patterns"<< endl;
         rate_str = rate_str.substr(0, posasc) + rate_str.substr(posasc+8);
     } else if ((posasc = rate_str.find("+ASC_MIS")) != string::npos) {
         // initialize Holder's ascertainment bias correction model
@@ -722,7 +726,8 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
                      " invariant sites in the alignment");
         }
         if (verbose_mode >= VB_MED)
-            cout << "Holder's ascertainment bias correction: " << unobserved_ptns.size() << " unobservable constant patterns" << endl;
+            // COMMENTED OUT: partition-specific message
+            // cout << "Holder's ascertainment bias correction: " << unobserved_ptns.size() << " unobservable constant patterns" << endl;
         rate_str = rate_str.substr(0, posasc) + rate_str.substr(posasc+8);
     } else if ((posasc = rate_str.find("+ASC")) != string::npos) {
         // ascertainment bias correction
@@ -756,7 +761,8 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
                 " invariant sites in the alignment");
         }
         if (verbose_mode >= VB_MED)
-            cout << "Ascertainment bias correction: " << unobserved_ptns.size() << " unobservable constant patterns"<< endl;
+            // COMMENTED OUT: partition-specific message
+            // cout << "Ascertainment bias correction: " << unobserved_ptns.size() << " unobservable constant patterns"<< endl;
 		rate_str = rate_str.substr(0, posasc) + rate_str.substr(posasc+4);
     } else {
         //tree->aln->buildSeqStates(model->seq_states, false);
@@ -774,14 +780,16 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
     
     // choose discrete/continuous gamma
     if (posG != string::npos && posGC != string::npos) {
-        cout << "NOTE: both +G and +GC were specified, continue with "
-            << ((posG < posGC)? rate_str.substr(posG,2) : rate_str.substr(posGC,3)) << endl;
+        // COMMENTED OUT: partition-specific message
+        // cout << "NOTE: both +G and +GC were specified, continue with "
+        //     << ((posG < posGC)? rate_str.substr(posG,2) : rate_str.substr(posGC,3)) << endl;
             
         is_continuous_gamma = posGC < posG;
     }
     if (posG2 != string::npos && posGC != string::npos) {
-        cout << "NOTE: both *G and +GC were specified, continue with "
-            << ((posG2 < posGC)? rate_str.substr(posG2,2) : rate_str.substr(posGC,3)) << endl;
+        // COMMENTED OUT: partition-specific message
+        // cout << "NOTE: both *G and +GC were specified, continue with "
+        //     << ((posG2 < posGC)? rate_str.substr(posG2,2) : rate_str.substr(posGC,3)) << endl;
         
         is_continuous_gamma = posGC < posG2;
     }
@@ -799,8 +807,9 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
     else
     {
         if (posG != string::npos && posG2 != string::npos) {
-            cout << "NOTE: both +G and *G were specified, continue with "
-                << ((posG < posG2)? rate_str.substr(posG,2) : rate_str.substr(posG2,2)) << endl;
+            // COMMENTED OUT: partition-specific message
+            // cout << "NOTE: both +G and *G were specified, continue with "
+            //     << ((posG < posG2)? rate_str.substr(posG,2) : rate_str.substr(posG2,2)) << endl;
         }
         if (posG2 != string::npos && posG2 < posG) {
             posG = posG2;
@@ -812,14 +821,16 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
     string::size_type posR2 = rate_str.find("*R"); // FreeRate model
 
     if (posG != string::npos && (posR != string::npos || posR2 != string::npos)) {
-        outWarning("Both Gamma and FreeRate models were specified, continue with FreeRate model");
+        // COMMENTED OUT: partition-specific message
+        // outWarning("Both Gamma and FreeRate models were specified, continue with FreeRate model");
         posG = string::npos;
         fused_mix_rate = false;
     }
 
     if (posR != string::npos && posR2 != string::npos) {
-        cout << "NOTE: both +R and *R were specified, continue with "
-            << ((posR < posR2)? rate_str.substr(posR,2) : rate_str.substr(posR2,2)) << endl;
+        // COMMENTED OUT: partition-specific message
+        // cout << "NOTE: both +R and *R were specified, continue with "
+        //     << ((posR < posR2)? rate_str.substr(posR,2) : rate_str.substr(posR2,2)) << endl;
     }
 
     if (posR2 != string::npos && posR2 < posR) {
@@ -831,20 +842,23 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
     string::size_type posH2 = rate_str.find("*H"); // heterotachy model
 
     if (posG != string::npos && (posH != string::npos || posH2 != string::npos)) {
-        outWarning("Both Gamma and heterotachy models were specified, continue with heterotachy model");
+        // COMMENTED OUT: partition-specific message
+        // outWarning("Both Gamma and heterotachy models were specified, continue with heterotachy model");
         posG = string::npos;
         fused_mix_rate = false;
     }
 
     if (posR != string::npos && (posH != string::npos || posH2 != string::npos)) {
-        outWarning("Both FreeRate and heterotachy models were specified, continue with heterotachy model");
+        // COMMENTED OUT: partition-specific message
+        // outWarning("Both FreeRate and heterotachy models were specified, continue with heterotachy model");
         posR = string::npos;
         fused_mix_rate = false;
     }
 
     if (posH != string::npos && posH2 != string::npos) {
-        cout << "NOTE: both +H and *H were specified, continue with "
-            << ((posH < posH2)? rate_str.substr(posH,2) : rate_str.substr(posH2,2)) << endl;
+        // COMMENTED OUT: partition-specific message
+        // cout << "NOTE: both +H and *H were specified, continue with "
+        //     << ((posH < posH2)? rate_str.substr(posH,2) : rate_str.substr(posH2,2)) << endl;
     }
     if (posH2 != string::npos && posH2 < posH) {
         posH = posH2;
@@ -1014,8 +1028,9 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
 
     if (fused_mix_rate) {
         if (!model->isMixture()) {
-            if (verbose_mode >= VB_MED)
-                cout << endl << "NOTE: Using mixture model with unlinked " << model_str << " parameters" << endl;
+            // COMMENTED OUT: partition-specific message
+            // if (verbose_mode >= VB_MED)
+            //     cout << endl << "NOTE: Using mixture model with unlinked " << model_str << " parameters" << endl;
             string model_list = model_str;
             delete model;
             for (int i = 1; i < site_rate->getNRate(); i++)
@@ -1567,28 +1582,29 @@ double ModelFactory::optimizeParameters(int fixed_len, bool write_info,
     double optimizeStartTime = getRealTime();
     cur_lh = tree->computeLikelihood();
     tree->setCurScore(cur_lh);
-    if (verbose_mode >= VB_MED || write_info) {
-    int p = -1;
+    // COMMENTED OUT: partition-specific messages
+    // if (verbose_mode >= VB_MED || write_info) {
+    // int p = -1;
 
-    // SET precision to 17 (temporarily)
-    if (verbose_mode >= VB_DEBUG) p = cout.precision(17);
+    // // SET precision to 17 (temporarily)
+    // if (verbose_mode >= VB_DEBUG) p = cout.precision(17);
 
-    // PRINT Log-Likelihood
-    if (verbose_mode >= VB_MED) {
-        cout << "1. Initial log-likelihood: " << cur_lh << " (took " <<
-        (getRealTime() - optimizeStartTime) << " wall-clock sec)" << endl;
-    } else {
-        cout << "1. Initial log-likelihood: " << cur_lh << endl;
-    }
+    // // PRINT Log-Likelihood
+    // if (verbose_mode >= VB_MED) {
+    //     cout << "1. Initial log-likelihood: " << cur_lh << " (took " <<
+    //     (getRealTime() - optimizeStartTime) << " wall-clock sec)" << endl;
+    // } else {
+    //     cout << "1. Initial log-likelihood: " << cur_lh << endl;
+    // }
         
-    // RESTORE previous precision
-    if (verbose_mode >= VB_DEBUG) cout.precision(p);
+    // // RESTORE previous precision
+    // if (verbose_mode >= VB_DEBUG) cout.precision(p);
 
-        if (verbose_mode >= VB_MAX) {
-            tree->printTree(cout);
-            cout << endl;
-        }
-    }
+    //     if (verbose_mode >= VB_MAX) {
+    //         tree->printTree(cout);
+    //         cout << endl;
+    //     }
+    // }
 
     // For UpperBounds -----------
     //cout<<"MLCheck = "<<tree->mlCheck <<endl;
@@ -1657,23 +1673,25 @@ double ModelFactory::optimizeParameters(int fixed_len, bool write_info,
             syncChkPoint->masterSyncOtherChkpts();
         }
 #endif
-        if (verbose_mode >= VB_MED) {
-            model->writeInfo(cout);
-            site_rate->writeInfo(cout);
-            if (fixed_len == BRLEN_SCALE)
-                cout << "Scaled tree length: " << tree->treeLength() << endl;
-        }
+        // COMMENTED OUT: partition-specific message
+        // if (verbose_mode >= VB_MED) {
+        //     model->writeInfo(cout);
+        //     site_rate->writeInfo(cout);
+        //     if (fixed_len == BRLEN_SCALE)
+        //         cout << "Scaled tree length: " << tree->treeLength() << endl;
+        // }
         if (new_lh > cur_lh + logl_epsilon) {
             cur_lh = new_lh;
-            if (write_info) {
-                if (verbose_mode >= VB_MED) {
-                cout << i << ". Current log-likelihood: " << cur_lh
-                    << " (after " << (getRealTime() - optimizeStartTime) << " wall-clock sec)"
-                    << endl;
-                } else {
-                    cout << i << ". Current log-likelihood: " << cur_lh << endl;
-                }
-            }
+            // COMMENTED OUT: partition-specific message
+            // if (write_info) {
+            //     if (verbose_mode >= VB_MED) {
+            //     cout << i << ". Current log-likelihood: " << cur_lh
+            //         << " (after " << (getRealTime() - optimizeStartTime) << " wall-clock sec)"
+            //         << endl;
+            //     } else {
+            //         cout << i << ". Current log-likelihood: " << cur_lh << endl;
+            //     }
+            // }
         } else {
             site_rate->classifyRates(new_lh);
             if (fixed_len == BRLEN_OPTIMIZE)
@@ -1714,27 +1732,31 @@ double ModelFactory::optimizeParameters(int fixed_len, bool write_info,
     
     if (Params::getInstance().root_find && tree->rooted && Params::getInstance().root_move_dist > 0) {
         cur_lh = tree->optimizeRootPosition(Params::getInstance().root_move_dist, write_info, logl_epsilon);
-        if (verbose_mode >= VB_MED || write_info)
-            cout << "Rooting log-likelihood: " << cur_lh << endl;
+        // COMMENTED OUT: partition-specific message
+        // if (verbose_mode >= VB_MED || write_info)
+        //     cout << "Rooting log-likelihood: " << cur_lh << endl;
     }
     
-    if (verbose_mode >= VB_MED || write_info)
-        cout << "Optimal log-likelihood: " << cur_lh << endl;
+    // COMMENTED OUT: partition-specific message
+    // if (verbose_mode >= VB_MED || write_info)
+    //     cout << "Optimal log-likelihood: " << cur_lh << endl;
 
     // For UpperBounds -----------
     if(tree->mlCheck == 0)
         tree->mlFirstOpt = cur_lh;
     // ---------------------------
 
-    if (verbose_mode <= VB_MIN && write_info) {
-        model->writeInfo(cout);
-        site_rate->writeInfo(cout);
-        if (fixed_len == BRLEN_SCALE)
-            cout << "Scaled tree length: " << tree->treeLength() << endl;
-    }
+    // COMMENTED OUT: partition-specific messages
+    // if (verbose_mode <= VB_MIN && write_info) {
+    //     model->writeInfo(cout);
+    //     site_rate->writeInfo(cout);
+    //     if (fixed_len == BRLEN_SCALE)
+    //         cout << "Scaled tree length: " << tree->treeLength() << endl;
+    // }
     double elapsed_secs = getRealTime() - begin_time;
-    if (write_info)
-        cout << "Parameters optimization took " << i-1 << " rounds (" << elapsed_secs << " sec)" << endl;
+    // COMMENTED OUT: partition-specific message
+    // if (write_info)
+    //     cout << "Parameters optimization took " << i-1 << " rounds (" << elapsed_secs << " sec)" << endl;
     startStoringTransMatrix();
 
     // For UpperBounds -----------
