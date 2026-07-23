@@ -951,8 +951,8 @@ endif()
 if (USE_MUTSEL STREQUAL "ON")
     add_dependencies(iqtree3 mutsel)
     target_link_libraries(iqtree3
-            debug "${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/libmutsel_rust.a"
-            optimized "${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/libmutsel_rust.a" )
+            debug "$<LINK_LIBRARY:WHOLE_ARCHIVE,${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/libmutsel_rust.a>"
+            optimized "$<LINK_LIBRARY:WHOLE_ARCHIVE,${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/libmutsel_rust.a>" )
 endif()
 
 if(Backtrace_FOUND)
