@@ -12,7 +12,7 @@
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
 #elif defined(__APPLE__)
-  #include <mach-o/dyld.h>
+  #include <libproc.h>
   #include <unistd.h>
   #include <sys/wait.h>
   #include <spawn.h>
@@ -44,15 +44,15 @@ inline std::filesystem::path executable_path() {
     return std::filesystem::path(buf);
 
 #elif defined(__APPLE__)
-    uint32_t size = 0;
-    _NSGetExecutablePath(nullptr, &size); // query required size
-    std::string buf(size, '\0');
-    if (_NSGetExecutablePath(buf.data(), &size) != 0)
-        throw std::runtime_error("_NSGetExecutablePath failed");
-    std::error_code ec;
-    auto resolved = std::filesystem::canonical(buf, ec);
-    return ec ? std::filesystem::path(buf) : resolved;
-
+    std::array<char, PROC_PIDPATHINFO_MAXSIZE> buffer{};
+    pid_t pid = getpid();
+    
+    int bytes = proc_pidpath(pid, buffer.data(), buffer.size());
+    if (bytes > 0) {
+        return std::filesystem::path(buffer.data());
+    }
+    
+    return {}; // Return empty path on failure
 #elif defined(__linux__)
     std::error_code ec;
     auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
