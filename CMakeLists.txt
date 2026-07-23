@@ -335,16 +335,10 @@ elseif (APPLE)
         # set the first version of mac 11 that supports ARM
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --target=arm64-apple-macos11.0.1")
 	else()
-		# to be compatible back to Mac OS X 10.7
-    	if (IQTREE_FLAGS MATCHES "oldmac")
-        	add_definitions("-mmacosx-version-min=10.5")
-        	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -mmacosx-version-min=10.5")
-    	else()
-            # supports the first version changed from OS X to macOS
-        	add_definitions("--target=x86_64-apple-macos10.12")
-            set(CMAKE_OSX_DEPLOYMENT_TARGET 10.12)
-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --target=x86_64-apple-macos10.12")
-    	endif()
+        # supports the first version changed from OS X to macOS
+        add_definitions("--target=x86_64-apple-macos11.0.1")
+        set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0.1)
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --target=x86_64-apple-macos11.0.1")
 	endif()
     SET(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
 elseif (UNIX)

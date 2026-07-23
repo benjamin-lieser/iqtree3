@@ -400,7 +400,7 @@ jobs:
             -DBoost_INCLUDE_DIR="C:/local/boost/include" ^
             -DBoost_LIBRARY_DIRS="C:/local/boost/lib" ^
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ^
-            -DIQTREE_FLAGS="static cpp14" ..
+            -DIQTREE_FLAGS="static" ..
           make -j
           make package
         env:
