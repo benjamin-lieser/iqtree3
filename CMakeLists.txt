@@ -285,6 +285,28 @@ else()
 endif()
 
 ##################################################################
+# Include Rust dependecies: phylo_grad, MUTSEL model
+##################################################################
+
+if (USE_MUTSEL STREQUAL "ON")
+    message("Compile Rust Dependencies: ON")
+    include(ExternalProject)
+    ExternalProject_Add(
+        mutsel
+        SOURCE_DIR "${CMAKE_SOURCE_DIR}/mutsel_rust"  # Where your Rust source is
+        CONFIGURE_COMMAND ""                           # No configure step for Rust
+        BUILD_COMMAND cargo build --release --lib
+        INSTALL_COMMAND ""  # No install step for Rust
+        BUILD_IN_SOURCE 1  # Build in source directory
+        LOG_BUILD ON
+        LOG_OUTPUT_ON_FAILURE ON
+    )
+    add_definitions(-DUSE_MUTSEL)
+else()
+    message("Compile Rust Dependencies: OFF")
+endif()
+
+##################################################################
 # build IQTREE library
 ##################################################################
 option(BUILD_LIB "Build IQTREE library" OFF)
@@ -932,6 +954,13 @@ if (USE_CMAPLE_AA STREQUAL "ON")
 	)
 endif()
 
+if (USE_MUTSEL STREQUAL "ON")
+    add_dependencies(iqtree3 mutsel)
+    target_link_libraries(iqtree3
+            debug "${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/libmutsel_rust.a"
+            optimized "${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/libmutsel_rust.a" )
+endif()
+
 if(Backtrace_FOUND)
   include_directories(${Backtrace_INCLUDE_DIR})
   target_link_libraries(iqtree3 ${Backtrace_LIBRARY})
@@ -1017,7 +1046,7 @@ endif()
 
 # basic linking librararies
 target_link_libraries(iqtree3 pll ncl nclextra utils pda lbfgsb whtest sprng vectorclass model
-    gsl alignment tree simulator terrace yaml-cpp phyloYAML main ${TARGET_CMAPLE} ${PLATFORM_LIB} ${STD_LIB} ${THREAD_LIB} ${ATOMIC_LIB})
+    gsl alignment tree simulator terrace yaml-cpp phyloYAML main ${TARGET_CMAPLE} ${PLATFORM_LIB} ${STD_LIB} ${THREAD_LIB} ${ATOMIC_LIB} ${CMAKE_DL_LIBS})
 
 # Link the bundled LLVM libomp.a even for GCC builds
 # dl is needed by libomp on Linux for dlsym

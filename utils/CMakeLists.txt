@@ -13,6 +13,7 @@ progress.cpp progress.h
 timeutil.h hammingdistance.h
 operatingsystem.cpp operatingsystem.h
 heapsort.h
+mutsel_wrapper.cpp mutsel_wrapper.h
 )
 
 if(ZLIB_FOUND)

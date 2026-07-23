@@ -1,10 +1,7 @@
 name: Build
 
-on:
-  push:
-    branches: ["*"]
-  pull_request:
-    branches: ["master"]
+on: 
+  workflow_dispatch:
 
 # If a Second Commit is Pushed After, and Build is Not Complete, Cancel
 # Extremely Important with the High Computation Time and Power Required of Arm Linux Builds
@@ -45,6 +42,13 @@ jobs:
           sudo apt-get update -q -y
           sudo apt-get install -q -y clang-${{ matrix.clang-version }} lld-${{ matrix.clang-version }} libomp-${{ matrix.clang-version }}-dev libeigen3-dev libboost-dev
           sudo ln -sf $(which ld.lld-${{ matrix.clang-version }}) /usr/local/bin/ld.lld
+      # Install Rust
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          profile: minimal
 
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
@@ -55,7 +59,7 @@ jobs:
         run: |
           mkdir build
           cd build
-          cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DIQTREE_FLAGS=static -DCMAKE_C_COMPILER=$(which clang-${{ matrix.clang-version }}) -DCMAKE_CXX_COMPILER=$(which clang++-${{ matrix.clang-version }})
+          cmake .. -DUSE_MUTSEL=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DIQTREE_FLAGS=static -DCMAKE_C_COMPILER=$(which clang-${{ matrix.clang-version }}) -DCMAKE_CXX_COMPILER=$(which clang++-${{ matrix.clang-version }})
           make -j
           make package
           file iqtree3 | grep x86-64
