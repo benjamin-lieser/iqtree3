@@ -179,7 +179,8 @@ std::string read_binary_site_model_file_internal(std::string &filename, std::vec
         for (size_t i = 0; i < num_sites; ++i) {
             site_model.push_back(i);
             for (int j = 0; j < 20; ++j) {
-                if (site_freq[i*20 + j] <= 1e-10) throw "Frequencies must be strictly bigger than 1e-10";
+                if (site_freq[i*20 + j] <= 1e-10)
+                    throw std::runtime_error("Frequencies must be strictly bigger than 1e-10");
             }
             double sum = 0;
             for (int j = 0; j < 20; ++j) {
