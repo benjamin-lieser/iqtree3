@@ -1057,6 +1057,10 @@ endif()
 target_link_libraries(iqtree3 pll ncl nclextra utils pda lbfgsb whtest sprng vectorclass model
     gsl alignment tree simulator terrace yaml-cpp phyloYAML main ${TARGET_CMAPLE} ${PLATFORM_LIB} ${STD_LIB} ${THREAD_LIB} ${ATOMIC_LIB} ${CMAKE_DL_LIBS})
 
+if (WIN32)
+    target_link_libraries(iqtree3 PRIVATE ntdll userenv)
+endif()
+
 # Link the bundled LLVM libomp.a even for GCC builds
 # dl is needed by libomp on Linux for dlsym
 if (GCC_USE_BUNDLED_OMP)
