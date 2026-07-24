@@ -290,7 +290,7 @@ endif()
 
 if (USE_MUTSEL STREQUAL "ON")
     message("Compile Rust Dependencies: ON")
-    if (WIN32 AND MSVC)
+    if (WIN32)
         set(MUTSEL_RUST_LIB_FILE "mutsel_rust.lib")
     else()
         set(MUTSEL_RUST_LIB_FILE "libmutsel_rust.a")
