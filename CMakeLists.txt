@@ -298,7 +298,7 @@ if (USE_MUTSEL STREQUAL "ON")
     set(MUTSEL_RUST_LIB_PATH "${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/${MUTSEL_RUST_LIB_FILE}")
 
     if (WIN32)
-        set(CARGO_TARGET "--target x86_64-pc-windows-gnullvm")
+        set(CARGO_TARGET --target x86_64-pc-windows-gnullvm)
     else()
         set(CARGO_TARGET "")
     endif()
