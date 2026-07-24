@@ -331,7 +331,7 @@ impl ModelParameters {
                 (
                     "log_branch_length_scaling",
                     &self.log_branch_length_scaling.as_detached_tensor(),
-                )
+                ),
             ],
             path,
         )
@@ -389,10 +389,12 @@ impl Optimizable for ModelParameters {
             let Mu = Mu(log_R);
 
             // One out the diagonal, since we only want to penalize the off-diagonal elements
-            let Mu = (&Mu - (&Mu - 1.0).unwrap() * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap()).unwrap();
+            let Mu = (&Mu
+                - (&Mu - 1.0).unwrap()
+                    * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
+            .unwrap();
 
-
-            return Mu.log().unwrap()
+            return Mu.log().unwrap();
         }
 
         let Mu = log_Mu(&self.log_R)
@@ -454,6 +456,7 @@ fn optimize(
     max_iterations: usize,
     min_rel_improvement: f64,
     no_improve_patience: usize,
+    verbosity: Verbosity,
 ) {
     let variables = model.variables();
     let mut opt = candle_nn::optim::AdamW::new_lr(variables, 0.05).unwrap();
@@ -473,12 +476,14 @@ fn optimize(
         let opt_fn = (&neg_likelihood + &penalty).unwrap();
 
         let current_opt = opt_fn.to_scalar::<f64>().unwrap();
-        println!(
-            "Iteration {}: neg Loglikelihood {:.3}, Optfn {:.3}",
-            iteration,
-            neg_likelihood.to_scalar::<f64>().unwrap(),
-            current_opt
-        );
+        if verbosity.should_print(Verbosity::Med) {
+            println!(
+                "Iteration {}: neg Loglikelihood {:.3}, Optfn {:.3}",
+                iteration,
+                neg_likelihood.to_scalar::<f64>().unwrap(),
+                current_opt
+            );
+        }
 
         model.print_state();
         let grads = opt_fn.backward().unwrap();
@@ -515,6 +520,7 @@ pub fn optimize_global_scaling_alpha(
     R: &Tensor,
     log_branch_lengths: &Tensor,
     branch_length_penalty: f64,
+    verbosity: Verbosity,
 ) -> (Tensor, Tensor, Tensor) {
     let var_log_global_scaling = Var::from_tensor(&tensor_full(0.0, &[])).unwrap();
     let var_alpha = Var::from_tensor(&tensor_full(1.0, &[])).unwrap();
@@ -532,7 +538,7 @@ pub fn optimize_global_scaling_alpha(
         branch_length_penalty,
     };
 
-    optimize(&model, 10, 100, 1e-5, 5);
+    optimize(&model, 10, 100, 1e-5, 5, verbosity);
 
     let alpha = if let RateParameters::G(_, alpha) = model.rate_model {
         alpha
@@ -553,7 +559,8 @@ pub fn two_step_light_pmsf(
     weights: &[f64],
     f_class: &[f64; 20],
     log_branch_lengths: &Tensor,
-    mutsel_params: &super::MutselParams
+    mutsel_params: &super::MutselParams,
+    verbosity: Verbosity,
 ) -> (Tensor, f64, f64, Tensor) {
     let step1_site_freq = light_pmsf(
         felsenstein_op.into_with_edge_op(),
@@ -574,7 +581,8 @@ pub fn two_step_light_pmsf(
             &log_pi,
             &Mu,
             log_branch_lengths,
-            mutsel_params.branch_reg
+            mutsel_params.branch_reg,
+            verbosity,
         );
 
     let final_site_freq = light_pmsf(
@@ -731,7 +739,10 @@ pub fn optimize_internal(
         Var::from_tensor(&tensor_full(0.0, log_branch_lengths.dims())).unwrap();
 
     let site_freq = if let Some(prior_pi_file) = prior_pi_file {
-        println!("Using prior site frequencies from file: {:?}", prior_pi_file);
+        println!(
+            "Using prior site frequencies from file: {:?}",
+            prior_pi_file
+        );
         crate::io::read_sitefreq_file(prior_pi_file)
     } else {
         // Do our lightweight PMSF procedure for the site_freq prior:
@@ -756,7 +767,8 @@ pub fn optimize_internal(
             &weights,
             &f_class,
             &log_branch_lengths,
-            &mutsel_params
+            &mutsel_params,
+            verbosity
         );
         var_log_global_scaling = global_scaling;
         var_alpha = alpha;
@@ -792,7 +804,7 @@ pub fn optimize_internal(
         substitution_model,
     };
 
-    optimize(&model, 100, 500, 1e-5, 5);
+    optimize(&model, 100, 500, 1e-5, 5, verbosity);
 
     let (S, sqrt_pi) = model.calc_rate_matrix();
     let rate_para = model.rate_parameters.parameters_for_iqtree();
