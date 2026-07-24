@@ -1058,7 +1058,7 @@ target_link_libraries(iqtree3 pll ncl nclextra utils pda lbfgsb whtest sprng vec
     gsl alignment tree simulator terrace yaml-cpp phyloYAML main ${TARGET_CMAPLE} ${PLATFORM_LIB} ${STD_LIB} ${THREAD_LIB} ${ATOMIC_LIB} ${CMAKE_DL_LIBS})
 
 if (WIN32)
-    target_link_libraries(iqtree3 PRIVATE ntdll userenv)
+    target_link_libraries(iqtree3 ntdll userenv)
 endif()
 
 # Link the bundled LLVM libomp.a even for GCC builds
