@@ -121,8 +121,7 @@ inline std::wstring quote_arg(const std::wstring& a) {
 } // namespace detail
 
 inline Process spawn(const std::filesystem::path& exe,
-                      const std::vector<std::string>& args,
-                      bool inherit_io = true) {
+                      const std::vector<std::string>& args) {
     std::wstring cmdline = detail::quote_arg(exe.wstring());
     for (auto& a : args) {
         cmdline.push_back(L' ');
@@ -140,7 +139,7 @@ inline Process spawn(const std::filesystem::path& exe,
         exe.wstring().c_str(),   // application name (avoids PATH search ambiguity)
         mutable_cmd.data(),      // command line, must be a mutable buffer
         nullptr, nullptr,
-        inherit_io ? TRUE : FALSE,
+        TRUE,
         0, nullptr, nullptr,
         &si, &pi);
 
@@ -168,9 +167,7 @@ struct Process {
 };
 
 inline Process spawn(const std::filesystem::path& exe,
-                      const std::vector<std::string>& args,
-                      bool inherit_io = true) {
-    (void)inherit_io; // posix_spawn inherits parent's fds by default
+                      const std::vector<std::string>& args) {
 
     std::vector<std::string> argv_storage;
     argv_storage.push_back(exe.string());
@@ -193,8 +190,8 @@ inline Process spawn(const std::filesystem::path& exe,
 #endif
 
 // Convenience: spawn a fresh copy of the currently running executable with the given args.
-inline Process spawn_self(const std::vector<std::string>& args, bool inherit_io = true) {
-    return spawn(executable_path(), args, inherit_io);
+inline Process spawn_self(const std::vector<std::string>& args) {
+    return spawn(executable_path(), args);
 }
 
 } // namespace selfproc

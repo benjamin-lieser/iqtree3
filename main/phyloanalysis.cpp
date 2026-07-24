@@ -5232,7 +5232,7 @@ void runPhyloAnalysis(Params &params, Checkpoint *checkpoint, IQTree *&tree, Ali
                 } else {
                     cout << "INFO: Guide tree does not exist, inferring..." << endl;
                     auto arguments = std::vector<std::string>{"-s", (std::string)params.aln_file, "-m", "LG+F+G4", "-nt", std::to_string(params.num_threads), "-pre", guide_tree_out};
-                    auto process = selfproc::spawn_self(arguments, false);
+                    auto process = selfproc::spawn_self(arguments);
                     auto exit_code = process.wait();
                     if (exit_code != 0) {
                         outError("Guide tree inference failed with exit code " + std::to_string(exit_code));

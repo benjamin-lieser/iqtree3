@@ -290,12 +290,20 @@ endif()
 
 if (USE_MUTSEL STREQUAL "ON")
     message("Compile Rust Dependencies: ON")
+    if (WIN32 AND MSVC)
+        set(MUTSEL_RUST_LIB_FILE "mutsel_rust.lib")
+    else()
+        set(MUTSEL_RUST_LIB_FILE "libmutsel_rust.a")
+    endif()
+    set(MUTSEL_RUST_LIB_PATH "${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/${MUTSEL_RUST_LIB_FILE}")
+
     include(ExternalProject)
     ExternalProject_Add(
         mutsel
         SOURCE_DIR "${CMAKE_SOURCE_DIR}/mutsel_rust"  # Where your Rust source is
         CONFIGURE_COMMAND ""                           # No configure step for Rust
         BUILD_COMMAND cargo build --release --lib
+        BUILD_BYPRODUCTS "${MUTSEL_RUST_LIB_PATH}"
         INSTALL_COMMAND ""  # No install step for Rust
         BUILD_IN_SOURCE 1  # Build in source directory
         LOG_BUILD ON
@@ -951,8 +959,8 @@ endif()
 if (USE_MUTSEL STREQUAL "ON")
     add_dependencies(iqtree3 mutsel)
     target_link_libraries(iqtree3
-            debug "$<LINK_LIBRARY:WHOLE_ARCHIVE,${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/libmutsel_rust.a>"
-            optimized "$<LINK_LIBRARY:WHOLE_ARCHIVE,${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/libmutsel_rust.a>" )
+            debug "$<LINK_LIBRARY:WHOLE_ARCHIVE,${MUTSEL_RUST_LIB_PATH}>"
+            optimized "$<LINK_LIBRARY:WHOLE_ARCHIVE,${MUTSEL_RUST_LIB_PATH}>" )
 endif()
 
 if(Backtrace_FOUND)
