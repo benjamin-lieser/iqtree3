@@ -297,12 +297,19 @@ if (USE_MUTSEL STREQUAL "ON")
     endif()
     set(MUTSEL_RUST_LIB_PATH "${CMAKE_SOURCE_DIR}/mutsel_rust/target/release/${MUTSEL_RUST_LIB_FILE}")
 
+    if (WIN32)
+        set(CARGO_TARGET "--target x86_64-pc-windows-gnullvm")
+    else()
+        set(CARGO_TARGET "")
+    endif()
+
+
     include(ExternalProject)
     ExternalProject_Add(
         mutsel
         SOURCE_DIR "${CMAKE_SOURCE_DIR}/mutsel_rust"  # Where your Rust source is
         CONFIGURE_COMMAND ""                           # No configure step for Rust
-        BUILD_COMMAND cargo build --release --lib
+        BUILD_COMMAND cargo build --release --lib ${CARGO_TARGET}
         BUILD_BYPRODUCTS "${MUTSEL_RUST_LIB_PATH}"
         INSTALL_COMMAND ""  # No install step for Rust
         BUILD_IN_SOURCE 1  # Build in source directory

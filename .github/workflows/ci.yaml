@@ -413,7 +413,7 @@ jobs:
           toolchain: stable
           override: true
           profile: minimal
-          target: x86_64-pc-windows-gnu
+          target: x86_64-pc-windows-gnullvm
       - name: Compile
         shell: cmd
         run: |
