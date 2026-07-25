@@ -16,6 +16,11 @@ heapsort.h
 mutsel_wrapper.cpp mutsel_wrapper.h
 )
 
+if (USE_MUTSEL STREQUAL "ON")
+    add_dependencies(utils mutsel)
+    target_link_libraries(utils "${MUTSEL_RUST_LIB_PATH}")
+endif()
+
 if(ZLIB_FOUND)
   target_link_libraries(utils ${ZLIB_LIBRARIES})
 else(ZLIB_FOUND)

@@ -14,12 +14,6 @@ add_library(main
     terraceanalysis.h
 )
 
-target_link_libraries(main -Wl,--start-group)
-
-if (USE_MUTSEL STREQUAL "ON")
-    add_dependencies(main mutsel)
-    target_link_libraries(main "${MUTSEL_RUST_LIB_PATH}")
-endif()
 
 if (USE_BOOSTER)
     target_link_libraries(main booster)
@@ -66,5 +60,3 @@ if (USE_CMAPLE)
         target_link_libraries(main-aa pda whtest vectorclass terrace maple-aa)
     endif()
 endif()
-
-target_link_libraries(main -Wl,--end-group)
