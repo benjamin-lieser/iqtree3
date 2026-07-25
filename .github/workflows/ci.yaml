@@ -432,6 +432,7 @@ jobs:
             -DIQTREE_FLAGS="static" ..
             
           type CMakeFiles\iqtree3.dir\link.txt
+          type CMakeFiles\iqtree3.dir\linkLibs.rsp
 
           make -j
           make package
