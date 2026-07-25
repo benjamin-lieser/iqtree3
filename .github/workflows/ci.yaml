@@ -431,6 +431,7 @@ jobs:
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ^
             -DIQTREE_FLAGS="static" ..
             
+          type CMakeFiles\iqtree3.dir\link.txt
 
           make -j
           make package
