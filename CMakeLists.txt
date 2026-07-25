@@ -965,9 +965,13 @@ endif()
 
 if (USE_MUTSEL STREQUAL "ON")
     add_dependencies(iqtree3 mutsel)
-    target_link_libraries(iqtree3
+    if (WIN32)
+        target_link_libraries(iqtree3 ${MUTSEL_RUST_LIB_PATH})
+    else()
+        target_link_libraries(iqtree3
             debug "$<LINK_LIBRARY:WHOLE_ARCHIVE,${MUTSEL_RUST_LIB_PATH}>"
             optimized "$<LINK_LIBRARY:WHOLE_ARCHIVE,${MUTSEL_RUST_LIB_PATH}>" )
+    endif()
 endif()
 
 if(Backtrace_FOUND)
