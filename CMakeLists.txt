@@ -1023,7 +1023,7 @@ endif()
 # link special lib for WIN32
 if (WIN32)
     set(PLATFORM_LIB "ws2_32")
-    target_link_options(iqtree3 --allow-multiple-definition)
+    target_link_options(iqtree3 "-Wl,--allow-multiple-definition")
 else()
     set(PLATFORM_LIB "m")
 endif()
