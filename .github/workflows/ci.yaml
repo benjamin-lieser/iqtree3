@@ -402,12 +402,17 @@ jobs:
       - name: Pin Cargo linker to the MSYS2 toolchain
         shell: msys2 {0}
         run: |
+          gcc_exe="$(cygpath -m "$(command -v gcc)")"
+          ar_exe="$(cygpath -m "$(command -v ar)")"
+
           mkdir -p mutsel_rust/.cargo
           printf '%s\n' \
             '[target.x86_64-pc-windows-gnu]' \
-            'linker = "C:/msys64/mingw64/bin/gcc.exe"' \
-            'ar = "C:/msys64/mingw64/bin/ar.exe"' \
+            "linker = \"$gcc_exe\"" \
+            "ar = \"$ar_exe\"" \
             > mutsel_rust/.cargo/config.toml
+
+          cat mutsel_rust/.cargo/config.toml
 
       - name: Compile
         shell: msys2 {0}
