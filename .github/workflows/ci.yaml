@@ -375,67 +375,51 @@ jobs:
         with:
           submodules: "recursive"
 
-      - name: Install LLVM v14
-        shell: cmd
-        run: |
-          setlocal EnableDelayedExpansion
-          set RETRIES=3
-          set WAIT_SECONDS=20
-          for /L %%i in (1,1,%RETRIES%) do (
-            echo Attempt %%i/%RETRIES%: installing LLVM 14.0.6 via Chocolatey
-            choco install llvm --version=14.0.6 --allow-downgrade
-            if !ERRORLEVEL! EQU 0 goto :success
-            if %%i LSS %RETRIES% (
-              echo Install failed. Waiting %WAIT_SECONDS%s before retry...
-              timeout /t %WAIT_SECONDS% /nobreak >nul
-            )
-          )
-          echo LLVM installation failed after %RETRIES% attempts.
-          exit /b 1
-          :success
-          echo LLVM installed successfully.
-
-      - name: Download and Extract Boost 1.84.0
-        shell: pwsh
-        run: |
-          curl -L -o boost.tar.gz https://github.com/MarkusJx/prebuilt-boost/releases/download/1.84.0/boost-1.84.0-windows-2022-mingw-static-x86.tar.gz
-          tar -xzf boost.tar.gz
-          mv boost C:/local/boost
-
-      - name: Install Eigen3
-        shell: cmd
-        run: choco install eigen
-
-      # Install Rust
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
+      - name: Setup MSYS2 MinGW64 toolchain
+        uses: msys2/setup-msys2@v2
         with:
-          toolchain: stable
-          override: true
-          profile: minimal
-          target: x86_64-pc-windows-gnu
-      - name: Compile
-        shell: cmd
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-eigen3
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-ninja
+          path-type: minimal   # do NOT inherit the runner's PATH -- avoids C:\mingw64, Strawberry Perl, etc. leaking in
+
+      - name: Install Rust (GNU toolchain, matching MSYS2 GCC ABI)
+        shell: msys2 {0}
         run: |
-          if exist build rd /s /q build
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+            --default-toolchain stable-x86_64-pc-windows-gnu \
+            --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Pin Cargo linker to the MSYS2 toolchain
+        shell: msys2 {0}
+        run: |
+          mkdir -p mutsel_rust/.cargo
+          cat > mutsel_rust/.cargo/config.toml <<'EOF'
+          [target.x86_64-pc-windows-gnu]
+          linker = "C:/msys64/mingw64/bin/gcc.exe"
+          ar = "C:/msys64/mingw64/bin/ar.exe"
+          EOF
+
+      - name: Compile
+        shell: msys2 {0}
+        run: |
+          rm -rf build
           mkdir build
           cd build
-          cmake -G "MinGW Makefiles" ^
-            -DUSE_MUTSEL=ON ^
-            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ^
-            -DCMAKE_C_FLAGS=--target=x86_64-pc-windows-gnu ^
-            -DCMAKE_CXX_FLAGS=--target=x86_64-pc-windows-gnu ^
-            -DCMAKE_MAKE_PROGRAM=mingw32-make ^
-            -DBoost_INCLUDE_DIR="C:/local/boost/include" ^
-            -DBoost_LIBRARY_DIRS="C:/local/boost/lib" ^
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ^
+          cmake -G "Ninja" \
+            -DUSE_MUTSEL=ON \
+            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_MAKE_PROGRAM=ninja \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DIQTREE_FLAGS="static" ..
-            
-
-          make -j
-          make package
-        env:
-          BOOST_ROOT: "C:/local/boost"
+          cmake --build . -j
+          cpack
 
       - name: Check File Arch
         shell: bash
