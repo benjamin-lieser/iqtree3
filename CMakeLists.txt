@@ -963,16 +963,6 @@ if (USE_CMAPLE_AA STREQUAL "ON")
 	)
 endif()
 
-if (USE_MUTSEL STREQUAL "ON")
-    add_dependencies(iqtree3 mutsel)
-    if (WIN32)
-        target_link_libraries(iqtree3 ${MUTSEL_RUST_LIB_PATH})
-    else()
-        target_link_libraries(iqtree3
-            debug "$<LINK_LIBRARY:WHOLE_ARCHIVE,${MUTSEL_RUST_LIB_PATH}>"
-            optimized "$<LINK_LIBRARY:WHOLE_ARCHIVE,${MUTSEL_RUST_LIB_PATH}>" )
-    endif()
-endif()
 
 if(Backtrace_FOUND)
   include_directories(${Backtrace_INCLUDE_DIR})
@@ -1152,6 +1142,10 @@ if (NOT BINARY32 AND NOT IQTREE_FLAGS MATCHES "novx")
     endif()
 endif()
 
+if (USE_MUTSEL STREQUAL "ON")
+    add_dependencies(iqtree3 mutsel)
+    target_link_libraries(iqtree3 ${MUTSEL_RUST_LIB_PATH})
+endif()
 # setup the executable name
 ##################################################################
 set_target_properties(iqtree3 PROPERTIES OUTPUT_NAME "iqtree3${EXE_SUFFIX}")
