@@ -416,6 +416,7 @@ jobs:
             -DUSE_MUTSEL=ON \
             -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
             -DCMAKE_MAKE_PROGRAM=ninja \
+            -DEIGEN3_INCLUDE_DIR=/mingw64/include/eigen3 \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DIQTREE_FLAGS="static" ..
           cmake --build . -j
