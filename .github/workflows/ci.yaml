@@ -388,28 +388,14 @@ jobs:
             mingw-w64-x86_64-ninja
           path-type: minimal   # do NOT inherit the runner's PATH -- avoids C:\mingw64, Strawberry Perl, etc. leaking in
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          profile: minimal
-          target: x86_64-pc-windows-gnu
-
-      - name: Expose Rust tools inside MSYS2
+      - name: Install Rust with rustup inside MSYS2
         shell: msys2 {0}
         run: |
           cargo_home_unix="$(cygpath "$USERPROFILE/.cargo/bin")"
-
-          for tool in cargo rustc rustup; do
-            cat > "/usr/local/bin/$tool" <<EOF
-#!/usr/bin/env bash
-export PATH="$cargo_home_unix:\$PATH"
-exec "$cargo_home_unix/$tool.exe" "\$@"
-EOF
-            chmod +x "/usr/local/bin/$tool"
-          done
-
+          curl --proto '=https' --tlsv1.2 -sSf https://win.rustup.rs/x86_64 -o rustup-init.exe
+          ./rustup-init.exe -y --default-host x86_64-pc-windows-gnu --default-toolchain stable --profile minimal
+          export PATH="$cargo_home_unix:$PATH"
+          rustup target add x86_64-pc-windows-gnu
           cargo --version
           rustc --version
 
@@ -417,15 +403,16 @@ EOF
         shell: msys2 {0}
         run: |
           mkdir -p mutsel_rust/.cargo
-          cat > mutsel_rust/.cargo/config.toml <<'EOF'
-          [target.x86_64-pc-windows-gnu]
-          linker = "C:/msys64/mingw64/bin/gcc.exe"
-          ar = "C:/msys64/mingw64/bin/ar.exe"
-          EOF
+          printf '%s\n' \
+            '[target.x86_64-pc-windows-gnu]' \
+            'linker = "C:/msys64/mingw64/bin/gcc.exe"' \
+            'ar = "C:/msys64/mingw64/bin/ar.exe"' \
+            > mutsel_rust/.cargo/config.toml
 
       - name: Compile
         shell: msys2 {0}
         run: |
+          export PATH="$(cygpath "$USERPROFILE/.cargo/bin"):$PATH"
           cargo --version
 
           rm -rf build
