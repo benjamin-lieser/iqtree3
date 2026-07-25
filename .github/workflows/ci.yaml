@@ -410,6 +410,7 @@ jobs:
         shell: msys2 {0}
         run: |
           rm -rf build
+          export PATH="$HOME/.cargo/bin:$PATH"
           mkdir build
           cd build
           cmake -G "Ninja" \
