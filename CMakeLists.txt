@@ -303,16 +303,13 @@ if (USE_MUTSEL STREQUAL "ON")
         set(CARGO_TARGET "")
     endif()
 
-    find_program(CARGO_EXECUTABLE NAMES cargo cargo.exe REQUIRED)
-    message("Cargo executable: ${CARGO_EXECUTABLE}")
-
 
     include(ExternalProject)
     ExternalProject_Add(
         mutsel
         SOURCE_DIR "${CMAKE_SOURCE_DIR}/mutsel_rust"  # Where your Rust source is
         CONFIGURE_COMMAND ""                           # No configure step for Rust
-        BUILD_COMMAND "${CARGO_EXECUTABLE}" build --release --lib ${CARGO_TARGET}
+        BUILD_COMMAND cargo build --release --lib ${CARGO_TARGET}
         BUILD_BYPRODUCTS "${MUTSEL_RUST_LIB_PATH}"
         INSTALL_COMMAND ""  # No install step for Rust
         BUILD_IN_SOURCE 1  # Build in source directory

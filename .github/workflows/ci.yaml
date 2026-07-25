@@ -396,12 +396,22 @@ jobs:
           profile: minimal
           target: x86_64-pc-windows-gnu
 
-      - name: Add Cargo to the MSYS2 PATH
+      - name: Expose Rust tools inside MSYS2
         shell: msys2 {0}
         run: |
-          cargo_bin="$(cygpath "$USERPROFILE/.cargo/bin")"
-          echo "$cargo_bin" >> "$GITHUB_PATH"
-          "$cargo_bin/cargo.exe" --version
+          cargo_home_unix="$(cygpath "$USERPROFILE/.cargo/bin")"
+
+          for tool in cargo rustc rustup; do
+            cat > "/usr/local/bin/$tool" <<EOF
+#!/usr/bin/env bash
+export PATH="$cargo_home_unix:\$PATH"
+exec "$cargo_home_unix/$tool.exe" "\$@"
+EOF
+            chmod +x "/usr/local/bin/$tool"
+          done
+
+          cargo --version
+          rustc --version
 
       - name: Pin Cargo linker to the MSYS2 toolchain
         shell: msys2 {0}
@@ -416,6 +426,8 @@ jobs:
       - name: Compile
         shell: msys2 {0}
         run: |
+          cargo --version
+
           rm -rf build
           mkdir build
           cd build
