@@ -963,13 +963,6 @@ if (USE_CMAPLE_AA STREQUAL "ON")
 	)
 endif()
 
-if (USE_MUTSEL STREQUAL "ON")
-    add_dependencies(iqtree3 mutsel)
-    target_link_libraries(iqtree3
-            debug "$<LINK_LIBRARY:WHOLE_ARCHIVE,${MUTSEL_RUST_LIB_PATH}>"
-            optimized "$<LINK_LIBRARY:WHOLE_ARCHIVE,${MUTSEL_RUST_LIB_PATH}>" )
-endif()
-
 if(Backtrace_FOUND)
   include_directories(${Backtrace_INCLUDE_DIR})
   target_link_libraries(iqtree3 ${Backtrace_LIBRARY})
@@ -1023,7 +1016,6 @@ endif()
 # link special lib for WIN32
 if (WIN32)
     set(PLATFORM_LIB "ws2_32")
-    target_link_options(iqtree3 INTERFACE "-Wl,--allow-multiple-definition")
 else()
     set(PLATFORM_LIB "m")
 endif()
