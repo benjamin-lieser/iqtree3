@@ -303,6 +303,7 @@ if (USE_MUTSEL STREQUAL "ON")
         set(CARGO_TARGET "")
     endif()
 
+    set(RUST_ARCHIVE_FIXUP COMMAND ${CMAKE_RANLIB} "${MUTSEL_RUST_LIB_PATH}")
 
     include(ExternalProject)
     ExternalProject_Add(
@@ -310,6 +311,7 @@ if (USE_MUTSEL STREQUAL "ON")
         SOURCE_DIR "${CMAKE_SOURCE_DIR}/mutsel_rust"  # Where your Rust source is
         CONFIGURE_COMMAND ""                           # No configure step for Rust
         BUILD_COMMAND cargo build --release --lib ${CARGO_TARGET}
+            ${RUST_ARCHIVE_FIXUP}
         BUILD_BYPRODUCTS "${MUTSEL_RUST_LIB_PATH}"
         INSTALL_COMMAND ""  # No install step for Rust
         BUILD_IN_SOURCE 1  # Build in source directory
