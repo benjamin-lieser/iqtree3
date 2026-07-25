@@ -375,63 +375,67 @@ jobs:
         with:
           submodules: "recursive"
 
-      - name: Setup MSYS2 MinGW64 toolchain
-        uses: msys2/setup-msys2@v2
+      - name: Install LLVM v14
+        shell: cmd
+        run: |
+          setlocal EnableDelayedExpansion
+          set RETRIES=3
+          set WAIT_SECONDS=20
+          for /L %%i in (1,1,%RETRIES%) do (
+            echo Attempt %%i/%RETRIES%: installing LLVM 14.0.6 via Chocolatey
+            choco install llvm --version=14.0.6 --allow-downgrade
+            if !ERRORLEVEL! EQU 0 goto :success
+            if %%i LSS %RETRIES% (
+              echo Install failed. Waiting %WAIT_SECONDS%s before retry...
+              timeout /t %WAIT_SECONDS% /nobreak >nul
+            )
+          )
+          echo LLVM installation failed after %RETRIES% attempts.
+          exit /b 1
+          :success
+          echo LLVM installed successfully.
+
+      - name: Download and Extract Boost 1.84.0
+        shell: pwsh
+        run: |
+          curl -L -o boost.tar.gz https://github.com/MarkusJx/prebuilt-boost/releases/download/1.84.0/boost-1.84.0-windows-2022-mingw-static-x86.tar.gz
+          tar -xzf boost.tar.gz
+          mv boost C:/local/boost
+
+      - name: Install Eigen3
+        shell: cmd
+        run: choco install eigen
+
+      # Install Rust
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
         with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-eigen3
-            mingw-w64-x86_64-boost
-            mingw-w64-x86_64-ninja
-          path-type: minimal   # do NOT inherit the runner's PATH -- avoids C:\mingw64, Strawberry Perl, etc. leaking in
-
-      - name: Install Rust with rustup inside MSYS2
-        shell: msys2 {0}
-        run: |
-          cargo_home_unix="$(cygpath "$USERPROFILE/.cargo/bin")"
-          curl --proto '=https' --tlsv1.2 -sSf https://win.rustup.rs/x86_64 -o rustup-init.exe
-          ./rustup-init.exe -y --default-host x86_64-pc-windows-gnu --default-toolchain stable --profile minimal
-          export PATH="$cargo_home_unix:$PATH"
-          rustup target add x86_64-pc-windows-gnu
-          cargo --version
-          rustc --version
-
-      - name: Pin Cargo linker to the MSYS2 toolchain
-        shell: msys2 {0}
-        run: |
-          gcc_exe="$(cygpath -m "$(command -v gcc)")"
-          ar_exe="$(cygpath -m "$(command -v ar)")"
-
-          mkdir -p mutsel_rust/.cargo
-          printf '%s\n' \
-            '[target.x86_64-pc-windows-gnu]' \
-            "linker = \"$gcc_exe\"" \
-            "ar = \"$ar_exe\"" \
-            > mutsel_rust/.cargo/config.toml
-
-          cat mutsel_rust/.cargo/config.toml
-
+          toolchain: stable
+          override: true
+          profile: minimal
+          target: x86_64-pc-windows-gnu
       - name: Compile
-        shell: msys2 {0}
+        shell: cmd
         run: |
-          export PATH="$(cygpath "$USERPROFILE/.cargo/bin"):$PATH"
-          cargo --version
-
-          rm -rf build
+          if exist build rd /s /q build
           mkdir build
           cd build
-          cmake -G "Ninja" \
-            -DUSE_MUTSEL=ON \
-            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
-            -DCMAKE_MAKE_PROGRAM=ninja \
-            -DEIGEN3_INCLUDE_DIR=/mingw64/include/eigen3 \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+          cmake -G "MinGW Makefiles" ^
+            -DUSE_MUTSEL=ON ^
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ^
+            -DCMAKE_C_FLAGS=--target=x86_64-pc-windows-gnu ^
+            -DCMAKE_CXX_FLAGS=--target=x86_64-pc-windows-gnu ^
+            -DCMAKE_MAKE_PROGRAM=mingw32-make ^
+            -DBoost_INCLUDE_DIR="C:/local/boost/include" ^
+            -DBoost_LIBRARY_DIRS="C:/local/boost/lib" ^
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ^
             -DIQTREE_FLAGS="static" ..
-          cmake --build . -j
-          cpack
+            
+
+          make -j
+          make package
+        env:
+          BOOST_ROOT: "C:/local/boost"
 
       - name: Check File Arch
         shell: bash
