@@ -423,8 +423,8 @@ jobs:
           cmake -G "MinGW Makefiles" ^
             -DUSE_MUTSEL=ON ^
             -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ^
-            -DCMAKE_C_FLAGS=--target=x86_64-pc-windows-gnu ^
-            -DCMAKE_CXX_FLAGS=--target=x86_64-pc-windows-gnu ^
+            -DCMAKE_C_FLAGS="--target=x86_64-pc-windows-gnu --sysroot=C:/mingw64 -B C:/mingw64/bin" ^
+            -DCMAKE_CXX_FLAGS="--target=x86_64-pc-windows-gnu --sysroot=C:/mingw64 -B C:/mingw64/bin" ^
             -DCMAKE_MAKE_PROGRAM=mingw32-make ^
             -DBoost_INCLUDE_DIR="C:/local/boost/include" ^
             -DBoost_LIBRARY_DIRS="C:/local/boost/lib" ^
