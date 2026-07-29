@@ -549,7 +549,8 @@ fn parse_rate_model(rate_model: &str) -> RateModel {
 pub enum SubstitutionModel {
     MutSel,
     MutSelApprox,
-    RelaxPMSF,
+    PMSFNormalize,
+    PMSFNoNormalize,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -1,4 +1,4 @@
-use std::ops::Deref;
+use std::{ops::Deref, todo};
 
 use candle_core::{CpuStorage, CustomOp1, Storage, Tensor};
 
@@ -75,8 +75,9 @@ pub fn calc_rate_matrix(
         SubstitutionModel::MutSelApprox => {
             calc_rate_matrix_mutselapprox(R, log_pi, global_scaling).unwrap()
         }
-        SubstitutionModel::RelaxPMSF => calc_rate_matrix_relaxpmsf(R, log_pi, global_scaling),
+        SubstitutionModel::PMSFNormalize => calc_rate_matrix_relaxpmsf(R, log_pi, global_scaling),
         SubstitutionModel::MutSel => calc_rate_matrix_mutsel(R, log_pi, global_scaling),
+        SubstitutionModel::PMSFNoNormalize => {todo!("PMSFNoNormalize is not implemented yet.")}
     }
 }
 

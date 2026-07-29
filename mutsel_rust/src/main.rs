@@ -6,15 +6,12 @@ use mutsel_rust::gamma::GammaOp;
 fn run(args : &[String]) {
     let newick = args[0].clone();
     let fasta = args[1].clone();
-    let pi_reg = args[2].parse::<f64>().unwrap();
-    let R_reg = args[3].parse::<f64>().unwrap();
-    let rate_model = args[4].clone();
     let mutsel = args[5].clone();
 
-
-    let substitution_model = match mutsel.as_str() {
+    let substitution_model = match mutsel.to_lowercase().as_str() {
         "mutselapprox" => mutsel_rust::SubstitutionModel::MutSelApprox,
-        "relaxpmsf" => mutsel_rust::SubstitutionModel::RelaxPMSF,
+        "pmsfnorm" => mutsel_rust::SubstitutionModel::PMSFNormalize,
+        "pmsfnonorm" => mutsel_rust::SubstitutionModel::PMSFNoNormalize,
         "mutsel" => mutsel_rust::SubstitutionModel::MutSel,
         _ => panic!("Unknown substitution model"),
     };
@@ -22,16 +19,16 @@ fn run(args : &[String]) {
     let (S, sqrt_pi, rate_para, _substitution_rates) = mutsel_rust::optimize_rust_binary(
         &std::path::Path::new(&newick),
         &std::path::Path::new(&fasta),
-        pi_reg,
-        R_reg,
-        &rate_model,
+        0.0,
+        0.0,
+        "G4",
         None,
         None,
         substitution_model
     )
     .unwrap();
 
-    if substitution_model == mutsel_rust::SubstitutionModel::RelaxPMSF {
+    if substitution_model == mutsel_rust::SubstitutionModel::PMSFNormalize {
         let (R, pi) = mutsel_rust::model::phylograd2iqtree_parametrization(&S, &sqrt_pi).unwrap();
         mutsel_rust::io::write_sitefreq_file(&pi, &std::path::Path::new(args[6].as_str()));
         // R should be the same for all sites
