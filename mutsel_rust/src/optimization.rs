@@ -16,7 +16,7 @@ use crate::{
     utils::{histogram, tensor_full},
 };
 
-trait Optimizable {
+pub trait Optimizable {
     fn variables(&self) -> Vec<Var>;
     fn likelihood(&self) -> Tensor;
     fn penalty(&self) -> Tensor;
@@ -30,7 +30,7 @@ pub enum RateParameters {
 }
 
 impl RateParameters {
-    fn gamma(n: usize, alpha: f64) -> RateParameters {
+    pub fn gamma(n: usize, alpha: f64) -> RateParameters {
         // Alpha is unconstrained, but there is a very strong barrier approaching 0. So this is not a problem.
         RateParameters::G(n, Var::from_tensor(&tensor_full(alpha, &[])).unwrap())
     }
@@ -71,7 +71,7 @@ impl RateParameters {
         }
     }
 
-    fn variables(&self) -> Vec<Var> {
+    pub fn variables(&self) -> Vec<Var> {
         match self {
             RateParameters::G(_, alpha) => vec![alpha.clone()],
             RateParameters::R(log_rate_cat, log_rate_weights) => {
@@ -120,7 +120,7 @@ impl RateParameters {
         }
     }
 
-    fn calc_rate_matrix(
+    pub fn calc_rate_matrix(
         &self,
         R: &Tensor,
         log_pi: &Tensor,
@@ -144,7 +144,7 @@ impl RateParameters {
         (S, sqrt_pi)
     }
 
-    fn likelihood(
+    pub fn likelihood(
         &self,
         felsenstein_op: FelsensteinWithEdgeOp,
         R: &Tensor,
@@ -165,7 +165,7 @@ impl RateParameters {
         .unwrap()
     }
 
-    fn likelihood_per_site(
+    pub fn likelihood_per_site(
         &self,
         felsenstein_op: FelsensteinWithEdgeOp,
         R: &Tensor,
@@ -450,7 +450,7 @@ impl Optimizable for ModelParameters {
     }
 }
 
-fn optimize(
+pub fn optimize(
     model: &impl Optimizable,
     min_iterations: usize,
     max_iterations: usize,

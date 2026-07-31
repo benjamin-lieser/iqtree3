@@ -5,8 +5,8 @@ pub mod felsenstein;
 pub mod gamma;
 pub mod io;
 pub mod model;
-mod optimization;
-mod utils;
+pub mod optimization;
+pub mod utils;
 
 use std::{
     io::Write,
@@ -423,7 +423,7 @@ pub unsafe extern "C" fn rust_mutsel(
 }
 
 #[derive(Debug, Clone, Copy)]
-enum RateModel {
+pub enum RateModel {
     G(usize),
     R(usize),
     X(f64, SiteSpecificRateModel), // this is the strength of the prior
@@ -440,7 +440,7 @@ impl RateModel {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum SiteSpecificRateModel {
+pub enum SiteSpecificRateModel {
     Triangle,
     Uniform,
     Gamma(f64),     // alpha parameter
@@ -554,7 +554,7 @@ pub enum SubstitutionModel {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Verbosity {
+pub enum Verbosity {
     Quiet,
     Min,
     Med,
