@@ -4,12 +4,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use candle_core::{Tensor, Var};
+use candle_core::{DType::F64, Device, Tensor, Var};
 use candle_nn::{Optimizer, ops::softmax};
+use linfa::prelude::DatasetBase;
+use linfa::traits::{Fit, Predict};
+use linfa_clustering::KMeans;
+use ndarray::Array2;
 use phylo_grad::FelsensteinTree;
 
 use crate::{
-    RateModel, SiteSpecificRateModel, SubstitutionModel, Verbosity,
+    MutselParams, RateModel, SiteSpecificRateModel, SubstitutionModel, Verbosity,
     felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp},
     gamma::GammaOp,
     model,
@@ -214,6 +218,143 @@ impl RateParameters {
         };
 
         likelihood
+    }
+}
+
+fn cluster_log_pi(log_pi: &Tensor, num_cluster: usize) -> anyhow::Result<(Tensor, Tensor)> {
+    let log_pi_rows = log_pi.to_vec2::<f64>()?;
+    let num_sites = log_pi_rows.len();
+    let num_features = log_pi_rows[0].len();
+
+    let k = num_cluster.min(num_sites);
+
+    let observations = Array2::from_shape_vec(
+        (num_sites, num_features),
+        log_pi_rows.iter().flatten().copied().collect::<Vec<_>>(),
+    )?;
+    let dataset = DatasetBase::from(observations);
+    let model = KMeans::params(k).max_n_iterations(100).fit(&dataset)?;
+    let centers = model.centroids().to_owned();
+    let labels = model.predict(&dataset);
+
+    let centers = Tensor::from_slice(centers.as_slice().unwrap(), &[k, num_features], &Device::Cpu)?;
+    let clustering = Tensor::from_vec(
+        labels.iter().map(|label| *label as i64).collect::<Vec<_>>(),
+        &[num_sites],
+        &Device::Cpu,
+    )?;
+
+    Ok((centers, clustering))
+}
+
+pub struct CATParameters {
+    pub felsenstein_op: FelsensteinWithEdgeOp,
+    pub log_branch_lengths: Var,
+    pub log_R: Var,
+    pub init_log_R: Tensor,
+    pub log_pi: Var,
+    pub hyperparameters: MutselParams,
+    pub log_pi_centers: Var,
+    pub clustering: Tensor,
+}
+
+impl CATParameters {
+    pub fn new(
+        felsenstein_op: FelsensteinWithEdgeOp,
+        log_branch_lengths: &Tensor,
+        init_log_R: &Tensor,
+        log_pi: &Tensor,
+        hyperparameters: MutselParams,
+        num_cluster: usize,
+    ) -> Self {
+        let (log_pi_centers, clustering) = cluster_log_pi(log_pi, num_cluster)
+            .expect("failed to cluster log_pi for CATParameters");
+
+        Self {
+            felsenstein_op,
+            log_branch_lengths: Var::from_tensor(log_branch_lengths).unwrap(),
+            log_R: Var::from_tensor(init_log_R).unwrap(),
+            init_log_R: init_log_R.detach().copy().unwrap(),
+            log_pi: Var::from_tensor(&log_pi_centers.index_select(&clustering, 0).unwrap()).unwrap(),
+            hyperparameters,
+            log_pi_centers: Var::from_tensor(&log_pi_centers).unwrap(),
+            clustering,
+        }
+    }
+    pub fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
+        let Mu = Mu(&self.log_R.as_detached_tensor());
+
+        model::calc_rate_matrix(
+            &Mu,
+            &self.log_pi.as_detached_tensor(),
+            &tensor_full(1.0, &[]),
+            SubstitutionModel::MutSel,
+        )
+    }
+}
+
+impl Optimizable for CATParameters {
+    fn variables(&self) -> Vec<Var> {
+        vec![
+            self.log_branch_lengths.clone(),
+            self.log_R.clone(),
+            self.log_pi.clone(),
+            self.log_pi_centers.clone(),
+        ]
+    }
+
+    fn likelihood(&self) -> Tensor {
+        let branch_lengths = self.log_branch_lengths.exp().unwrap();
+        let Mu = Mu(&self.log_R);
+
+        let (S, sqrt_pi) = model::calc_rate_matrix(
+            &Mu,
+            &self.log_pi,
+            &tensor_full(1.0, &[]),
+            SubstitutionModel::MutSel,
+        );
+
+        let log_likelihoods = S
+            .apply_op3(&sqrt_pi, &branch_lengths, self.felsenstein_op.clone())
+            .unwrap();
+        log_likelihoods.sum_all().unwrap()
+    }
+
+    fn penalty(&self) -> Tensor {
+        let log_pi_centers = self
+            .log_pi_centers
+            .index_select(&self.clustering, 0)
+            .unwrap();
+        let pi_penalty = (&log_pi_centers - self.log_pi.as_tensor())
+            .unwrap()
+            .powf(2.0)
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let pi_penalty = (pi_penalty * self.hyperparameters.pi_reg).unwrap();
+
+        fn log_Mu(log_R: &Tensor) -> Tensor {
+            let Mu = Mu(log_R);
+
+            // One out the diagonal, since we only want to penalize the off-diagonal elements
+            let Mu = (&Mu
+                - (&Mu - 1.0).unwrap()
+                    * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
+            .unwrap();
+
+            return Mu.log().unwrap();
+        }
+
+        let Mu = log_Mu(&self.log_R)
+            .sub(&log_Mu(&self.init_log_R))
+            .unwrap()
+            .powf(2.0)
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let Mu_penalty = (Mu * self.hyperparameters.Mu_reg).unwrap();
+
+        (pi_penalty + Mu_penalty).unwrap()
     }
 }
 
@@ -768,7 +909,7 @@ pub fn optimize_internal(
             &f_class,
             &log_branch_lengths,
             &mutsel_params,
-            verbosity
+            verbosity,
         );
         var_log_global_scaling = global_scaling;
         var_alpha = alpha;
@@ -796,18 +937,32 @@ pub fn optimize_internal(
         log_branch_length_scaling: var_log_branch_length_scaling,
         init_log_branch_lengths: log_branch_lengths.detach(),
         rate_parameters: RateParameters::init(num_sites, rate_model, var_alpha),
-        pi_reg: mutsel_params.pi_reg,
+        pi_reg: 0.2,
         R_reg: mutsel_params.Mu_reg,
         branch_length_penalty: mutsel_params.branch_reg,
-        init_log_R,
+        init_log_R: init_log_R.clone(),
         init_log_pi,
         substitution_model,
     };
 
-    optimize(&model, 100, 500, 1e-5, 5, verbosity);
+    optimize(&model, 100, 500, 1e-3, 5, verbosity);
 
-    let (S, sqrt_pi) = model.calc_rate_matrix();
-    let rate_para = model.rate_parameters.parameters_for_iqtree();
+    let log_branch_lengths = (model.log_branch_length_scaling.broadcast_add(&model.log_global_scaling)).unwrap();
+
+    // Clustering and thirst optimiztation
+
+    let cat_model = CATParameters::new(
+        model.felsenstein_op.clone(),
+        &log_branch_lengths,
+        &init_log_R,
+        &model.log_pi.as_detached_tensor(),
+        mutsel_params,
+        60,
+    );
+
+    optimize(&cat_model, 100, 500, 1e-5, 5, verbosity);
+
+    let (S, sqrt_pi) = cat_model.calc_rate_matrix();
 
     let substitution_rates = model::substitution_rates(&S, &sqrt_pi);
 
@@ -819,7 +974,7 @@ pub fn optimize_internal(
 
     let S = S.broadcast_div(&tensor_full(average_rate, &[])).unwrap();
 
-    Ok((S, sqrt_pi, rate_para, substitution_rates))
+    Ok((S, sqrt_pi, Tensor::zeros(&[0], F64,  &candle_core::Device::Cpu).unwrap(), substitution_rates))
 }
 
 // Outputs categories and log_weights
@@ -834,4 +989,23 @@ fn normalize_rate_cat(log_rate_cat: &Tensor, log_rate_weights: &Tensor) -> (Tens
         .exp()
         .unwrap();
     (categories, log_weights)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clusters_log_pi_into_centers_and_assignments() {
+        let log_pi = Tensor::from_vec(
+            vec![0.0f64, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0],
+            &[4, 2],
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let (centers, clustering) = cluster_log_pi(&log_pi, 2).unwrap();
+        assert_eq!(centers.dims(), &[2, 2]);
+        assert_eq!(clustering.dims(), &[4]);
+    }
 }
