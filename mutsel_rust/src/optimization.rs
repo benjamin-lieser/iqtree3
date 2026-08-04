@@ -247,6 +247,87 @@ fn cluster_log_pi(log_pi: &Tensor, num_cluster: usize) -> anyhow::Result<(Tensor
     Ok((centers, clustering))
 }
 
+/// Calculates the mutation rate matrix from is log parametrization. This is a lower triangular matrix with the exchanabilities and the equilibirum in the diagonal. Both as in log space.
+/// Returns Mu and the equilibrium frequencies in the diagonal. (not log space)
+pub fn Mu(log_parameter: &Tensor) -> Tensor {
+    let parameter = log_parameter.exp().unwrap();
+    let diagonal = (&parameter
+        * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
+    .unwrap();
+    let off_diagonal = (parameter - &diagonal).unwrap();
+
+    let pi = diagonal
+        .broadcast_div(&diagonal.sum_all().unwrap())
+        .unwrap();
+
+    let R = (&off_diagonal + off_diagonal.t().unwrap()).unwrap();
+
+    let Q = R.matmul(&pi).unwrap();
+
+    let Q = (&Q
+        - &Q * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
+    .unwrap();
+
+    // Normalize to 1 expected mutation per unit time.
+
+    let row_sum = Q.sum(1).unwrap();
+    // Pi is still a diagonal matrix, so we can just sum the rows to get the diagonal elements.
+    let pi_vec = pi.sum(1).unwrap();
+    let sum = row_sum.dot(&pi_vec).unwrap();
+    let Q = Q.broadcast_div(&sum).unwrap();
+
+    // This has one expected mutation per unit time. The guide tree will be more in the regime of 1 substitution.
+    // We multiply with 1.6 to make them more equal in practise, the precise factor is fitted on the alignment.
+    // (This does depend on the protein and how many columns are under strong selection)
+
+    let Q = (Q * 1.6).unwrap();
+
+    // diagonal is zero here, but they are not used anyway
+    (Q + pi).unwrap()
+}
+pub struct Mu {
+    pub log_rates: Var,
+    pub init_log_rates: Tensor,
+}
+
+impl Mu {
+    fn new(pam : &str) -> Self {
+        let init_log_rates = crate::data::load_lower_R_with_equi(pam).log().unwrap();
+
+        let log_rates = Var::from_tensor(&init_log_rates).unwrap();
+        Self {
+            log_rates,
+            init_log_rates : init_log_rates.copy().unwrap(),
+        }
+    }
+
+    fn mu(&self) -> Tensor {
+        Mu(&self.log_rates)
+    }
+
+    fn penalty(&self) -> Tensor {
+        fn log_Mu(log_R: &Tensor) -> Tensor {
+            let Mu = Mu(log_R);
+
+            // One out the diagonal, since we only want to penalize the off-diagonal elements
+            let Mu = (&Mu
+                - (&Mu - 1.0).unwrap()
+                    * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
+            .unwrap();
+
+            return Mu.log().unwrap();
+        }
+
+        let Mu = log_Mu(&self.log_rates)
+            .sub(&log_Mu(&self.init_log_rates))
+            .unwrap()
+            .powf(2.0)
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        Mu
+    }
+}
 pub struct CATParameters {
     pub felsenstein_op: FelsensteinWithEdgeOp,
     pub log_branch_lengths: Var,
@@ -282,7 +363,7 @@ impl CATParameters {
         }
     }
     pub fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
-        let Mu = Mu(&self.log_R.as_detached_tensor());
+        let Mu = Mu(&self.log_R);
 
         model::calc_rate_matrix(
             &Mu,
@@ -292,6 +373,8 @@ impl CATParameters {
         )
     }
 }
+
+
 
 impl Optimizable for CATParameters {
     fn variables(&self) -> Vec<Var> {
@@ -800,41 +883,6 @@ pub fn light_pmsf(
     site_freq
 }
 
-/// Calculates the mutation rate matrix from the log_R variable. This is a lower triangular matrix with the exchanabilities and the equilibirum in the diagonal. Both as in log space.
-/// Returns Mut and the equilibrium frequencies in the diagonal. (not log space)
-pub fn Mu(log_parameter: &Tensor) -> Tensor {
-    let parameter = log_parameter.exp().unwrap();
-    let diagonal = (&parameter
-        * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
-    .unwrap();
-    let off_diagonal = (parameter - &diagonal).unwrap();
-
-    let pi = diagonal
-        .broadcast_div(&diagonal.sum_all().unwrap())
-        .unwrap();
-
-    let R = (&off_diagonal + off_diagonal.t().unwrap()).unwrap();
-
-    let Q = R.matmul(&pi).unwrap();
-
-    let Q = (&Q
-        - &Q * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
-    .unwrap();
-
-    let row_sum = Q.sum(1).unwrap();
-    let pi_vec = pi.sum(1).unwrap();
-    let sum = row_sum.dot(&pi_vec).unwrap();
-    let Q = Q.broadcast_div(&sum).unwrap();
-
-    // This has one expected mutation per unit time. The guide tree will be more in the regime of 1 substitution.
-    // So we mutlpiphy with 20. Exact factor is fitted later. We also divide with 8 which is emprically close to the optimum.
-    // (This does depend on the protein and how many columns are under strong selection)
-
-    let Q = (Q * (20.0 / 12.0)).unwrap();
-
-    // diagonal is zero here, but they are not used anyway
-    (Q + pi).unwrap()
-}
 
 // Used with the MutSel model.
 fn loadMu() -> Tensor {
