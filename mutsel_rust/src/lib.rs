@@ -518,7 +518,7 @@ pub enum SubstitutionModel {
     RelaxPMSF,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Verbosity {
     Quiet,
     Min,
@@ -539,18 +539,10 @@ impl Verbosity {
         }
     }
 
+    /// True if the current verbosity is at least `level`, i.e. -v (Med) also
+    /// enables everything gated at Min. Quiet never prints.
     fn should_print(&self, level: Verbosity) -> bool {
-        match (self, level) {
-            (Verbosity::Quiet, _) => false,
-            (
-                Verbosity::Min,
-                Verbosity::Min | Verbosity::Med | Verbosity::Max | Verbosity::Debug,
-            ) => true,
-            (Verbosity::Med, Verbosity::Med | Verbosity::Max | Verbosity::Debug) => true,
-            (Verbosity::Max, Verbosity::Max | Verbosity::Debug) => true,
-            (Verbosity::Debug, _) => true,
-            _ => false,
-        }
+        *self != Verbosity::Quiet && *self >= level
     }
 }
 

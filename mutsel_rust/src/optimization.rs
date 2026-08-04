@@ -483,9 +483,9 @@ fn optimize(
                 neg_likelihood.to_scalar::<f64>().unwrap(),
                 current_opt
             );
+            model.print_state();
         }
 
-        model.print_state();
         let grads = opt_fn.backward().unwrap();
         opt.step(&grads).unwrap();
 
@@ -814,6 +814,8 @@ pub fn optimize_internal(
     let average_rate = substitution_rates.iter().sum::<f64>() / substitution_rates.len() as f64;
     if verbosity.should_print(Verbosity::Min) {
         println!("Average substitution rate: {:.3}", average_rate);
+    }
+    if verbosity.should_print(Verbosity::Med) {
         model.save_npz(Path::new(&format!("{}.mutsel.npz", out_prefix)));
     }
 
