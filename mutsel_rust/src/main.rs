@@ -103,6 +103,7 @@ fn run(args: &[String]) {
     let newick = args[0].clone();
     let fasta = args[1].clone();
     let model = args[2].clone();
+    let num_categories = args[3].parse::<usize>().unwrap();
 
     let substitution_model = match model.to_lowercase().as_str() {
         "mutselapprox" => mutsel_rust::SubstitutionModel::MutSelApprox,
@@ -139,13 +140,13 @@ fn run(args: &[String]) {
     let model = MixtureModel {
         felsenstein_op: FelsensteinWithEdgeOp::new(Arc::new(Mutex::new(felsenstein))),
         log_R: Var::from_tensor(&log_R).unwrap(),
-        alpha: RateParameters::gamma(4, 0.5),
+        alpha: RateParameters::gamma(num_categories, 0.5),
         log_branch_lengths: Var::from_tensor(&log_branch_lenghts).unwrap(),
         substitution_model,
         L
     };
 
-    optimization::optimize(&model, 100, 1000, 1e-4, 5, mutsel_rust::Verbosity::Debug);
+    optimization::optimize(&model, 100, 1000, 1e-6, 5, mutsel_rust::Verbosity::Debug);
 
 }
 
