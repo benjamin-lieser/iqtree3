@@ -244,7 +244,7 @@ pub fn cat_mutsel(
         let changed_pos = new_assignment.ne(&model.clustering).unwrap();
         let cluster_centers = model.log_pi_centers.index_select(&new_assignment, 0).unwrap();
         let L = model.log_pi.dim(0).unwrap();
-        let mask = changed_pos.broadcast_as(&[L, 20]).unwrap();
+        let mask = changed_pos.unsqueeze(1).unwrap().broadcast_as(&[L, 20]).unwrap();
         let new_log_pi = mask.where_cond(&cluster_centers, &model.log_pi).unwrap();
         model.log_pi.set(&new_log_pi).unwrap();
 
