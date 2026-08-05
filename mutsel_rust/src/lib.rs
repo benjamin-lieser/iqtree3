@@ -7,6 +7,7 @@ pub mod io;
 pub mod model;
 pub mod optimization;
 pub mod utils;
+pub mod cat_model;
 
 use std::{
     io::Write,
@@ -236,6 +237,7 @@ fn restore_stdout_stderr(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct MutselParams {
     pi_reg: f64,
     Mu_reg: f64,
@@ -359,6 +361,7 @@ pub unsafe extern "C" fn rust_mutsel(
         num_leaves as usize,
     );
 
+    /* Old mutsel
     let (S, sqrt_pi, _rate_para, _substitution_rates) = optimization::optimize_internal(
         felsenstein,
         branch_lengths,
@@ -372,6 +375,14 @@ pub unsafe extern "C" fn rust_mutsel(
         out_prefix,
     )
     .unwrap();
+    */
+
+    let (S, sqrt_pi) = cat_model::cat_mutsel(
+        felsenstein,
+        branch_lengths,
+        mutsel_params,
+        crate::Verbosity::from_u8(verbose),
+    );
 
     let (R, pi) = model::phylograd2iqtree_parametrization(&S, &sqrt_pi).unwrap();
     let site_freq = pi.to_vec2().unwrap();
