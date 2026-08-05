@@ -225,8 +225,8 @@ pub fn cat_mutsel(
         &orig_log_categories,
     );
 
-    for _epoch in 0..5 {
-        crate::optimization::optimize(&model, 100, 1000, 1e-5, 5, verbosity);
+    for _epoch in 0..10 {
+        crate::optimization::optimize(&model, 10, 1000, 1e-5, 5, verbosity);
 
         // Assign new cluster centers based on the current log_pi estimates
 
