@@ -119,7 +119,6 @@ impl Optimizable for CATParameters {
             center_penalty.to_scalar::<f64>().unwrap()
         );
 
-
         (pi_penalty + Mu_penalty + center_penalty).unwrap()
     }
 }
@@ -129,7 +128,7 @@ pub fn mixture_posteriors(
     log_branch_lengths: &Tensor,
     log_categories: &Tensor,
     log_weights: &Tensor,
-    Mu : &Mu,
+    Mu: &Mu,
 ) -> Tensor {
     let mut likelihoods = vec![];
 
@@ -242,14 +241,25 @@ pub fn cat_mutsel(
 
         // For the positions that changed cluster assignments, update the log_pi to the new cluster center
         let changed_pos = new_assignment.ne(&model.clustering).unwrap();
-        let cluster_centers = model.log_pi_centers.index_select(&new_assignment, 0).unwrap();
+        let cluster_centers = model
+            .log_pi_centers
+            .index_select(&new_assignment, 0)
+            .unwrap();
         let L = model.log_pi.dim(0).unwrap();
-        let mask = changed_pos.unsqueeze(1).unwrap().broadcast_as(&[L, 20]).unwrap();
+        let mask = changed_pos
+            .unsqueeze(1)
+            .unwrap()
+            .broadcast_as(&[L, 20])
+            .unwrap();
         let new_log_pi = mask.where_cond(&cluster_centers, &model.log_pi).unwrap();
         model.log_pi.set(&new_log_pi).unwrap();
 
         // Print the number of sites that changed cluster assignments
-        let changed = new_assignment.ne(&model.clustering).unwrap().to_vec1::<u8>().unwrap();
+        let changed = new_assignment
+            .ne(&model.clustering)
+            .unwrap()
+            .to_vec1::<u8>()
+            .unwrap();
         let num_changed = changed.iter().map(|&x| x as usize).sum::<usize>();
 
         println!(
@@ -257,7 +267,6 @@ pub fn cat_mutsel(
             _epoch + 1,
             num_changed
         );
-
 
         model.clustering = new_assignment;
     }
