@@ -121,10 +121,11 @@ pub fn mixture_posteriors(
     log_branch_lengths: &Tensor,
     log_categories: &Tensor,
     log_weights: &Tensor,
+    Mu : &Mu,
 ) -> Tensor {
     let mut likelihoods = vec![];
 
-    let Mu = Mu::new().mu();
+    let Mu = Mu.mu();
 
     for category in 0..log_categories.dim(0).unwrap() {
         let category_tensor = log_categories.get(category).unwrap();
@@ -198,6 +199,7 @@ pub fn cat_mutsel(
         &log_branch_lengths,
         &orig_log_categories,
         &orig_categories_log_weights,
+        &Mu::new(),
     );
 
     let cluster_assignments = posteriors.argmax(0).unwrap();
@@ -225,6 +227,7 @@ pub fn cat_mutsel(
             &model.log_branch_lengths,
             &model.log_pi_centers,
             &orig_categories_log_weights,
+            &model.mu,
         );
 
         model.clustering = posteriors.argmax(0).unwrap();
