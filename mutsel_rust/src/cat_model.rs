@@ -241,10 +241,8 @@ pub fn cat_mutsel(
         let new_assignment = posteriors.argmax(0).unwrap();
 
         // Print the number of sites that changed cluster assignments
-        let num_changed = new_assignment.ne(&model.clustering).unwrap()
-            .sum_all()
-            .unwrap()
-            .to_scalar::<i64>().unwrap();
+        let changed = new_assignment.ne(&model.clustering).unwrap().to_vec1::<u8>().unwrap();
+        let num_changed = changed.iter().map(|&x| x as usize).sum::<usize>();
 
         println!(
             "Epoch {}: {} sites changed cluster assignments",
