@@ -112,6 +112,14 @@ impl Optimizable for CATParameters {
             .unwrap();
         let center_penalty = (center_penalty * self.hyperparameters.branch_reg).unwrap();
 
+        println!(
+            "Penalty: pi_penalty = {}, Mu_penalty = {}, center_penalty = {}",
+            pi_penalty.to_scalar::<f64>().unwrap(),
+            Mu_penalty.to_scalar::<f64>().unwrap(),
+            center_penalty.to_scalar::<f64>().unwrap()
+        );
+
+
         (pi_penalty + Mu_penalty + center_penalty).unwrap()
     }
 }
@@ -208,7 +216,7 @@ pub fn cat_mutsel(
         op.into_with_edge_op(),
         &log_branch_lengths,
         &Mu::new(),
-        &&orig_log_categories
+        &orig_log_categories
             .index_select(&cluster_assignments, 0)
             .unwrap(),
         hyperparameters,
@@ -230,7 +238,22 @@ pub fn cat_mutsel(
             &model.mu,
         );
 
-        model.clustering = posteriors.argmax(0).unwrap();
+        let new_assignment = posteriors.argmax(0).unwrap();
+
+        // Print the number of sites that changed cluster assignments
+        let num_changed = new_assignment.ne(&model.clustering).unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<i64>().unwrap();
+
+        println!(
+            "Epoch {}: {} sites changed cluster assignments",
+            _epoch + 1,
+            num_changed
+        );
+
+
+        model.clustering = new_assignment;
     }
 
     model.calc_rate_matrix()
