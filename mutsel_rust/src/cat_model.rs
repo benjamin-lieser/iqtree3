@@ -224,7 +224,7 @@ pub fn cat_mutsel(
         &orig_log_categories,
     );
 
-    for _epoch in 0..10 {
+    for _epoch in 0..20 {
         crate::optimization::optimize(&model, 10, 1000, 1e-5, 5, verbosity);
 
         // Assign new cluster centers based on the current log_pi estimates
@@ -233,7 +233,7 @@ pub fn cat_mutsel(
             model.felsenstein_op.clone().into_fwd_op(),
             &model.log_branch_lengths,
             &model.log_pi_centers,
-            &orig_categories_log_weights,
+            &tensor_full(0.0, &[model.log_pi_centers.dim(0).unwrap()]),
             &model.mu,
         );
 
