@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use candle_core::DType::U32;
 use candle_core::Tensor;
 use candle_core::Var;
 use phylo_grad::FelsensteinTree;
@@ -63,10 +64,7 @@ impl CATParameters {
 
         let mut means = Vec::with_capacity(num_clusters);
         for k in 0..num_clusters {
-            let mask = self
-                .clustering
-                .eq(k as u32)
-                .unwrap();
+            let mask = self.clustering.eq(k as u32).unwrap().to_dtype(U32).unwrap();
             let count = mask.sum_all().unwrap().to_scalar::<u32>().unwrap();
             if count == 0 {
                 means.push(tensor_full(0.0, &[20]));
