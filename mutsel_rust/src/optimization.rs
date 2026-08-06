@@ -431,7 +431,11 @@ impl Optimizable for ModelParameters {
                 println!("alpha: {}", alpha.to_scalar::<f64>().unwrap())
             }
             RateParameters::G(_, _) => {}
-            RateParameters::R(log_rate_cat, log_rate_weights) => {
+            // A single free rate category is fixed at rate 1.0 with weight 1.0,
+            // so there is nothing to report (this is what IQ-TREE always asks for).
+            RateParameters::R(log_rate_cat, log_rate_weights)
+                if log_rate_weights.dims()[0] > 1 =>
+            {
                 let (categories, log_weights) = normalize_rate_cat(
                     &log_rate_cat.as_detached_tensor(),
                     &log_rate_weights.as_detached_tensor(),
@@ -440,6 +444,7 @@ impl Optimizable for ModelParameters {
                 println!("Rate categories: {}", categories);
                 println!("Rate category weights: {}", weights);
             }
+            RateParameters::R(_, _) => {}
             RateParameters::X(site_rate_var, _, site_model) => {
                 let rates = site_model.rates_from_parameters(site_rate_var);
                 let histogram = histogram(&rates, 10);
