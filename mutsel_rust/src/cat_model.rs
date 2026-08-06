@@ -253,6 +253,11 @@ pub fn cat_mutsel(
             num_changed
         );
 
+        if num_changed == 0 {
+            println!("No sites changed cluster assignments. Stopping optimization.");
+            break;
+        }
+
         // Print assignment summary
         let mut assignment_summary = vec![0; model.log_pi_centers.dim(0).unwrap()];
         for &assignment in new_assignment.to_vec1::<u32>().unwrap().iter() {
