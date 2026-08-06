@@ -148,11 +148,7 @@ pub fn mixture_posteriors(
         );
 
         let log_likelihoods = S
-            .apply_op3(
-                &sqrt_pi,
-                &branch_lengths,
-                felsenstein_op.clone(),
-            )
+            .apply_op3(&sqrt_pi, &branch_lengths, felsenstein_op.clone())
             .unwrap();
         likelihoods.push(log_likelihoods);
     }
@@ -230,16 +226,14 @@ pub fn cat_mutsel(
         crate::optimization::optimize(&model, 10, 1000, 1e-5, 5, verbosity);
 
         // Assign new cluster centers based on the current log_pi estimates
+        let euclidian_distances = (model.log_pi.as_tensor() - model.log_pi_centers.as_tensor())
+            .unwrap()
+            .powf(2.0)
+            .unwrap()
+            .sum(1)
+            .unwrap();
 
-        let posteriors = mixture_posteriors(
-            model.felsenstein_op.clone().into_fwd_op(),
-            &model.log_branch_lengths,
-            &model.log_pi_centers,
-            &tensor_full(0.0, &[model.log_pi_centers.dim(0).unwrap()]),
-            &model.mu,
-        );
-
-        let new_assignment = posteriors.argmax(0).unwrap();
+        let new_assignment = euclidian_distances.argmin(0).unwrap();
 
         // For the positions that changed cluster assignments, update the log_pi to the new cluster center
         let changed_pos = new_assignment.ne(&model.clustering).unwrap();
