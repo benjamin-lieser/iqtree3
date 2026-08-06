@@ -72,7 +72,7 @@ impl CATParameters {
             }
             let sum = self
                 .log_pi
-                .broadcast_mul(&mask.unsqueeze(1).unwrap())
+                .broadcast_mul(&mask.to_dtype(candle_core::DType::F64).unwrap().unsqueeze(1).unwrap())
                 .unwrap()
                 .sum(0)
                 .unwrap();
