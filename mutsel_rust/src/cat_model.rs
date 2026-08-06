@@ -23,7 +23,6 @@ pub struct CATParameters {
     pub log_pi: Var,
     pub mu: Mu,
     pub hyperparameters: MutselParams,
-    pub log_pi_centers: Var,
     pub center_centers: Tensor,
     pub clustering: Tensor,
 }
@@ -36,7 +35,6 @@ impl CATParameters {
         log_pi: &Tensor,
         hyperparameters: MutselParams,
         clustering: &Tensor,
-        log_pi_centers: &Tensor,
         center_centers: &Tensor,
     ) -> Self {
         Self {
@@ -45,7 +43,6 @@ impl CATParameters {
             mu: mu.clone(),
             log_pi: Var::from_tensor(log_pi).unwrap(),
             hyperparameters,
-            log_pi_centers: Var::from_tensor(log_pi_centers).unwrap(),
             center_centers: center_centers.detach().copy().unwrap(),
             clustering: clustering.clone(),
         }
@@ -60,6 +57,32 @@ impl CATParameters {
             SubstitutionModel::MutSel,
         )
     }
+
+    pub fn cluster_mean_log_pi(&self) -> Tensor {
+        let num_clusters = self.center_centers.dim(0).unwrap();
+
+        let mut means = Vec::with_capacity(num_clusters);
+        for k in 0..num_clusters {
+            let mask = self
+                .clustering
+                .eq(k as u32)
+                .unwrap();
+            let count = mask.sum_all().unwrap().to_scalar::<u32>().unwrap();
+            if count == 0 {
+                means.push(tensor_full(0.0, &[20]));
+                continue;
+            }
+            let sum = self
+                .log_pi
+                .broadcast_mul(&mask.unsqueeze(1).unwrap())
+                .unwrap()
+                .sum(0)
+                .unwrap();
+            means.push((sum / count as f64).unwrap());
+        }
+
+        Tensor::stack(&means, 0).unwrap()
+    }
 }
 
 impl Optimizable for CATParameters {
@@ -68,7 +91,6 @@ impl Optimizable for CATParameters {
             self.log_branch_lengths.clone(),
             self.mu.variable(),
             self.log_pi.clone(),
-            self.log_pi_centers.clone(),
         ]
     }
 
@@ -90,11 +112,11 @@ impl Optimizable for CATParameters {
     }
 
     fn penalty(&self) -> Tensor {
-        let log_pi_centers = self
-            .log_pi_centers
-            .index_select(&self.clustering, 0)
-            .unwrap();
-        let pi_penalty = (&log_pi_centers - self.log_pi.as_tensor())
+        let log_pi_centers = self.cluster_mean_log_pi();
+
+        let per_site_centers = log_pi_centers.index_select(&self.clustering, 0).unwrap();
+
+        let pi_penalty = (&per_site_centers - self.log_pi.as_tensor())
             .unwrap()
             .powf(2.0)
             .unwrap()
@@ -104,7 +126,7 @@ impl Optimizable for CATParameters {
 
         let Mu_penalty = (self.mu.penalty() * self.hyperparameters.Mu_reg).unwrap();
 
-        let center_penalty = (&self.center_centers - self.log_pi_centers.as_tensor())
+        let center_penalty = (&self.center_centers - &log_pi_centers)
             .unwrap()
             .powf(2.0)
             .unwrap()
@@ -219,18 +241,18 @@ pub fn cat_mutsel(
         hyperparameters,
         &cluster_assignments,
         &orig_log_categories,
-        &orig_log_categories,
     );
 
     for _epoch in 0..20 {
         crate::optimization::optimize(&model, 10, 1000, 1e-5, 5, verbosity);
 
         // Assign new cluster centers based on the current log_pi estimates
+        let log_pi_centers = model.cluster_mean_log_pi();
         let euclidian_distances = model
             .log_pi
             .unsqueeze(1)
             .unwrap()
-            .broadcast_sub(&model.log_pi_centers.unsqueeze(0).unwrap())
+            .broadcast_sub(&log_pi_centers.unsqueeze(0).unwrap())
             .unwrap()
             .powf(2.0)
             .unwrap()
@@ -259,7 +281,7 @@ pub fn cat_mutsel(
         }
 
         // Print assignment summary
-        let mut assignment_summary = vec![0; model.log_pi_centers.dim(0).unwrap()];
+        let mut assignment_summary = vec![0; log_pi_centers.dim(0).unwrap()];
         for &assignment in new_assignment.to_vec1::<u32>().unwrap().iter() {
             assignment_summary[assignment as usize] += 1;
         }
