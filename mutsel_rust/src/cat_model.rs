@@ -226,11 +226,15 @@ pub fn cat_mutsel(
         crate::optimization::optimize(&model, 10, 1000, 1e-5, 5, verbosity);
 
         // Assign new cluster centers based on the current log_pi estimates
-        let euclidian_distances = (model.log_pi.as_tensor() - model.log_pi_centers.as_tensor())
+        let euclidian_distances = model
+            .log_pi
+            .unsqueeze(1)
+            .unwrap()
+            .broadcast_sub(&model.log_pi_centers.unsqueeze(0).unwrap())
             .unwrap()
             .powf(2.0)
             .unwrap()
-            .sum(1)
+            .sum(2)
             .unwrap();
 
         let new_assignment = euclidian_distances.argmin(0).unwrap();
