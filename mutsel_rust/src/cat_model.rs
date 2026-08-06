@@ -134,6 +134,8 @@ pub fn mixture_posteriors(
 
     let Mu = Mu.mu();
 
+    let branch_lengths = log_branch_lengths.exp().unwrap();
+
     for category in 0..log_categories.dim(0).unwrap() {
         let category_tensor = log_categories.get(category).unwrap();
         let log_pi = category_tensor.unsqueeze(0).unwrap();
@@ -148,7 +150,7 @@ pub fn mixture_posteriors(
         let log_likelihoods = S
             .apply_op3(
                 &sqrt_pi,
-                &log_branch_lengths.exp().unwrap(),
+                &branch_lengths,
                 felsenstein_op.clone(),
             )
             .unwrap();
@@ -267,6 +269,13 @@ pub fn cat_mutsel(
             _epoch + 1,
             num_changed
         );
+
+        // Print assignment summary
+        let mut assignment_summary = vec![0; model.log_pi_centers.dim(0).unwrap()];
+        for &assignment in new_assignment.to_vec1::<u32>().unwrap().iter() {
+            assignment_summary[assignment as usize] += 1;
+        }
+        println!("Cluster assignment summary: {:?}", assignment_summary);
 
         model.clustering = new_assignment;
     }
