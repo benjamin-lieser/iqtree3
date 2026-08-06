@@ -237,7 +237,7 @@ pub fn cat_mutsel(
             .sum(2)
             .unwrap();
 
-        let new_assignment = euclidian_distances.argmin(0).unwrap();
+        let new_assignment = euclidian_distances.argmin(1).unwrap();
 
         // For the positions that changed cluster assignments, update the log_pi to the new cluster center
         let changed_pos = new_assignment.ne(&model.clustering).unwrap();
