@@ -239,21 +239,6 @@ pub fn cat_mutsel(
 
         let new_assignment = euclidian_distances.argmin(1).unwrap();
 
-        // For the positions that changed cluster assignments, update the log_pi to the new cluster center
-        let changed_pos = new_assignment.ne(&model.clustering).unwrap();
-        let cluster_centers = model
-            .log_pi_centers
-            .index_select(&new_assignment, 0)
-            .unwrap();
-        let L = model.log_pi.dim(0).unwrap();
-        let mask = changed_pos
-            .unsqueeze(1)
-            .unwrap()
-            .broadcast_as(&[L, 20])
-            .unwrap();
-        let new_log_pi = mask.where_cond(&cluster_centers, &model.log_pi).unwrap();
-        model.log_pi.set(&new_log_pi).unwrap();
-
         // Print the number of sites that changed cluster assignments
         let changed = new_assignment
             .ne(&model.clustering)
