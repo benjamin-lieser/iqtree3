@@ -27,6 +27,8 @@ fn cluster_log_pi(log_pi: &Tensor, min_cluster_size: usize) -> Tensor {
     let clusterer_params = HdbscanHyperParams::builder()
         .min_cluster_size(min_cluster_size)
         .dist_metric(hdbscan::DistanceMetric::Euclidean)
+        .allow_single_cluster(true)
+        .nn_algorithm(hdbscan::NnAlgorithm::KdTree)
         .build();
 
     let clusterer = Hdbscan::new(&data, clusterer_params);
