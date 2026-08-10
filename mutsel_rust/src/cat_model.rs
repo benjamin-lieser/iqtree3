@@ -1,13 +1,17 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use candle_core::DType::U32;
-use hdbscan_rs::Hdbscan;
-use hdbscan_rs::HdbscanParams;
 use candle_core::Device;
 use candle_core::Tensor;
 use candle_core::Var;
+use linfa::Dataset;
+use linfa::traits::Predict;
 use ndarray::Array2;
+use linfa_clustering::Dbscan;
+use linfa::traits::{Fit, Transformer};
+use linfa_reduction::Pca;
 use phylo_grad::FelsensteinTree;
 
 use crate::SubstitutionModel;
@@ -23,24 +27,48 @@ use crate::MutselParams;
 use crate::felsenstein::FelsensteinWithEdgeOp;
 use crate::optimization::Mu;
 
-fn cluster_log_pi(log_pi: &Tensor, min_cluster_size: usize) -> Tensor {
+
+fn cluster_log_pi(
+    log_pi: &Tensor,
+    min_cluster_size: usize,
+    n_components: usize, // e.g. 8-10, tune to your data
+) -> Tensor {
     let num_sites = log_pi.dim(0).unwrap();
     let num_features = log_pi.dim(1).unwrap();
-
     let data = log_pi.flatten_all().unwrap().to_vec1::<f64>().unwrap();
-
     let data = Array2::from_shape_vec((num_sites, num_features), data).unwrap();
 
-    let clusterer_params = HdbscanParams {
-        min_cluster_size,
-        allow_single_cluster: true,
-        ..Default::default()
-    };
+    // Wrap as a linfa Dataset (required for Pca's Fit trait)
+    let dataset = Dataset::from(data);
 
-    let mut clusterer = Hdbscan::new(clusterer_params);
-    let labels = clusterer.fit_predict(&data.view()).unwrap().iter().map(|&x| x as u32).collect::<Vec<_>>();
+    // Fit PCA and project down to n_components dimensions
+    let pca = Pca::params(n_components).fit(&dataset).unwrap();
+    let reduced = pca.predict(dataset); // Dataset<f64, ()>, now with n_components columns
+    let reduced_records = reduced.records().to_owned(); // Array2<f64>
+
+    // Run DBSCAN on the reduced data
+    let clusters = Dbscan::params(min_cluster_size)
+        .transform(&reduced_records)
+        .unwrap();
+
+    // Make labels contiguous
+    let mut unique_ids: Vec<usize> = clusters.iter().flatten().copied().collect::<HashSet<_>>().into_iter().collect();
+    unique_ids.sort();
+    let num_clusters = unique_ids.len();
+    let mut id_map = std::collections::HashMap::new();
+    for (new_id, old_id) in unique_ids.iter().enumerate() {
+        id_map.insert(*old_id, new_id);
+    }
+    let labels: Vec<usize> = clusters
+        .iter()
+        .map(|c| *id_map.get(c).unwrap())
+        .collect();
+    }
+
     Tensor::from_slice(&labels, &[labels.len()], &Device::Cpu).unwrap()
 }
+
+
 pub struct GlobalScalingPiMuParameters {
     pub felsenstein_op: FelsensteinOp,
     pub log_global_scaling: Var,
