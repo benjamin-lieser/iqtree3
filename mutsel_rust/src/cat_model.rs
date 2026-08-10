@@ -2,13 +2,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use candle_core::DType::U32;
+use candle_core::Device;
 use candle_core::Tensor;
 use candle_core::Var;
+use hdbscan::Hdbscan;
+use hdbscan::HdbscanHyperParams;
 use phylo_grad::FelsensteinTree;
 
 use crate::SubstitutionModel;
 use crate::Verbosity;
 use crate::felsenstein;
+use crate::felsenstein::FelsensteinOp;
 use crate::felsenstein::FelsensteinWithEdgeFwdOp;
 use crate::model;
 use crate::optimization::Optimizable;
@@ -18,13 +22,74 @@ use crate::MutselParams;
 use crate::felsenstein::FelsensteinWithEdgeOp;
 use crate::optimization::Mu;
 
+fn cluster_log_pi(log_pi: &Tensor, min_cluster_size: usize) -> Tensor {
+    let data = log_pi.to_vec2::<f64>().unwrap();
+    let clusterer_params = HdbscanHyperParams::builder()
+        .min_cluster_size(min_cluster_size)
+        .dist_metric(hdbscan::DistanceMetric::Euclidean)
+        .build();
+
+    let clusterer = Hdbscan::new(&data, clusterer_params);
+    let labels = clusterer.cluster().unwrap().iter().map(|&x| x as u32).collect::<Vec<_>>();
+    Tensor::from_slice(&labels, &[labels.len()], &Device::Cpu).unwrap()
+}
+pub struct GlobalScalingPiMuParameters {
+    pub felsenstein_op: FelsensteinOp,
+    pub log_global_scaling: Var,
+    pub mu: Mu,
+    pub log_pi: Var,
+    pub log_pi_init: Tensor,
+    pub pi_reg: f64,
+    pub Mu_reg: f64,
+}
+
+impl Optimizable for GlobalScalingPiMuParameters {
+    fn variables(&self) -> Vec<Var> {
+        vec![
+            self.log_global_scaling.clone(),
+            self.mu.variable(),
+            self.log_pi.clone(),
+        ]
+    }
+    fn likelihood(&self) -> Tensor {
+        let global_scaling = self.log_global_scaling.exp().unwrap();
+        let Mu = self.mu.mu();
+
+        let (S, sqrt_pi) = model::calc_rate_matrix(
+            &Mu,
+            &self.log_pi,
+            &global_scaling,
+            SubstitutionModel::MutSel,
+        );
+
+        S.apply_op2(&sqrt_pi, self.felsenstein_op.clone())
+            .unwrap()
+            .sum_all()
+            .unwrap()
+    }
+    fn penalty(&self) -> Tensor {
+        let log_pi_mean = self.log_pi.mean(1).unwrap();
+        let pi_penalty = self
+            .log_pi
+            .sub(&log_pi_mean)
+            .unwrap()
+            .powf(2.0)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            * self.pi_reg;
+        let Mu_penalty = (self.mu.penalty() * self.Mu_reg).unwrap();
+        (pi_penalty + Mu_penalty).unwrap()
+    }
+}
+
 pub struct CATParameters {
     pub felsenstein_op: FelsensteinWithEdgeOp,
     pub log_branch_lengths: Var,
     pub log_pi: Var,
     pub mu: Mu,
     pub hyperparameters: MutselParams,
-    pub center_centers: Tensor,
+    pub center_centers: Option<Tensor>,
     pub clustering: Tensor,
 }
 
@@ -36,7 +101,7 @@ impl CATParameters {
         log_pi: &Tensor,
         hyperparameters: MutselParams,
         clustering: &Tensor,
-        center_centers: &Tensor,
+        center_centers: Option<Tensor>,
     ) -> Self {
         Self {
             felsenstein_op,
@@ -44,7 +109,7 @@ impl CATParameters {
             mu: mu.clone(),
             log_pi: Var::from_tensor(log_pi).unwrap(),
             hyperparameters,
-            center_centers: center_centers.detach().copy().unwrap(),
+            center_centers,
             clustering: clustering.clone(),
         }
     }
@@ -60,7 +125,13 @@ impl CATParameters {
     }
 
     pub fn cluster_mean_log_pi(&self) -> Tensor {
-        let num_clusters = self.center_centers.dim(0).unwrap();
+        let num_clusters = self
+            .clustering
+            .max_all()
+            .unwrap()
+            .to_scalar::<u32>()
+            .unwrap() as usize
+            + 1;
 
         let mut means = Vec::with_capacity(num_clusters);
         for k in 0..num_clusters {
@@ -72,7 +143,13 @@ impl CATParameters {
             }
             let sum = self
                 .log_pi
-                .broadcast_mul(&mask.to_dtype(candle_core::DType::F64).unwrap().unsqueeze(1).unwrap())
+                .broadcast_mul(
+                    &mask
+                        .to_dtype(candle_core::DType::F64)
+                        .unwrap()
+                        .unsqueeze(1)
+                        .unwrap(),
+                )
                 .unwrap()
                 .sum(0)
                 .unwrap();
@@ -124,12 +201,16 @@ impl Optimizable for CATParameters {
 
         let Mu_penalty = (self.mu.penalty() * self.hyperparameters.Mu_reg).unwrap();
 
-        let center_penalty = (&self.center_centers - &log_pi_centers)
-            .unwrap()
-            .powf(2.0)
-            .unwrap()
-            .sum_all()
-            .unwrap();
+        let center_penalty = if let Some(center_centers) = self.center_centers.as_ref() {
+            (center_centers - &log_pi_centers)
+                .unwrap()
+                .powf(2.0)
+                .unwrap()
+                .sum_all()
+                .unwrap()
+        } else {
+            tensor_full(0.0, &[])
+        };
         let center_penalty = (center_penalty * self.hyperparameters.branch_reg).unwrap();
 
         println!(
@@ -198,95 +279,42 @@ pub fn cat_mutsel(
             .log()
             .unwrap();
 
-    let orig_categories = crate::data::C60;
-    let orig_categories_weights = crate::data::C60_WEIGHTS;
-
-    let orig_log_categories = Tensor::from_slice(
-        &orig_categories.concat(),
-        &[orig_categories.len(), 20],
-        &candle_core::Device::Cpu,
-    )
-    .unwrap()
-    .log()
-    .unwrap();
-
-    let orig_categories_log_weights = Tensor::from_slice(
-        &orig_categories_weights,
-        &[orig_categories_weights.len()],
-        &candle_core::Device::Cpu,
-    )
-    .unwrap()
-    .log()
-    .unwrap();
-
-    let posteriors = mixture_posteriors(
-        op.into_with_edge_fwd_op(),
+    let (init_pi, log_global_scaling) = super::optimization::two_step_light_pmsf(
+        op.clone(),
+        crate::data::C60,
+        &crate::data::C60_WEIGHTS,
         &log_branch_lengths,
-        &orig_log_categories,
-        &orig_categories_log_weights,
-        &Mu::new(),
+        &hyperparameters,
+        verbosity,
     );
+    let init_log_pi = init_pi.log().unwrap();
 
-    let cluster_assignments = posteriors.argmax(0).unwrap();
 
-    let mut model = CATParameters::new(
+    let model = GlobalScalingPiMuParameters {
+        felsenstein_op: op.clone(),
+        log_global_scaling: Var::from_tensor(&tensor_full(log_global_scaling, &[])).unwrap(),
+        mu: Mu::new(),
+        log_pi: Var::from_tensor(&init_log_pi).unwrap(),
+        log_pi_init: init_log_pi.clone(),
+        pi_reg: hyperparameters.branch_reg, // Will use a better name later
+        Mu_reg: hyperparameters.Mu_reg,
+    };
+
+    crate::optimization::optimize(&model, 10, 1000, 1e-3, 5, verbosity);
+
+    let cluster_assignments = cluster_log_pi(&model.log_pi.as_detached_tensor(), 30);
+
+    let model = CATParameters::new(
         op.into_with_edge_op(),
-        &log_branch_lengths,
-        &Mu::new(),
-        &orig_log_categories
-            .index_select(&cluster_assignments, 0)
-            .unwrap(),
+        &(log_branch_lengths + model.log_global_scaling.as_detached_tensor()).unwrap(),
+        &model.mu,
+        &model.log_pi,
         hyperparameters,
         &cluster_assignments,
-        &orig_log_categories,
+        None
     );
 
-    for _epoch in 0..20 {
-        crate::optimization::optimize(&model, 10, 1000, 1e-5, 5, verbosity);
-
-        // Assign new cluster centers based on the current log_pi estimates
-        let log_pi_centers = model.cluster_mean_log_pi();
-        let euclidian_distances = model
-            .log_pi
-            .unsqueeze(1)
-            .unwrap()
-            .broadcast_sub(&log_pi_centers.unsqueeze(0).unwrap())
-            .unwrap()
-            .powf(2.0)
-            .unwrap()
-            .sum(2)
-            .unwrap();
-
-        let new_assignment = euclidian_distances.argmin(1).unwrap();
-
-        // Print the number of sites that changed cluster assignments
-        let changed = new_assignment
-            .ne(&model.clustering)
-            .unwrap()
-            .to_vec1::<u8>()
-            .unwrap();
-        let num_changed = changed.iter().map(|&x| x as usize).sum::<usize>();
-
-        println!(
-            "Epoch {}: {} sites changed cluster assignments",
-            _epoch + 1,
-            num_changed
-        );
-
-        if num_changed == 0 {
-            println!("No sites changed cluster assignments. Stopping optimization.");
-            break;
-        }
-
-        // Print assignment summary
-        let mut assignment_summary = vec![0; log_pi_centers.dim(0).unwrap()];
-        for &assignment in new_assignment.to_vec1::<u32>().unwrap().iter() {
-            assignment_summary[assignment as usize] += 1;
-        }
-        println!("Cluster assignment summary: {:?}", assignment_summary);
-
-        model.clustering = new_assignment;
-    }
+    crate::optimization::optimize(&model, 100, 1000, 1e-5, 5, verbosity);
 
     model.calc_rate_matrix()
 }

@@ -317,57 +317,33 @@ impl Mu {
         Mu
     }
 }
-pub struct AlphaAndScalingParameters {
-    pub felsenstein_op: FelsensteinWithEdgeOp,
+pub struct ScalingParameters {
+    pub felsenstein_op: FelsensteinOp,
     pub log_global_scaling: Var,
-    pub log_branch_length_scaling: Var,
-    pub init_log_branch_lengths: Tensor,
-    pub R: Tensor,
+    pub Mu: Tensor,
     pub log_pi: Tensor,
-    pub rate_model: RateParameters,
-    pub branch_length_penalty: f64,
 }
 
-impl Optimizable for AlphaAndScalingParameters {
+impl Optimizable for ScalingParameters {
     fn variables(&self) -> Vec<Var> {
-        let mut vars = vec![
-            self.log_global_scaling.clone(),
-            self.log_branch_length_scaling.clone(),
-        ];
-        vars.extend(self.rate_model.variables());
-        vars
+        vec![self.log_global_scaling.clone()]
     }
 
     fn likelihood(&self) -> Tensor {
-        let log_branch_length_scaling = self
-            .log_branch_length_scaling
-            .broadcast_sub(&self.log_branch_length_scaling.mean(0).unwrap())
-            .unwrap();
-
-        let log_branch_lengths = (&self.init_log_branch_lengths + log_branch_length_scaling)
-            .unwrap()
-            .broadcast_add(&self.log_global_scaling)
-            .unwrap();
-
-        self.rate_model.likelihood(
-            self.felsenstein_op.clone(),
-            &self.R,
+        let (S, sqrt_pi) = model::calc_rate_matrix(
+            &self.Mu,
             &self.log_pi,
+            &self.log_global_scaling.exp().unwrap(),
             SubstitutionModel::MutSel,
-            true,
-            &log_branch_lengths,
-        )
-    }
-
-    fn penalty(&self) -> Tensor {
-        let branch_penalty = self
-            .log_branch_length_scaling
-            .powf(2.0)
+        );
+        S.apply_op2(&sqrt_pi, self.felsenstein_op.clone())
             .unwrap()
             .sum_all()
             .unwrap()
-            * self.branch_length_penalty;
-        (self.rate_model.penalty() + branch_penalty.unwrap()).unwrap()
+    }
+
+    fn penalty(&self) -> Tensor {
+        tensor_full(0.0, &[])
     }
 
     fn print_state(&self) {
@@ -379,12 +355,6 @@ impl Optimizable for AlphaAndScalingParameters {
                 .to_scalar::<f64>()
                 .unwrap()
         );
-        match &self.rate_model {
-            RateParameters::G(num_cat, alpha) if *num_cat > 1 => {
-                println!("alpha: {}", alpha.to_scalar::<f64>().unwrap())
-            }
-            _ => {}
-        }
     }
 }
 
@@ -614,124 +584,88 @@ pub fn optimize(
     }
 }
 
-pub fn optimize_global_scaling_alpha(
-    felsenstein_op: FelsensteinWithEdgeOp,
+pub fn optimize_global_scaling(
+    felsenstein_op: FelsensteinOp,
     log_pi: &Tensor,
-    R: &Tensor,
-    log_branch_lengths: &Tensor,
-    branch_length_penalty: f64,
+    Mu: &Tensor,
     verbosity: Verbosity,
-) -> (Tensor, Tensor, Tensor) {
+) -> f64 {
     let var_log_global_scaling = Var::from_tensor(&tensor_full(0.0, &[])).unwrap();
-    let var_alpha = Var::from_tensor(&tensor_full(1.0, &[])).unwrap();
-    let var_log_branch_length_scaling =
-        Var::from_tensor(&tensor_full(0.0, log_branch_lengths.dims())).unwrap();
 
-    let model = AlphaAndScalingParameters {
+    let model = ScalingParameters {
         felsenstein_op,
         log_global_scaling: var_log_global_scaling,
-        R: R.detach(),
+        Mu: Mu.detach(),
         log_pi: log_pi.detach(),
-        init_log_branch_lengths: log_branch_lengths.detach(),
-        log_branch_length_scaling: var_log_branch_length_scaling,
-        rate_model: RateParameters::G(1, var_alpha),
-        branch_length_penalty,
     };
 
     optimize(&model, 10, 100, 1e-5, 5, verbosity);
 
-    let alpha = if let RateParameters::G(_, alpha) = model.rate_model {
-        alpha
-    } else {
-        panic!("Expected gamma rate model.");
-    };
-
-    return (
-        model.log_global_scaling.as_detached_tensor(),
-        alpha.as_detached_tensor(),
-        model.log_branch_length_scaling.as_detached_tensor(),
-    );
+    return model.log_global_scaling.to_scalar::<f64>().unwrap();
 }
 
 pub fn two_step_light_pmsf(
     felsenstein_op: FelsensteinOp,
     categories: &[[f64; 20]],
     weights: &[f64],
-    f_class: &[f64; 20],
     log_branch_lengths: &Tensor,
-    mutsel_params: &super::MutselParams,
+    _mutsel_params: &super::MutselParams,
     verbosity: Verbosity,
-) -> (Tensor, f64, f64, Tensor) {
+) -> (Tensor, f64) {
     let step1_site_freq = light_pmsf(
         felsenstein_op.into_with_edge_op(),
         categories,
         weights,
-        1.0,
         log_branch_lengths,
-        f_class,
     );
 
     let Mu = loadMu();
 
     let log_pi = step1_site_freq.log().unwrap();
 
-    let (step2_log_global_scaling, step2_alpha, step2_log_branch_length_scaling) =
-        optimize_global_scaling_alpha(
-            felsenstein_op.into_with_edge_op(),
-            &log_pi,
-            &Mu,
-            log_branch_lengths,
-            mutsel_params.branch_reg,
-            verbosity,
-        );
+    let log_global_scaling =
+        optimize_global_scaling(felsenstein_op.clone(), &log_pi, &Mu, verbosity);
 
     let final_site_freq = light_pmsf(
         felsenstein_op.into_with_edge_op(),
         categories,
         weights,
-        step2_alpha.to_scalar::<f64>().unwrap(),
-        &(log_branch_lengths + &step2_log_branch_length_scaling)
-            .unwrap()
-            .broadcast_add(&step2_log_global_scaling)
-            .unwrap(),
-        f_class,
+        &(log_branch_lengths + log_global_scaling).unwrap(),
     );
 
-    (
-        final_site_freq,
-        step2_log_global_scaling.to_scalar::<f64>().unwrap(),
-        step2_alpha.to_scalar::<f64>().unwrap(),
-        step2_log_branch_length_scaling,
-    )
+    (final_site_freq, log_global_scaling)
 }
 
 pub fn light_pmsf(
     felsenstein_op: FelsensteinWithEdgeOp,
     categories: &[[f64; 20]],
     weights: &[f64],
-    alpha: f64,
     log_branch_lengths: &Tensor,
-    f_class: &[f64; 20],
 ) -> Tensor {
     let mut likelihoods = vec![];
 
     let Mu = loadMu();
 
-    let rate_model = RateParameters::gamma(1, alpha);
-
-    for category in iter::once(f_class).chain(categories.iter()) {
+    for category in categories {
         let category_tensor =
             Tensor::from_vec(category.to_vec(), &[20], &candle_core::Device::Cpu).unwrap();
         let log_pi = category_tensor.log().unwrap().unsqueeze(0).unwrap();
 
-        likelihoods.push(rate_model.likelihood_per_site(
-            felsenstein_op.clone(),
+        let (S, sqrt_pi) = model::calc_rate_matrix(
             &Mu,
             &log_pi,
+            &tensor_full(1.0, &[]),
             SubstitutionModel::MutSel,
-            false,
-            log_branch_lengths,
-        ));
+        );
+
+        likelihoods.push(
+            S.apply_op3(
+                &sqrt_pi,
+                &log_branch_lengths.exp().unwrap(),
+                felsenstein_op.into_fwd_op(),
+            )
+            .unwrap(),
+        );
     }
 
     let likelihoods = Tensor::stack(&likelihoods, 0).unwrap();
@@ -743,13 +677,9 @@ pub fn light_pmsf(
 
     let posteriors = candle_nn::ops::softmax(&weighted_likelihoods, 0).unwrap();
 
-    let category_tensor = Tensor::from_vec(
-        iter::once(f_class)
-            .chain(categories.iter())
-            .flatten()
-            .copied()
-            .collect(),
-        &[categories.len() + 1, 20],
+    let category_tensor = Tensor::from_slice(
+        categories.as_flattened(),
+        &[categories.len(), 20],
         &candle_core::Device::Cpu,
     )
     .unwrap();
@@ -798,7 +728,6 @@ pub fn optimize_internal(
         Tensor::from_slice(distances, &[distances.len()], &candle_core::Device::Cpu)?.log()?;
 
     let mut var_log_global_scaling = 0.0;
-    let mut var_alpha = 1.0;
     let var_log_branch_length_scaling =
         Var::from_tensor(&tensor_full(0.0, log_branch_lengths.dims())).unwrap();
 
@@ -810,36 +739,16 @@ pub fn optimize_internal(
         crate::io::read_sitefreq_file(prior_pi_file)
     } else {
         // Do our lightweight PMSF procedure for the site_freq prior:
-        let f_class_weight = 0.1;
 
-        let weights = iter::once(f_class_weight)
-            .chain(
-                crate::data::UDM256_WEIGHTS
-                    .iter()
-                    .map(|w| w * (1.0 - f_class_weight)),
-            )
-            .collect::<Vec<f64>>();
-
-        let f_class = aa_dist
-            .sum(0)?
-            .broadcast_div(&aa_dist.sum_all()?.unsqueeze(0)?)?;
-        let f_class: [f64; 20] = f_class.to_vec1()?.try_into().unwrap();
-
-        let (site_freq, global_scaling, alpha, log_branch_length_scaling) = two_step_light_pmsf(
+        let (site_freq, global_scaling) = two_step_light_pmsf(
             op.clone(),
-            crate::data::UDM256,
-            &weights,
-            &f_class,
+            crate::data::C60,
+            &crate::data::C60_WEIGHTS,
             &log_branch_lengths,
             &mutsel_params,
-            verbosity
+            verbosity,
         );
         var_log_global_scaling = global_scaling;
-        var_alpha = alpha;
-        var_log_branch_length_scaling
-            .set(&log_branch_length_scaling)
-            .unwrap();
-
         site_freq
     };
 
@@ -859,7 +768,7 @@ pub fn optimize_internal(
         log_global_scaling: Var::from_tensor(&tensor_full(var_log_global_scaling, &[]))?,
         log_branch_length_scaling: var_log_branch_length_scaling,
         init_log_branch_lengths: log_branch_lengths.detach(),
-        rate_parameters: RateParameters::init(num_sites, rate_model, var_alpha),
+        rate_parameters: RateParameters::init(num_sites, rate_model, 1.0),
         pi_reg: mutsel_params.pi_reg,
         R_reg: mutsel_params.Mu_reg,
         branch_length_penalty: mutsel_params.branch_reg,
