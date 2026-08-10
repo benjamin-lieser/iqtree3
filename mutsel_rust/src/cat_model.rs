@@ -2,11 +2,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use candle_core::DType::U32;
+use hdbscan_rs::Hdbscan;
+use hdbscan_rs::HdbscanParams;
 use candle_core::Device;
 use candle_core::Tensor;
 use candle_core::Var;
-use hdbscan::Hdbscan;
-use hdbscan::HdbscanHyperParams;
+use ndarray::Array2;
 use phylo_grad::FelsensteinTree;
 
 use crate::SubstitutionModel;
@@ -23,16 +24,21 @@ use crate::felsenstein::FelsensteinWithEdgeOp;
 use crate::optimization::Mu;
 
 fn cluster_log_pi(log_pi: &Tensor, min_cluster_size: usize) -> Tensor {
-    let data = log_pi.to_vec2::<f64>().unwrap();
-    let clusterer_params = HdbscanHyperParams::builder()
-        .min_cluster_size(min_cluster_size)
-        .dist_metric(hdbscan::DistanceMetric::Euclidean)
-        .allow_single_cluster(true)
-        .nn_algorithm(hdbscan::NnAlgorithm::KdTree)
-        .build();
+    let num_sites = log_pi.dim(0).unwrap();
+    let num_features = log_pi.dim(1).unwrap();
 
-    let clusterer = Hdbscan::new(&data, clusterer_params);
-    let labels = clusterer.cluster().unwrap().iter().map(|&x| x as u32).collect::<Vec<_>>();
+    let data = log_pi.flatten_all().unwrap().to_vec1::<f64>().unwrap();
+
+    let data = Array2::from_shape_vec((num_sites, num_features), data).unwrap();
+
+    let clusterer_params = HdbscanParams {
+        min_cluster_size,
+        allow_single_cluster: true,
+        ..Default::default()
+    };
+
+    let mut clusterer = Hdbscan::new(clusterer_params);
+    let labels = clusterer.fit_predict(&data.view()).unwrap().iter().map(|&x| x as u32).collect::<Vec<_>>();
     Tensor::from_slice(&labels, &[labels.len()], &Device::Cpu).unwrap()
 }
 pub struct GlobalScalingPiMuParameters {
