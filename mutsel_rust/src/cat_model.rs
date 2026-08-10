@@ -68,7 +68,7 @@ impl Optimizable for GlobalScalingPiMuParameters {
             .unwrap()
     }
     fn penalty(&self) -> Tensor {
-        let log_pi_mean = self.log_pi.mean(1).unwrap();
+        let log_pi_mean = self.log_pi.mean_keepdim(1).unwrap();
         let pi_penalty = self
             .log_pi
             .sub(&log_pi_mean)
