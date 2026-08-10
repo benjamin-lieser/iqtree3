@@ -306,7 +306,7 @@ pub fn cat_mutsel(
 
     let model = CATParameters::new(
         op.into_with_edge_op(),
-        &(log_branch_lengths + model.log_global_scaling.as_detached_tensor()).unwrap(),
+        &(log_branch_lengths.broadcast_add(&model.log_global_scaling)).unwrap(),
         &model.mu,
         &model.log_pi,
         hyperparameters,
