@@ -71,7 +71,7 @@ impl Optimizable for GlobalScalingPiMuParameters {
         let log_pi_mean = self.log_pi.mean_keepdim(1).unwrap();
         let pi_penalty = self
             .log_pi
-            .sub(&log_pi_mean)
+            .broadcast_sub(&log_pi_mean)
             .unwrap()
             .powf(2.0)
             .unwrap()
