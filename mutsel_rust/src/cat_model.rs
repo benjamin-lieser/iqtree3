@@ -54,16 +54,15 @@ fn cluster_log_pi(
     // Make labels contiguous
     let mut unique_ids: Vec<usize> = clusters.iter().flatten().copied().collect::<HashSet<_>>().into_iter().collect();
     unique_ids.sort();
-    let num_clusters = unique_ids.len();
     let mut id_map = std::collections::HashMap::new();
+    let num_clusters = unique_ids.len();
     for (new_id, old_id) in unique_ids.iter().enumerate() {
         id_map.insert(*old_id, new_id);
     }
-    let labels: Vec<usize> = clusters
+    let labels: Vec<u32> = clusters
         .iter()
-        .map(|c| *id_map.get(c).unwrap())
+        .map(|c| { if let Some(old_id) = c { *id_map.get(&old_id).unwrap() as u32 } else { num_clusters as u32 } })
         .collect();
-    }
 
     Tensor::from_slice(&labels, &[labels.len()], &Device::Cpu).unwrap()
 }
@@ -338,7 +337,17 @@ pub fn cat_mutsel(
 
     crate::optimization::optimize(&model, 10, 1000, 1e-3, 5, verbosity);
 
-    let cluster_assignments = cluster_log_pi(&model.log_pi.as_detached_tensor(), 30);
+    let cluster_assignments = cluster_log_pi(&model.log_pi.as_detached_tensor(), 30, 8);
+
+    // Print cluster assignments for debugging
+    let cluster_assignments_vec = cluster_assignments.to_vec1::<u32>().unwrap();
+    let num_clusters = cluster_assignments_vec.iter().max().unwrap() + 1;
+    let mut cluster_counts = vec![0; num_clusters as usize];
+    for &cluster in &cluster_assignments_vec {
+        cluster_counts[cluster as usize] += 1;
+    }
+    println!("Cluster counts: {:?}", cluster_counts);
+
 
     let model = CATParameters::new(
         op.into_with_edge_op(),
