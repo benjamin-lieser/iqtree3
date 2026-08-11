@@ -10,6 +10,7 @@ use linfa::Dataset;
 use linfa::traits::Predict;
 use ndarray::Array2;
 use linfa_clustering::Dbscan;
+use linfa_clustering::KMeans;
 use linfa::traits::{Fit, Transformer};
 use linfa_reduction::Pca;
 use phylo_grad::FelsensteinTree;
@@ -64,6 +65,24 @@ fn cluster_log_pi(
         .map(|c| { if let Some(old_id) = c { *id_map.get(&old_id).unwrap() as u32 } else { num_clusters as u32 } })
         .collect();
 
+    Tensor::from_slice(&labels, &[labels.len()], &Device::Cpu).unwrap()
+}
+
+fn cluster_log_pi_kmeans(
+    log_pi: &Tensor,
+    n_clusters: usize,
+) -> Tensor {
+    let num_sites = log_pi.dim(0).unwrap();
+    let num_features = log_pi.dim(1).unwrap();
+    let data = log_pi.flatten_all().unwrap().to_vec1::<f64>().unwrap();
+    let data = Array2::from_shape_vec((num_sites, num_features), data).unwrap();
+
+    let dataset = Dataset::from(data);
+
+    let kmeans = KMeans::params(n_clusters).fit(&dataset).unwrap();
+    let labels = kmeans.predict(&dataset);
+
+    let labels: Vec<u32> = labels.iter().map(|&x| x as u32).collect();
     Tensor::from_slice(&labels, &[labels.len()], &Device::Cpu).unwrap()
 }
 
@@ -324,6 +343,8 @@ pub fn cat_mutsel(
     );
     let init_log_pi = init_pi.log().unwrap();
 
+    let L = init_log_pi.dim(0).unwrap();
+
 
     let model = GlobalScalingPiMuParameters {
         felsenstein_op: op.clone(),
@@ -337,7 +358,7 @@ pub fn cat_mutsel(
 
     crate::optimization::optimize(&model, 10, 1000, 1e-3, 5, verbosity);
 
-    let cluster_assignments = cluster_log_pi(&model.log_pi.as_detached_tensor(), 30, 8);
+    let cluster_assignments = cluster_log_pi_kmeans(&model.log_pi.as_detached_tensor(), (L as f64).powf(0.4).ceil() as usize);
 
     // Print cluster assignments for debugging
     let cluster_assignments_vec = cluster_assignments.to_vec1::<u32>().unwrap();
