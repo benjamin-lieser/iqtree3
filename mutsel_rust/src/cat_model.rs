@@ -356,7 +356,7 @@ pub fn cat_mutsel(
         Mu_reg: hyperparameters.Mu_reg,
     };
 
-    crate::optimization::optimize(&model, 10, 1000, 1e-3, 5, verbosity);
+    crate::optimization::optimize(&model, 10, 1000, 1e-5, 5, verbosity);
 
     let cluster_assignments = cluster_log_pi_kmeans(&model.log_pi.as_detached_tensor(), (L as f64).powf(0.4).ceil() as usize);
 
