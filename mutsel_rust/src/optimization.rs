@@ -378,7 +378,7 @@ impl Optimizable for ModelParameters {
             .init_log_pi
             .sub(&self.log_pi)
             .unwrap()
-            .powf(2.0)
+            .abs()
             .unwrap()
             .sum_all()
             .unwrap();
