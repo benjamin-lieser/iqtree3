@@ -8,11 +8,7 @@ use candle_nn::{Optimizer, ops::softmax};
 use phylo_grad::FelsensteinTree;
 
 use crate::{
-    RateModel, SiteSpecificRateModel, SubstitutionModel, Verbosity,
-    felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp},
-    gamma::GammaOp,
-    model,
-    utils::{histogram, tensor_full},
+    RateModel, SiteSpecificRateModel, SubstitutionModel, Verbosity, felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp}, gamma::GammaOp, model, pca, utils::{histogram, tensor_full},
 };
 
 trait Optimizable {
@@ -290,7 +286,7 @@ impl Optimizable for AlphaAndScalingParameters {
 pub struct ModelParameters {
     pub felsenstein_op: FelsensteinWithEdgeOp,
     pub log_R: Var,
-    pub log_pi: Var,
+    pub pca_coordinates: Var,
     pub log_global_scaling: Var,
     pub log_branch_length_scaling: Var,
     pub init_log_branch_lengths: Tensor,
@@ -299,15 +295,23 @@ pub struct ModelParameters {
     pub R_reg: f64,
     pub branch_length_penalty: f64,
     pub init_log_R: Tensor,
-    pub init_log_pi: Tensor,
     pub substitution_model: SubstitutionModel,
+    pub pca_data: (Tensor, Tensor), // (components, singular_values)
 }
 
 impl ModelParameters {
+    pub fn log_pi(&self) -> Tensor {
+        pca::pca_coordinates_to_log_freq(
+            &self.pca_data.0,
+            &self.pca_coordinates.as_detached_tensor(),
+        )
+    }
+
+
     pub fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
         self.rate_parameters.calc_rate_matrix(
             &Mu(&self.log_R.as_detached_tensor()),
-            &self.log_pi.as_detached_tensor(),
+            &self.log_pi().detach(),
             &self.log_global_scaling.as_detached_tensor().exp().unwrap(),
             self.substitution_model,
         )
@@ -315,7 +319,7 @@ impl ModelParameters {
 
     pub fn save_npz(&self, path: &Path) {
         let Mu = Mu(&self.log_R.as_detached_tensor());
-        let pi = softmax(&self.log_pi.as_detached_tensor(), 1).unwrap();
+        let pi = softmax(&self.log_pi().detach(), 1).unwrap();
 
         Tensor::write_npz(
             &[
@@ -325,7 +329,6 @@ impl ModelParameters {
                     "global_scaling",
                     &self.log_global_scaling.as_detached_tensor(),
                 ),
-                ("init_log_pi", &self.init_log_pi),
                 ("init_log_R", &self.init_log_R),
                 (
                     "log_branch_length_scaling",
@@ -342,7 +345,7 @@ impl Optimizable for ModelParameters {
     fn variables(&self) -> Vec<Var> {
         let mut vars = vec![
             self.log_R.clone(),
-            self.log_pi.clone(),
+            self.pca_coordinates.clone(),
             self.log_global_scaling.clone(),
             self.log_branch_length_scaling.clone(),
         ];
@@ -363,10 +366,15 @@ impl Optimizable for ModelParameters {
             .broadcast_add(&self.log_global_scaling)
             .unwrap();
 
+        let log_pi = pca::pca_coordinates_to_log_freq(
+            &self.pca_data.0,
+            &self.pca_coordinates,
+        );
+
         self.rate_parameters.likelihood(
             self.felsenstein_op.clone(),
             &Mu,
-            &self.log_pi,
+            &log_pi,
             self.substitution_model,
             true,
             &log_branch_lengths,
@@ -374,14 +382,10 @@ impl Optimizable for ModelParameters {
     }
 
     fn penalty(&self) -> Tensor {
-        let pi_penalty = self
-            .init_log_pi
-            .sub(&self.log_pi)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .sum_all()
-            .unwrap();
+        let pi_penalty = pca::penalty_on_pca_coordinates(
+            &self.pca_data.1,
+            &self.pca_coordinates,
+        );
         let pi_penalty = (pi_penalty * self.pi_reg).unwrap();
 
         fn log_Mu(log_R: &Tensor) -> Tensor {
@@ -758,16 +762,19 @@ pub fn optimize_internal(
     // Variable which gets optimized
     let log_R = Var::from_tensor(&init_R.log()?)?;
     let init_log_pi = site_freq.log()?;
-    let log_pi = Var::from_tensor(&init_log_pi)?;
     let num_sites = site_freq.dims()[0];
 
     let init_log_R = log_R.detach().copy().unwrap();
-    let init_log_pi = log_pi.detach().copy().unwrap();
+    
+    let pca_coordinates = pca::log_freq_to_pca_coordinates(
+        &pca::read_pca_components().0,
+        &init_log_pi,
+    );
 
     let model = ModelParameters {
         felsenstein_op: op.into_with_edge_op(),
         log_R,
-        log_pi,
+        pca_coordinates: Var::from_tensor(&pca_coordinates)?,
         log_global_scaling: Var::from_tensor(&tensor_full(var_log_global_scaling, &[]))?,
         log_branch_length_scaling: var_log_branch_length_scaling,
         init_log_branch_lengths: log_branch_lengths.detach(),
@@ -776,8 +783,8 @@ pub fn optimize_internal(
         R_reg: mutsel_params.Mu_reg,
         branch_length_penalty: mutsel_params.branch_reg,
         init_log_R,
-        init_log_pi,
         substitution_model,
+        pca_data: pca::read_pca_components(),
     };
 
     optimize(&model, 100, 500, 1e-5, 5, verbosity);

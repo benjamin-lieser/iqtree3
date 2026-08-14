@@ -5,6 +5,7 @@ pub mod felsenstein;
 pub mod gamma;
 pub mod io;
 pub mod model;
+pub mod pca;
 mod optimization;
 mod utils;
 
