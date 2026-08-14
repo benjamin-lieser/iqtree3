@@ -36,7 +36,7 @@ pub fn penalty_on_pca_coordinates(singular_values: &Tensor, pca_coordinates: &Te
     let singular_values = singular_values.narrow(0, 0, 19).unwrap();
     
     let penalty = pca_coordinates
-        .abs()
+        .powf(2.0)
         .unwrap()
         .broadcast_div(&singular_values.unsqueeze(0).unwrap())
         .unwrap()
