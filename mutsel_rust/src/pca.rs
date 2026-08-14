@@ -22,7 +22,7 @@ pub fn read_pca_components() -> (Tensor, Tensor) {
 
 pub fn log_freq_to_pca_coordinates(components: &Tensor, data: &Tensor) -> Tensor {
     let pca_coordinates = data.matmul(&components.transpose(0, 1).unwrap()).unwrap();
-    pca_coordinates
+    pca_coordinates.narrow(1, 0, 19).unwrap() // ignore the last coordinate
 }
 
 pub fn pca_coordinates_to_log_freq(components: &Tensor, pca_coordinates: &Tensor) -> Tensor {
