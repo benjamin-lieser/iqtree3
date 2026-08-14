@@ -15,14 +15,14 @@ pub fn read_pca_components() -> (Tensor, Tensor) {
         .collect();
 
     (
-        Tensor::from_vec(components, &[20, 20], &candle_core::Device::Cpu).unwrap(),
+        Tensor::from_vec(components, &[20, 20], &candle_core::Device::Cpu).unwrap().narrow(0, 0, 19).unwrap(),
         Tensor::from_vec(singular_values, &[20], &candle_core::Device::Cpu).unwrap(),
     )
 }
 
 pub fn log_freq_to_pca_coordinates(components: &Tensor, data: &Tensor) -> Tensor {
     let pca_coordinates = data.matmul(&components.transpose(0, 1).unwrap()).unwrap();
-    pca_coordinates.narrow(1, 0, 19).unwrap() // ignore the last coordinate
+    pca_coordinates
 }
 
 pub fn pca_coordinates_to_log_freq(components: &Tensor, pca_coordinates: &Tensor) -> Tensor {
