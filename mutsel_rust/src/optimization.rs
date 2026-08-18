@@ -296,7 +296,7 @@ pub struct ModelParameters {
     pub branch_length_penalty: f64,
     pub init_log_R: Tensor,
     pub substitution_model: SubstitutionModel,
-    pub pca_data: (Tensor, Tensor), // (components, singular_values)
+    pub pca_data: (Tensor, Tensor, Tensor), // (components, singular_values, mean (pca coordinates))
 }
 
 impl ModelParameters {
@@ -385,6 +385,7 @@ impl Optimizable for ModelParameters {
         let pi_penalty = pca::penalty_on_pca_coordinates(
             &self.pca_data.1,
             &self.pca_coordinates,
+            &self.pca_data.2
         );
         let pi_penalty = (pi_penalty * self.pi_reg).unwrap();
 
