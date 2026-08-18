@@ -26,7 +26,7 @@ pub fn read_pca_components() -> (Tensor, Tensor, Tensor) {
     );
 
     // We store the mean in PCA coordinates, so we need to convert it from log-frequencies to PCA coordinates
-    let mean_values = log_freq_to_pca_coordinates(&components, &mean_values);
+    let mean_values = log_freq_to_pca_coordinates(&components, &mean_values.unsqueeze(0).unwrap());
 
     (components, singular_values, mean_values)
 }
