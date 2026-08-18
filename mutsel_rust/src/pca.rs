@@ -64,7 +64,7 @@ pub fn penalty_on_pca_coordinates(_singular_values: &Tensor, pca_coordinates: &T
         .unwrap()
         .broadcast_div(&alpha.unsqueeze(0).unwrap())
         .unwrap()
-        .pow(&beta.unsqueeze(0).unwrap())
+        .broadcast_pow(&beta.unsqueeze(0).unwrap())
         .unwrap()
         .sum_all()
         .unwrap();
