@@ -4,7 +4,7 @@ use candle_core::Tensor;
 /// Read PCA components and singular values from the data module and return them as Tensors
 /// The components are per row
 pub fn read_pca_components() -> (Tensor, Tensor, Tensor) {
-    let components: Vec<f64> = super::data::PCA
+    let components: Vec<f64> = super::data::PCA_COMPONENTS
         .split_whitespace()
         .map(|s| s.parse::<f64>().unwrap())
         .collect();
@@ -42,16 +42,29 @@ pub fn pca_coordinates_to_log_freq(components: &Tensor, pca_coordinates: &Tensor
 }
 
 /// pca_mean needs to be in pca coordinates!
-pub fn penalty_on_pca_coordinates(singular_values: &Tensor, pca_coordinates: &Tensor, pca_mean: &Tensor) -> Tensor {
+pub fn penalty_on_pca_coordinates(_singular_values: &Tensor, pca_coordinates: &Tensor, pca_mean: &Tensor) -> Tensor {
     // We ignore the last coordiante, because it has 0 singular value and is not penalized
 
-    let singular_values = singular_values.narrow(0, 0, 19).unwrap();
+    let alpha = super::data::PCA_ALPHA
+        .split_whitespace()
+        .map(|s| s.parse::<f64>().unwrap())
+        .collect::<Vec<f64>>();
+    let beta = super::data::PCA_BETA
+        .split_whitespace()
+        .map(|s| s.parse::<f64>().unwrap())
+        .collect::<Vec<f64>>();
 
-    let centered_pca_coordinates = pca_coordinates.broadcast_sub(&pca_mean.unsqueeze(0).unwrap()).unwrap();
+    let alpha = Tensor::from_vec(alpha, &[19], &candle_core::Device::Cpu).unwrap();
+    let beta = Tensor::from_vec(beta, &[19], &candle_core::Device::Cpu).unwrap();
+
+
+    let centered_pca_coordinates = pca_coordinates.broadcast_sub(&pca_mean).unwrap();
     let penalty = centered_pca_coordinates
         .abs()
         .unwrap()
-        .broadcast_div(&singular_values.unsqueeze(0).unwrap())
+        .broadcast_div(&alpha.unsqueeze(0).unwrap())
+        .unwrap()
+        .pow(&beta.unsqueeze(0).unwrap())
         .unwrap()
         .sum_all()
         .unwrap();
