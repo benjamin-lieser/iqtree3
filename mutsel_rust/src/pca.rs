@@ -42,7 +42,7 @@ pub fn pca_coordinates_to_log_freq(components: &Tensor, pca_coordinates: &Tensor
 }
 
 /// pca_mean needs to be in pca coordinates!
-pub fn penalty_on_pca_coordinates(_singular_values: &Tensor, pca_coordinates: &Tensor, pca_mean: &Tensor) -> Tensor {
+pub fn penalty_on_pca_coordinates(_singular_values: &Tensor, pca_coordinates: &Tensor, _pca_mean: &Tensor) -> Tensor {
     // We ignore the last coordiante, because it has 0 singular value and is not penalized
 
     let alpha = super::data::PCA_ALPHA
@@ -54,11 +54,18 @@ pub fn penalty_on_pca_coordinates(_singular_values: &Tensor, pca_coordinates: &T
         .map(|s| s.parse::<f64>().unwrap())
         .collect::<Vec<f64>>();
 
+    let means = super::data::PCA_MEAN
+        .split_whitespace()
+        .map(|s| s.parse::<f64>().unwrap())
+        .collect::<Vec<f64>>();
+
+
     let alpha = Tensor::from_vec(alpha, &[19], &candle_core::Device::Cpu).unwrap();
     let beta = Tensor::from_vec(beta, &[19], &candle_core::Device::Cpu).unwrap();
+    let means = Tensor::from_vec(means, &[19], &candle_core::Device::Cpu).unwrap();
 
 
-    let centered_pca_coordinates = pca_coordinates.broadcast_sub(&pca_mean).unwrap();
+    let centered_pca_coordinates = pca_coordinates.broadcast_sub(&means.unsqueeze(0).unwrap()).unwrap();
     let penalty = centered_pca_coordinates
         .abs()
         .unwrap()
