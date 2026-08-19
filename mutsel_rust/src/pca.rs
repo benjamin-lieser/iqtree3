@@ -48,7 +48,9 @@ pub fn penalty_on_pca_coordinates(singular_values: &Tensor, pca_coordinates: &Te
 
     let centered_pca_coordinates = pca_coordinates.broadcast_sub(&pca_mean).unwrap();
     let penalty = centered_pca_coordinates
-        .abs()
+        .powf(2.0)
+        .unwrap()
+        .broadcast_div(&singular_values.unsqueeze(0).unwrap())
         .unwrap()
         .broadcast_div(&singular_values.unsqueeze(0).unwrap())
         .unwrap()
