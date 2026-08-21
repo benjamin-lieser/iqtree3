@@ -8,7 +8,7 @@ use candle_nn::{Optimizer, ops::softmax};
 use phylo_grad::FelsensteinTree;
 
 use crate::{
-    RateModel, SiteSpecificRateModel, SubstitutionModel, Verbosity, felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp}, gamma::GammaOp, model, pca, utils::{histogram, tensor_full},
+    RateModel, SiteSpecificRateModel, SubstitutionModel, Verbosity, felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp}, gamma::GammaOp, model, pca::{self, PCA}, utils::{histogram, tensor_full},
 };
 
 trait Optimizable {
@@ -296,15 +296,12 @@ pub struct ModelParameters {
     pub branch_length_penalty: f64,
     pub init_log_R: Tensor,
     pub substitution_model: SubstitutionModel,
-    pub pca_data: (Tensor, Tensor, Tensor), // (components, singular_values, mean (pca coordinates))
+    pub pca_data: PCA
 }
 
 impl ModelParameters {
     pub fn log_pi(&self) -> Tensor {
-        pca::pca_coordinates_to_log_freq(
-            &self.pca_data.0,
-            &self.pca_coordinates.as_detached_tensor(),
-        )
+        self.pca_data.pca_coordinates_to_log_freq(&self.pca_coordinates)
     }
 
 
@@ -366,10 +363,7 @@ impl Optimizable for ModelParameters {
             .broadcast_add(&self.log_global_scaling)
             .unwrap();
 
-        let log_pi = pca::pca_coordinates_to_log_freq(
-            &self.pca_data.0,
-            &self.pca_coordinates,
-        );
+        let log_pi = self.pca_data.pca_coordinates_to_log_freq(&self.pca_coordinates);
 
         self.rate_parameters.likelihood(
             self.felsenstein_op.clone(),
@@ -382,11 +376,7 @@ impl Optimizable for ModelParameters {
     }
 
     fn penalty(&self) -> Tensor {
-        let pi_penalty = pca::penalty_on_pca_coordinates(
-            &self.pca_data.1,
-            &self.pca_coordinates,
-            &self.pca_data.2
-        );
+        let pi_penalty = self.pca_data.penalty_on_pca_coordinates(&self.pca_coordinates);
         let pi_penalty = (pi_penalty * self.pi_reg).unwrap();
 
         fn log_Mu(log_R: &Tensor) -> Tensor {
@@ -766,11 +756,10 @@ pub fn optimize_internal(
     let num_sites = site_freq.dims()[0];
 
     let init_log_R = log_R.detach().copy().unwrap();
+
+    let pca = PCA::new(19);
     
-    let pca_coordinates = pca::log_freq_to_pca_coordinates(
-        &pca::read_pca_components().0,
-        &init_log_pi,
-    );
+    let pca_coordinates = pca.log_freq_to_pca_coordinates(&init_log_pi);
 
     let model = ModelParameters {
         felsenstein_op: op.into_with_edge_op(),
@@ -785,7 +774,7 @@ pub fn optimize_internal(
         branch_length_penalty: mutsel_params.branch_reg,
         init_log_R,
         substitution_model,
-        pca_data: pca::read_pca_components(),
+        pca_data: pca,
     };
 
     optimize(&model, 100, 500, 1e-5, 5, verbosity);
