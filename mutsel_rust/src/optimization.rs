@@ -659,6 +659,9 @@ pub fn Mu(log_parameter: &Tensor) -> Tensor {
     .unwrap();
     let off_diagonal = (parameter - &diagonal).unwrap();
 
+    // Mutation equilibrium should stay fixed to neutral
+    let diagonal = diagonal.detach();
+
     let pi = diagonal
         .broadcast_div(&diagonal.sum_all().unwrap())
         .unwrap();
