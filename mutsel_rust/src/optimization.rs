@@ -498,7 +498,7 @@ fn optimize(
         let grads = opt_fn.backward().unwrap();
         opt.step(&grads).unwrap();
 
-        if iteration > min_iterations {
+        if iteration > min_iterations.saturating_sub(no_improve_patience) {
             let rel_improvement = (prev_opt - current_opt) / prev_opt.abs().max(1e-12);
             if rel_improvement > min_rel_improvement {
                 no_improve_count = 0;
