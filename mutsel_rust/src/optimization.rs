@@ -665,10 +665,12 @@ pub fn Mu(log_parameter: &Tensor) -> Tensor {
     let pi = diagonal
         .broadcast_div(&diagonal.sum_all().unwrap())
         .unwrap();
+    let sqrt_pi = pi.sqrt().unwrap();
+    let sqrt_pi_inv = sqrt_pi.recip().unwrap();
 
-    let R = (&off_diagonal + off_diagonal.t().unwrap()).unwrap();
+    let S = (&off_diagonal + off_diagonal.t().unwrap()).unwrap();
 
-    let Q = R.matmul(&pi).unwrap();
+    let Q = sqrt_pi_inv.matmul(&S).unwrap().matmul(&sqrt_pi).unwrap();
 
     let Q = (&Q
         - &Q * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
