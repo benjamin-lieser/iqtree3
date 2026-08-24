@@ -59,9 +59,11 @@ impl PCA {
             .narrow(0, self.num_components, 19 - self.num_components)
             .unwrap();
 
-        let full_pca_coordinates =
-            Tensor::cat(&[pca_coordinates, &pad_means.unsqueeze(0).unwrap()], 1).unwrap();
-
+        let full_pca_coordinates = if self.num_components == 19 {
+            pca_coordinates.clone()
+        } else {
+            Tensor::cat(&[pca_coordinates, &pad_means.unsqueeze(0).unwrap()], 1).unwrap()
+        };
         let log_freq = full_pca_coordinates.matmul(&self.components).unwrap();
         log_freq
     }
@@ -105,8 +107,12 @@ mod tests {
     #[test]
     fn projection_returns_requested_number_of_components() {
         let pca = PCA::new(4);
-        let data = Tensor::from_vec((0..40).map(|x| x as f64 * 0.01).collect(), &[2, 20], &candle_core::Device::Cpu)
-            .unwrap();
+        let data = Tensor::from_vec(
+            (0..40).map(|x| x as f64 * 0.01).collect(),
+            &[2, 20],
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
 
         let coords = pca.log_freq_to_pca_coordinates(&data);
 
@@ -114,10 +120,24 @@ mod tests {
     }
 
     #[test]
+    fn projection_returns_requested_number_of_components_19() {
+        let pca = PCA::new(19);
+        let data = Tensor::from_vec(
+            (0..40).map(|x| x as f64 * 0.01).collect(),
+            &[2, 20],
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+
+        let coords = pca.log_freq_to_pca_coordinates(&data);
+
+        assert_eq!(coords.dims(), &[2, 19]);
+    }
+    #[test]
     fn inverse_fills_missing_components_with_means() {
         let pca = PCA::new(3);
-        let coords = Tensor::from_vec(vec![0.2, -0.3, 0.5], &[1, 3], &candle_core::Device::Cpu)
-            .unwrap();
+        let coords =
+            Tensor::from_vec(vec![0.2, -0.3, 0.5], &[1, 3], &candle_core::Device::Cpu).unwrap();
 
         let reconstructed = pca.pca_coordinates_to_log_freq(&coords);
 
@@ -139,4 +159,3 @@ mod tests {
         assert!(penalty.to_scalar::<f64>().unwrap().abs() < 1e-12);
     }
 }
-

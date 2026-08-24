@@ -460,13 +460,13 @@ fn optimize(
     let variables = model.variables();
     let mut opt = candle_nn::optim::AdamW::new_lr(variables, 0.05).unwrap();
     let parameter = candle_nn::optim::ParamsAdamW {
-        lr: 0.05,
+        lr: 0.02,
         weight_decay: 0.0,
         ..Default::default()
     };
     opt.set_params(parameter);
 
-    let mut prev_opt = f64::INFINITY;
+    let mut best_opt = f64::INFINITY;
     let mut no_improve_count = 0;
 
     for iteration in 0.. {
@@ -489,7 +489,7 @@ fn optimize(
         opt.step(&grads).unwrap();
 
         if iteration > min_iterations.saturating_sub(no_improve_patience) {
-            let rel_improvement = (prev_opt - current_opt) / prev_opt.abs().max(1e-12);
+            let rel_improvement = (best_opt - current_opt) / best_opt.abs().max(1e-12);
             if rel_improvement > min_rel_improvement {
                 no_improve_count = 0;
             } else {
@@ -509,7 +509,7 @@ fn optimize(
             break;
         }
 
-        prev_opt = current_opt;
+        best_opt = current_opt.min(best_opt);
     }
 }
 
@@ -665,19 +665,25 @@ pub fn Mu(log_parameter: &Tensor) -> Tensor {
     let pi = diagonal
         .broadcast_div(&diagonal.sum_all().unwrap())
         .unwrap();
-    let sqrt_pi = pi.sqrt().unwrap();
+    let pi_vec = pi.sum(1).unwrap();
+    let sqrt_pi = pi_vec.sqrt().unwrap();
     let sqrt_pi_inv = sqrt_pi.recip().unwrap();
 
     let S = (&off_diagonal + off_diagonal.t().unwrap()).unwrap();
 
-    let Q = sqrt_pi_inv.matmul(&S).unwrap().matmul(&sqrt_pi).unwrap();
-
+    // Q = diag(sqrt_pi_inv) * S * diag(sqrt_pi)
+    let Q = sqrt_pi_inv
+        .unsqueeze(1)
+        .unwrap()
+        .broadcast_mul(&S)
+        .unwrap()
+        .broadcast_mul(&sqrt_pi.unsqueeze(0).unwrap())
+        .unwrap();
     let Q = (&Q
         - &Q * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
     .unwrap();
 
     let row_sum = Q.sum(1).unwrap();
-    let pi_vec = pi.sum(1).unwrap();
     let sum = row_sum.dot(&pi_vec).unwrap();
     let Q = Q.broadcast_div(&sum).unwrap();
 
