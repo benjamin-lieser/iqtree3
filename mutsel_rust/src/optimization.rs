@@ -460,13 +460,19 @@ fn optimize(
     let variables = model.variables();
     let mut opt = candle_nn::optim::AdamW::new_lr(variables, 0.05).unwrap();
     let parameter = candle_nn::optim::ParamsAdamW {
-        lr: 0.02,
+        lr: 0.03,
         weight_decay: 0.0,
         ..Default::default()
     };
     opt.set_params(parameter);
 
+    let variables = model.variables();
+
     let mut best_opt = f64::INFINITY;
+    let mut best_params: Vec<Tensor> = variables
+        .iter()
+        .map(|variable| variable.as_tensor().copy().unwrap())
+        .collect();
     let mut no_improve_count = 0;
 
     for iteration in 0.. {
@@ -475,6 +481,14 @@ fn optimize(
         let opt_fn = (&neg_likelihood + &penalty).unwrap();
 
         let current_opt = opt_fn.to_scalar::<f64>().unwrap();
+
+        if current_opt < best_opt {
+            best_params = variables
+                .iter()
+                .map(|variable| variable.as_tensor().copy().unwrap())
+                .collect();
+        }
+
         if verbosity.should_print(Verbosity::Med) {
             println!(
                 "Iteration {}: neg Loglikelihood {:.3}, Optfn {:.3}",
@@ -510,6 +524,11 @@ fn optimize(
         }
 
         best_opt = current_opt.min(best_opt);
+    }
+
+    // Obtain parameters from best iteration
+    for (variable, value) in variables.iter().zip(best_params.iter()) {
+        variable.set(value).unwrap();
     }
 }
 
