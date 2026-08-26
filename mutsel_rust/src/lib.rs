@@ -2,10 +2,9 @@
 
 pub mod data;
 pub mod felsenstein;
-pub mod gamma;
-pub mod io;
-pub mod model;
-pub mod pca;
+mod io;
+mod model;
+mod pca;
 mod optimization;
 mod utils;
 
@@ -15,10 +14,7 @@ use std::{
     path::Path,
 };
 
-use candle_core::{IndexOp, Tensor};
-use candle_nn::ops::sigmoid;
-
-use crate::{gamma::log_gamma_pdf, utils::tensor_full};
+use candle_core::IndexOp;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_set_rayon_threads(num_threads: u32) {
@@ -240,15 +236,14 @@ fn restore_stdout_stderr(
 pub struct MutselParams {
     pi_reg: f64,
     Mu_reg: f64,
-    branch_reg: f64,
 }
 
 fn parse_mustel_str(model_str: &str) -> MutselParams {
     let model_str = model_str.trim();
     let model_upper = model_str.to_ascii_uppercase();
 
-    let (pi_reg, Mu_reg, branch_reg) = if model_upper == "MUTSEL" {
-        (0.65, 1.05, 1.86)
+    let (pi_reg, Mu_reg) = if model_upper == "MUTSEL" {
+        (0.3, 0.5)
     } else if model_upper.starts_with("MUTSEL{") && model_str.ends_with('}') {
         let params_str = &model_str[7..model_str.len() - 1];
         let values = params_str
@@ -256,14 +251,14 @@ fn parse_mustel_str(model_str: &str) -> MutselParams {
             .map(|value| value.trim().parse::<f64>().unwrap())
             .collect::<Vec<_>>();
         assert!(
-            values.len() == 3,
-            "Invalid MUTSEL format: expected MUTSEL{{pi_reg/Mu_reg/branch_reg}}, got {}",
+            values.len() == 2,
+            "Invalid MUTSEL format: expected MUTSEL{{pi_reg/Mu_reg}}, got {}",
             model_str
         );
-        (values[0], values[1], values[2])
+        (values[0], values[1])
     } else {
         panic!(
-            "Invalid MUTSEL format: expected MUTSEL or MUTSEL{{pi_reg/Mu_reg/branch_reg}}, got {}",
+            "Invalid MUTSEL format: expected MUTSEL or MUTSEL{{pi_reg/Mu_reg}}, got {}",
             model_str
         );
     };
@@ -271,10 +266,36 @@ fn parse_mustel_str(model_str: &str) -> MutselParams {
     MutselParams {
         pi_reg,
         Mu_reg,
-        branch_reg,
     }
 }
 
+fn create_felsenstein_tree(
+    parents: &[i32],
+    distances: &[f64],
+    alignment: &[u8],
+    L : usize,
+    N : usize,
+) -> phylo_grad::FelsensteinTree<20> {
+    let mut felsenstein = phylo_grad::FelsensteinTree::<20>::new(parents, distances);
+
+    let mut sites = vec![];
+    sites.resize(L, vec![]);
+    for site_idx in 0..L {
+        sites[site_idx].resize(N, phylo_grad::nalgebra::SVector::<f64, 20>::zeros());
+        for seq_idx in 0..N {
+            let residue = alignment[site_idx * N + seq_idx];
+            if residue < 20 {
+                sites[site_idx][seq_idx][residue as usize] = 1.0;
+            } else {
+                for i in 0..20 {
+                    sites[site_idx][seq_idx][i] = 1.0;
+                }
+            }
+        }
+    }
+    felsenstein.bind_leaf_pl(sites);
+    felsenstein
+}
 /// parents: [num_nodes]
 /// branch_lengths: [num_nodes]
 /// alignment: [num_sites * num_leaves] (row-major)
@@ -293,7 +314,7 @@ pub unsafe extern "C" fn rust_mutsel(
     num_nodes: u32,
     model_str: *const std::os::raw::c_char,
     prior_R_file: *const std::os::raw::c_char,
-    prior_pi_file: *const std::os::raw::c_char,
+    _prior_pi_file: *const std::os::raw::c_char,
     verbose: u8,
     out_site_freq: *mut f64,
     out_rate_matrix: *mut f64,
@@ -330,7 +351,7 @@ pub unsafe extern "C" fn rust_mutsel(
 
     let mutsel_params = parse_mustel_str(model_str);
 
-    let felsenstein = io::create_felsenstein_tree(
+    let felsenstein = create_felsenstein_tree(
         parents,
         branch_lengths,
         alignment,
@@ -345,23 +366,11 @@ pub unsafe extern "C" fn rust_mutsel(
         Some(Path::new(cstr.to_str().unwrap()))
     };
 
-    let prior_pi_file = if prior_pi_file.is_null() {
-        None
-    } else {
-        let cstr = unsafe { std::ffi::CStr::from_ptr(prior_pi_file) };
-        Some(Path::new(cstr.to_str().unwrap()))
-    };
-
-    let substitution_model = SubstitutionModel::MutSel;
-
-    let (S, sqrt_pi, _rate_para, _substitution_rates) = optimization::optimize_internal(
+    let (S, sqrt_pi) = optimization::optimize_internal(
         felsenstein,
         branch_lengths,
         mutsel_params,
-        RateModel::R(1),
         prior_R_file,
-        prior_pi_file,
-        substitution_model,
         crate::Verbosity::from_u8(verbose),
         out_prefix,
     )
@@ -392,126 +401,6 @@ pub unsafe extern "C" fn rust_mutsel(
     restore_stdout_stderr(saved_stdout, saved_stderr, tee_handle);
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RateModel {
-    G(usize),
-    R(usize),
-    X(f64, SiteSpecificRateModel), // this is the strength of the prior
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SiteSpecificRateModel {
-    Triangle,
-    Uniform,
-    Gamma(f64),     // alpha parameter
-    LogNormal(f64), // Mean
-}
-
-impl SiteSpecificRateModel {
-    fn from_str(s: &str) -> SiteSpecificRateModel {
-        let s = s.trim().to_ascii_lowercase();
-        if s == "triangle" {
-            SiteSpecificRateModel::Triangle
-        } else if s == "uniform" {
-            SiteSpecificRateModel::Uniform
-        } else if let Some(alpha_str) = s.strip_prefix("gamma{").and_then(|s| s.strip_suffix('}')) {
-            let alpha: f64 = alpha_str.parse().unwrap();
-            SiteSpecificRateModel::Gamma(alpha)
-        } else if let Some(mean_str) = s
-            .strip_prefix("lognormal{")
-            .and_then(|s| s.strip_suffix('}'))
-        {
-            let mean: f64 = mean_str.parse().unwrap();
-            SiteSpecificRateModel::LogNormal(mean)
-        } else {
-            panic!("Unknown site-specific rate model: {}", s);
-        }
-    }
-
-    fn penalty(&self, rate_para: &Tensor) -> Tensor {
-        match self {
-            SiteSpecificRateModel::Triangle => (1.0 - rate_para).unwrap().sum_all().unwrap(),
-            SiteSpecificRateModel::Uniform => {
-                return tensor_full(1.0, &[]);
-            }
-            SiteSpecificRateModel::Gamma(alpha) => {
-                return log_gamma_pdf(rate_para, &tensor_full(*alpha, &[]))
-                    .neg()
-                    .unwrap();
-            }
-            SiteSpecificRateModel::LogNormal(mean) => {
-                return (rate_para.log().unwrap() - mean.ln())
-                    .unwrap()
-                    .powf(2.0)
-                    .unwrap();
-            }
-        }
-    }
-
-    fn rates_from_parameters(&self, rate_para: &Tensor) -> Tensor {
-        match self {
-            SiteSpecificRateModel::Triangle | SiteSpecificRateModel::Uniform => {
-                sigmoid(rate_para).unwrap()
-            }
-            SiteSpecificRateModel::Gamma(_) => {
-                rate_para.exp().unwrap() // this will be transformed to rates in the penalty function
-            }
-            SiteSpecificRateModel::LogNormal(_) => {
-                rate_para.exp().unwrap() // this will be transformed to rates in the penalty function
-            }
-        }
-    }
-
-    fn init(&self, num_sites: usize) -> Tensor {
-        match self {
-            SiteSpecificRateModel::Triangle | SiteSpecificRateModel::Uniform => {
-                tensor_full(0.0, &[num_sites])
-            }
-            SiteSpecificRateModel::Gamma(_) => tensor_full(0.0, &[num_sites]),
-            SiteSpecificRateModel::LogNormal(mean) => tensor_full(mean.ln(), &[num_sites]),
-        }
-    }
-}
-
-fn parse_rate_model(rate_model: &str) -> RateModel {
-    let mut chars = rate_model.chars();
-    let model_type = chars.next().unwrap();
-    match model_type {
-        'G' => {
-            let num_categories: usize = chars.collect::<String>().parse().unwrap();
-            RateModel::G(num_categories)
-        }
-        'R' => {
-            let num_categories: usize = chars.collect::<String>().parse().unwrap();
-            RateModel::R(num_categories)
-        }
-        'X' => {
-            // X{strength, site_specific_model}
-            let params_str = chars.collect::<String>();
-            let params_str = params_str.trim();
-            assert!(
-                params_str.starts_with('{') && params_str.ends_with('}'),
-                "Invalid X model format: {}",
-                params_str
-            );
-            let params_str = &params_str[1..params_str.len() - 1]; // remove { and }
-            let mut params = params_str.splitn(2, '/');
-            let strength: f64 = params.next().unwrap().trim().parse().unwrap();
-            let site_specific_model_str = params.next().unwrap().trim();
-            let site_specific_model = SiteSpecificRateModel::from_str(site_specific_model_str);
-            RateModel::X(strength, site_specific_model)
-        }
-        _ => panic!("Unknown rate model"),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubstitutionModel {
-    MutSel,
-    MutSelApprox,
-    RelaxPMSF,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Verbosity {
     Quiet,
@@ -538,39 +427,4 @@ impl Verbosity {
     fn should_print(&self, level: Verbosity) -> bool {
         *self != Verbosity::Quiet && *self >= level
     }
-}
-
-// optimize function called from the rust binary
-pub fn optimize_rust_binary(
-    newick: &Path,
-    fasta: &Path,
-    pi_reg: f64,
-    R_reg: f64,
-    rate_mode: &str,
-    prior_R_file: Option<&Path>,
-    prior_pi_file: Option<&Path>,
-    substitution_model: SubstitutionModel,
-) -> Result<(Tensor, Tensor, Tensor, Vec<f64>), candle_core::Error> {
-    let sequences = io::read_alignment(fasta);
-
-    let (felsenstein, distances) =
-        io::process_newick_alignment(&std::fs::read_to_string(&newick).unwrap(), &sequences);
-
-    let rate_model = parse_rate_model(rate_mode);
-
-    optimization::optimize_internal(
-        felsenstein,
-        &distances,
-        MutselParams {
-            pi_reg,
-            Mu_reg: R_reg,
-            branch_reg: 10.0, // default value
-        },
-        rate_model,
-        prior_R_file,
-        prior_pi_file,
-        substitution_model,
-        Verbosity::Debug,
-        "./mutsel"
-    )
 }
