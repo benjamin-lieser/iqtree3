@@ -16,13 +16,8 @@ use crate::{
 
 trait Optimizable {
     fn variables(&self) -> Vec<Var>;
-    fn variables_names(&self) -> Vec<String> {
-        self.variables()
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("var_{}", i))
-            .collect()
-    }
+    fn variables_names(&self) -> Vec<String>;
+    fn model_name(&self) -> String;
     fn likelihood(&self) -> Tensor;
     fn penalty(&self) -> Tensor;
     fn print_state(&self) {}
@@ -38,6 +33,12 @@ pub struct BranchParameters {
 impl Optimizable for BranchParameters {
     fn variables(&self) -> Vec<Var> {
         vec![self.log_branch_length.clone()]
+    }
+    fn variables_names(&self) -> Vec<String> {
+        vec!["branch_length".to_string()]
+    }
+    fn model_name(&self) -> String {
+        "BranchParameters".to_string()
     }
 
     fn likelihood(&self) -> Tensor {
@@ -107,6 +108,18 @@ impl Optimizable for ModelParameters {
             self.pca_coordinates.clone(),
             self.log_branch_lengths.clone(),
         ]
+    }
+
+    fn variables_names(&self) -> Vec<String> {
+        vec![
+            "log_R".to_string(),
+            "pca_coordinates".to_string(),
+            "log_branch_lengths".to_string(),
+        ]
+    }
+
+    fn model_name(&self) -> String {
+        "ModelParameters".to_string()
     }
 
     fn likelihood(&self) -> Tensor {
@@ -256,10 +269,9 @@ fn optimize(
         .into_iter()
         .map(|tensors| Tensor::stack(&tensors, 0).unwrap())
         .collect();
-    for (name, var) in variable_names.iter().zip(trajectory_tensors.iter()) {
-        let filename = format!("{}.traj.npz", prefix);
-        Tensor::write_npz(&[(name, var)], Path::new(&filename)).unwrap();
-    }
+    let filename = format!("{}.traj_{}.npz", prefix, model.model_name());
+    Tensor::write_npz(&variable_names.iter().zip(trajectory_tensors.iter()).collect::<Vec<_>>(), Path::new(&filename)).unwrap();
+    
 }
 
 pub fn optimize_branch_lengths(
