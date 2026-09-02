@@ -1,6 +1,5 @@
 use std::{
-    path::Path,
-    sync::{Arc, Mutex},
+    path::Path, sync::{Arc, Mutex},
 };
 
 use candle_core::{Tensor, Var};
@@ -17,6 +16,13 @@ use crate::{
 
 trait Optimizable {
     fn variables(&self) -> Vec<Var>;
+    fn variables_names(&self) -> Vec<String> {
+        self.variables()
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("var_{}", i))
+            .collect()
+    }
     fn likelihood(&self) -> Tensor;
     fn penalty(&self) -> Tensor;
     fn print_state(&self) {}
@@ -37,11 +43,7 @@ impl Optimizable for BranchParameters {
     fn likelihood(&self) -> Tensor {
         let log_branch_lengths = self.log_branch_length.clone();
 
-        let (S, sqrt_pi) = model::calc_rate_matrix(
-            &self.Mu,
-            &self.log_pi,
-            &tensor_full(1.0, &[]),
-        );
+        let (S, sqrt_pi) = model::calc_rate_matrix(&self.Mu, &self.log_pi, &tensor_full(1.0, &[]));
 
         let branch_lengths = log_branch_lengths.exp().unwrap();
         S.apply_op3(&sqrt_pi, &branch_lengths, self.felsenstein_op.clone())
@@ -78,11 +80,7 @@ impl ModelParameters {
     }
 
     pub fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
-        calc_rate_matrix(
-            &Mu(&self.log_R),
-            &self.log_pi(),
-            &tensor_full(1.0, &[]),
-        )
+        calc_rate_matrix(&Mu(&self.log_R), &self.log_pi(), &tensor_full(1.0, &[]))
     }
 
     pub fn save_npz(&self, path: &Path) {
@@ -166,8 +164,15 @@ fn optimize(
     min_rel_improvement: f64,
     no_improve_patience: usize,
     verbosity: Verbosity,
+    prefix: &str,
 ) {
     let variables = model.variables();
+    let variable_names = model.variables_names();
+    let mut trajectory_tensors: Vec<Vec<Tensor>> =
+        variables
+            .iter()
+            .map(|variable| vec![variable.as_tensor().copy().unwrap()])
+            .collect();
     let mut opt = candle_nn::optim::AdamW::new_lr(variables, 0.05).unwrap();
     let parameter = candle_nn::optim::ParamsAdamW {
         lr: 0.03,
@@ -212,6 +217,11 @@ fn optimize(
         let grads = opt_fn.backward().unwrap();
         opt.step(&grads).unwrap();
 
+        for (traj, new) in &mut trajectory_tensors.iter_mut().zip(variables.iter()) {
+            traj.push(
+                new.as_tensor().copy().unwrap()
+            );
+        }
         if iteration > min_iterations.saturating_sub(no_improve_patience) {
             let rel_improvement = (best_opt - current_opt) / best_opt.abs().max(1e-12);
             if rel_improvement > min_rel_improvement {
@@ -240,6 +250,16 @@ fn optimize(
     for (variable, value) in variables.iter().zip(best_params.iter()) {
         variable.set(value).unwrap();
     }
+
+    // Combine trajectory tensors into a single tensor for each variable
+    let trajectory_tensors: Vec<Tensor> = trajectory_tensors
+        .into_iter()
+        .map(|tensors| Tensor::stack(&tensors, 0).unwrap())
+        .collect();
+    for (name, var) in variable_names.iter().zip(trajectory_tensors.iter()) {
+        let filename = format!("{}.traj.npz", prefix);
+        Tensor::write_npz(&[(name, var)], Path::new(&filename)).unwrap();
+    }
 }
 
 pub fn optimize_branch_lengths(
@@ -248,6 +268,7 @@ pub fn optimize_branch_lengths(
     Mu: &Tensor,
     log_branch_lengths: &Tensor,
     verbosity: Verbosity,
+    prefix: &str
 ) -> Tensor {
     let model = BranchParameters {
         felsenstein_op,
@@ -256,7 +277,7 @@ pub fn optimize_branch_lengths(
         log_pi: log_pi.clone(),
     };
 
-    optimize(&model, 10, 100, 1e-5, 5, verbosity);
+    optimize(&model, 10, 100, 1e-5, 5, verbosity, prefix);
 
     model.log_branch_length.as_tensor().copy().unwrap()
 }
@@ -267,6 +288,7 @@ pub fn two_step_light_pmsf(
     weights: &[f64],
     log_branch_lengths: &Tensor,
     verbosity: Verbosity,
+    prefix: &str
 ) -> (Tensor, Tensor) {
     let step1_site_freq = light_pmsf(
         felsenstein_op.into_with_edge_op(),
@@ -285,6 +307,7 @@ pub fn two_step_light_pmsf(
         &Mu,
         log_branch_lengths,
         verbosity,
+        prefix
     );
 
     let final_site_freq = light_pmsf(
@@ -312,11 +335,7 @@ pub fn light_pmsf(
             Tensor::from_vec(category.to_vec(), &[20], &candle_core::Device::Cpu).unwrap();
         let log_pi = category_tensor.log().unwrap().unsqueeze(0).unwrap();
 
-        let (S, sqrt_pi) = model::calc_rate_matrix(
-            &Mu,
-            &log_pi,
-            &tensor_full(1.0, &[]),
-        );
+        let (S, sqrt_pi) = model::calc_rate_matrix(&Mu, &log_pi, &tensor_full(1.0, &[]));
 
         let likelihood = S
             .apply_op3(
@@ -434,6 +453,7 @@ pub fn optimize_internal(
         crate::data::UDM256_WEIGHTS,
         &log_branch_lengths,
         verbosity,
+        out_prefix
     );
 
     // Variable which gets optimized
@@ -457,7 +477,7 @@ pub fn optimize_internal(
         pca_data: pca,
     };
 
-    optimize(&model, 100, 500, 1e-5, 5, verbosity);
+    optimize(&model, 100, 500, 1e-5, 5, verbosity, out_prefix);
 
     let (S, sqrt_pi) = model.calc_rate_matrix();
 
