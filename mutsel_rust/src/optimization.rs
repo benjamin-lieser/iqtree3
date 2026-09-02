@@ -35,7 +35,7 @@ impl Optimizable for BranchParameters {
         vec![self.log_branch_length.clone()]
     }
     fn variables_names(&self) -> Vec<String> {
-        vec!["branch_length".to_string()]
+        vec!["log_branch_lengths".to_string()]
     }
     fn model_name(&self) -> String {
         "BranchParameters".to_string()
@@ -106,7 +106,7 @@ impl Optimizable for ModelParameters {
         vec![
             self.log_R.clone(),
             self.pca_coordinates.clone(),
-            self.log_branch_lengths.clone(),
+            //self.log_branch_lengths.clone(),
         ]
     }
 
@@ -114,7 +114,7 @@ impl Optimizable for ModelParameters {
         vec![
             "log_R".to_string(),
             "pca_coordinates".to_string(),
-            "log_branch_lengths".to_string(),
+            //"log_branch_lengths".to_string(),
         ]
     }
 
