@@ -6,6 +6,8 @@ use candle_core::{Tensor, Var};
 use candle_nn::{Optimizer, ops::softmax};
 use phylo_grad::FelsensteinTree;
 
+const BRANCH_LENGTH_PENALTY: f64 = 10.0;
+
 use crate::{
     Verbosity,
     felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp},
@@ -54,7 +56,7 @@ impl Optimizable for BranchParameters {
     }
 
     fn penalty(&self) -> Tensor {
-        tensor_full(0.0, &[])
+        (BRANCH_LENGTH_PENALTY * self.log_branch_length.exp().unwrap().sum_all().unwrap()).unwrap()
     }
 
     fn print_state(&self) {
@@ -106,7 +108,7 @@ impl Optimizable for ModelParameters {
         vec![
             self.log_R.clone(),
             self.pca_coordinates.clone(),
-            //self.log_branch_lengths.clone(),
+            self.log_branch_lengths.clone(),
         ]
     }
 
@@ -114,7 +116,7 @@ impl Optimizable for ModelParameters {
         vec![
             "log_R".to_string(),
             "pca_coordinates".to_string(),
-            //"log_branch_lengths".to_string(),
+            "log_branch_lengths".to_string(),
         ]
     }
 
@@ -159,7 +161,9 @@ impl Optimizable for ModelParameters {
             .unwrap();
         let R_penalty = (Mu * self.R_reg).unwrap();
 
-        (pi_penalty + R_penalty).unwrap()
+        let branch_penalty = (BRANCH_LENGTH_PENALTY * self.log_branch_lengths.exp().unwrap().sum_all().unwrap()).unwrap();
+
+        (pi_penalty + R_penalty + branch_penalty).unwrap()
     }
 
     fn print_state(&self) {
