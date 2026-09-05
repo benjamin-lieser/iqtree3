@@ -56,7 +56,7 @@ impl Optimizable for BranchParameters {
     }
 
     fn penalty(&self) -> Tensor {
-        (BRANCH_LENGTH_PENALTY * self.log_branch_length.exp().unwrap().sum_all().unwrap()).unwrap()
+        (BRANCH_LENGTH_PENALTY * self.log_branch_length.exp().unwrap().powf(2.0).unwrap().sum_all().unwrap()).unwrap()
         //tensor_full(0.0, &[])
     }
 
@@ -162,7 +162,7 @@ impl Optimizable for ModelParameters {
             .unwrap();
         let R_penalty = (Mu * self.R_reg).unwrap();
 
-        let branch_penalty = (BRANCH_LENGTH_PENALTY * self.log_branch_lengths.exp().unwrap().sum_all().unwrap()).unwrap();
+        let branch_penalty = (BRANCH_LENGTH_PENALTY * self.log_branch_lengths.exp().unwrap().powf(2.0).unwrap().sum_all().unwrap()).unwrap();
 
         (pi_penalty + R_penalty + branch_penalty).unwrap()
     }
