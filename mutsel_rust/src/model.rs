@@ -110,6 +110,23 @@ pub fn phylograd2iqtree_parametrization(
     Ok((R, pi))
 }
 
+/// Returns a tensor of shape [L] with the total substitution rate per site,
+/// keeping the computation differentiable w.r.t. S and sqrt_pi.
+/// Assumes S is symmetric.
+pub fn substitution_rates_tensor(S: &Tensor, sqrt_pi: &Tensor) -> Tensor {
+    // Q_ij = S_ij * sqrt_pi_j * sqrt_pi_i (i != j)
+
+    let pi_outer = sqrt_pi.unsqueeze(2).unwrap().broadcast_mul(&sqrt_pi.unsqueeze(1).unwrap()).unwrap();
+    let weighted = S.mul(&pi_outer).unwrap();
+
+    let total = weighted.sum(2).unwrap().sum(1).unwrap();
+
+    let eye = Tensor::eye(20, candle_core::DType::F64, S.device()).unwrap();
+    let diag = weighted.broadcast_mul(&eye).unwrap().sum(2).unwrap().sum(1).unwrap();
+
+    total.sub(&diag).unwrap()
+}
+
 pub fn substitution_rates(S: &Tensor, sqrt_pi: &Tensor) -> Vec<f64> {
     // Q_ij = S_ij * sqrt_pi_j / sqrt_pi_i
 
@@ -156,5 +173,23 @@ use super::*;
         println!("S - S.T: {}", (&S - &S.transpose(1, 2).unwrap()).unwrap());
 
         assert!((&S - &S.transpose(1, 2).unwrap()).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f64>().unwrap() < 1e-12);
+    }
+
+    #[test]
+    fn test_substitution_rates_tensor_matches_vec() {
+        let L = 2;
+        let log_pi = Tensor::rand(-1.0, 1.0, &[L, 20], &candle_core::Device::Cpu).unwrap();
+        let R = Tensor::rand(0.1, 2.0, &[20, 20], &candle_core::Device::Cpu).unwrap();
+        let R = Mu(&R);
+
+        let (S, sqrt_pi) = calc_rate_matrix(&R, &log_pi, &tensor_full(1.0, &[]));
+
+        let rates_vec = substitution_rates(&S, &sqrt_pi);
+        let rates_tensor = substitution_rates_tensor(&S, &sqrt_pi).to_vec1::<f64>().unwrap();
+
+        assert_eq!(rates_vec.len(), rates_tensor.len());
+        for (a, b) in rates_vec.iter().zip(rates_tensor.iter()) {
+            assert!((a - b).abs() < 1e-10, "rates differ: {} vs {}", a, b);
+        }
     }
 }

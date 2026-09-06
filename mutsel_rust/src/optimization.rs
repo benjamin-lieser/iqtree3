@@ -25,6 +25,20 @@ trait Optimizable {
     fn print_state(&self) {}
 }
 
+fn calc_likelihood(mu : &Tensor, log_pi: &Tensor, log_branch_lengths: &Tensor, felsenstein_op: FelsensteinWithEdgeOp) -> Tensor {
+    let (S, sqrt_pi) = calc_rate_matrix(mu, log_pi, &tensor_full(1.0, &[]));
+
+    let branch_lengths = log_branch_lengths.exp().unwrap();
+
+    let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi).mean_all().unwrap();
+    let S = S.broadcast_div(&average_rate).unwrap();
+
+    S.apply_op3(&sqrt_pi, &branch_lengths, felsenstein_op)
+        .unwrap()
+        .sum_all()
+        .unwrap()
+}
+
 pub struct BranchParameters {
     pub felsenstein_op: FelsensteinWithEdgeOp,
     pub log_branch_length: Var,
@@ -44,15 +58,7 @@ impl Optimizable for BranchParameters {
     }
 
     fn likelihood(&self) -> Tensor {
-        let log_branch_lengths = self.log_branch_length.clone();
-
-        let (S, sqrt_pi) = model::calc_rate_matrix(&self.Mu, &self.log_pi, &tensor_full(1.0, &[]));
-
-        let branch_lengths = log_branch_lengths.exp().unwrap();
-        S.apply_op3(&sqrt_pi, &branch_lengths, self.felsenstein_op.clone())
-            .unwrap()
-            .sum_all()
-            .unwrap()
+        calc_likelihood(&self.Mu, &self.log_pi, &self.log_branch_length, self.felsenstein_op.clone())
     }
 
     fn penalty(&self) -> Tensor {
@@ -126,13 +132,12 @@ impl Optimizable for ModelParameters {
     }
 
     fn likelihood(&self) -> Tensor {
-        let branch_lengths = self.log_branch_lengths.exp().unwrap();
-
-        let (S, sqrt_pi) = self.calc_rate_matrix();
-        S.apply_op3(&sqrt_pi, &branch_lengths, self.felsenstein_op.clone())
-            .unwrap()
-            .sum_all()
-            .unwrap()
+        calc_likelihood(
+            &Mu(&self.log_R),
+            &self.log_pi(),
+            &self.log_branch_lengths,
+            self.felsenstein_op.clone(),
+        )
     }
 
     fn penalty(&self) -> Tensor {
@@ -422,11 +427,8 @@ pub fn Mu(log_parameter: &Tensor) -> Tensor {
     let sum = row_sum.dot(&pi_vec).unwrap();
     let Q = Q.broadcast_div(&sum).unwrap();
 
-    // This has one expected mutation per unit time. The guide tree will be more in the regime of 1 substitution.
-    // So we mutlpiphy with 20. Exact factor is fitted later. We also divide with 8 which is emprically close to the optimum.
-    // (This does depend on the protein and how many columns are under strong selection)
 
-    let Q = (Q * (20.0 / 12.0)).unwrap();
+    // The scaling of Q does not matter, since we always scale it so the subsitution rate over all rate averages to 1.0.
 
     // diagonal is zero here, but they are not used anyway
     (Q + pi).unwrap()
