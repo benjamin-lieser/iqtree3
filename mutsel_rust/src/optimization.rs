@@ -39,6 +39,13 @@ fn calc_likelihood(mu : &Tensor, log_pi: &Tensor, log_branch_lengths: &Tensor, f
         .unwrap()
 }
 
+fn branch_length_reg(log_branch_lengths: &Tensor) -> Tensor {
+    let branch_lengths = log_branch_lengths.exp().unwrap();
+
+    let penalty = BRANCH_LENGTH_PENALTY * branch_lengths.powf(8.0).unwrap().sum_all().unwrap();
+    penalty.unwrap()
+}
+
 pub struct BranchParameters {
     pub felsenstein_op: FelsensteinWithEdgeOp,
     pub log_branch_length: Var,
@@ -62,14 +69,7 @@ impl Optimizable for BranchParameters {
     }
 
     fn penalty(&self) -> Tensor {
-        let branch_lengths = self.log_branch_length.exp().unwrap();
-
-        // RELU on branches bigger than 1.0, since we don't want to penalize small branches
-        let branch_lengths = branch_lengths.broadcast_sub(&tensor_full(1.0, &[])).unwrap();
-        let branch_lengths = branch_lengths.relu().unwrap();
-
-        let branch_penalty = (BRANCH_LENGTH_PENALTY * 10.0 * branch_lengths.powf(2.0).unwrap().sum_all().unwrap()).unwrap();
-        branch_penalty
+        branch_length_reg(&self.log_branch_length)
     }
 
     fn print_state(&self) {
@@ -173,13 +173,7 @@ impl Optimizable for ModelParameters {
             .unwrap();
         let R_penalty = (Mu * self.R_reg).unwrap();
 
-        let branch_lengths = self.log_branch_lengths.exp().unwrap();
-
-        // RELU on branches bigger than 1.0, since we don't want to penalize small branches
-        let branch_lengths = branch_lengths.broadcast_sub(&tensor_full(1.0, &[])).unwrap();
-        let branch_lengths = branch_lengths.relu().unwrap();
-
-        let branch_penalty = (BRANCH_LENGTH_PENALTY * 10.0 * branch_lengths.powf(2.0).unwrap().sum_all().unwrap()).unwrap();
+        let branch_penalty = branch_length_reg(&self.log_branch_lengths);
 
         (pi_penalty + R_penalty + branch_penalty).unwrap()
     }
