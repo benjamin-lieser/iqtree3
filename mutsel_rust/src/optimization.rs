@@ -1,5 +1,6 @@
 use std::{
-    path::Path, sync::{Arc, Mutex},
+    path::Path,
+    sync::{Arc, Mutex},
 };
 
 use candle_core::{Tensor, Var};
@@ -25,25 +26,25 @@ trait Optimizable {
     fn print_state(&self) {}
 }
 
-fn calc_likelihood(mu : &Tensor, log_pi: &Tensor, log_branch_lengths: &Tensor, felsenstein_op: FelsensteinWithEdgeOp) -> Tensor {
+fn calc_likelihood(
+    mu: &Tensor,
+    log_pi: &Tensor,
+    log_branch_lengths: &Tensor,
+    felsenstein_op: FelsensteinWithEdgeOp,
+) -> Tensor {
     let (S, sqrt_pi) = calc_rate_matrix(mu, log_pi, &tensor_full(1.0, &[]));
 
     let branch_lengths = log_branch_lengths.exp().unwrap();
 
-    let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi).mean_all().unwrap();
+    let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi)
+        .mean_all()
+        .unwrap();
     let S = S.broadcast_div(&average_rate).unwrap();
 
     S.apply_op3(&sqrt_pi, &branch_lengths, felsenstein_op)
         .unwrap()
         .sum_all()
         .unwrap()
-}
-
-fn branch_length_reg(log_branch_lengths: &Tensor) -> Tensor {
-    let branch_lengths = log_branch_lengths.exp().unwrap();
-
-    let penalty = BRANCH_LENGTH_PENALTY * branch_lengths.powf(8.0).unwrap().sum_all().unwrap();
-    penalty.unwrap()
 }
 
 pub struct BranchParameters {
@@ -65,11 +66,16 @@ impl Optimizable for BranchParameters {
     }
 
     fn likelihood(&self) -> Tensor {
-        calc_likelihood(&self.Mu, &self.log_pi, &self.log_branch_length, self.felsenstein_op.clone())
+        calc_likelihood(
+            &self.Mu,
+            &self.log_pi,
+            &self.log_branch_length,
+            self.felsenstein_op.clone(),
+        )
     }
 
     fn penalty(&self) -> Tensor {
-        branch_length_reg(&self.log_branch_length)
+        tensor_full(0.0, &[])
     }
 
     fn print_state(&self) {
@@ -83,6 +89,7 @@ pub struct ModelParameters {
     /// Defines the log pi per site
     pub pca_coordinates: Var,
     pub log_branch_lengths: Var,
+    pub init_log_branch_lengths: Tensor,
     pub pi_reg: f64,
     pub R_reg: f64,
     pub init_log_R: Tensor,
@@ -173,7 +180,16 @@ impl Optimizable for ModelParameters {
             .unwrap();
         let R_penalty = (Mu * self.R_reg).unwrap();
 
-        let branch_penalty = branch_length_reg(&self.log_branch_lengths);
+        let branch_penalty = (&self
+            .log_branch_lengths
+            .sub(&self.init_log_branch_lengths)
+            .unwrap())
+            .powf(2.0)
+            .unwrap()
+            .sum_all()
+            .unwrap();
+
+        let branch_penalty = (branch_penalty * BRANCH_LENGTH_PENALTY).unwrap();
 
         (pi_penalty + R_penalty + branch_penalty).unwrap()
     }
@@ -197,11 +213,10 @@ fn optimize(
 ) {
     let variables = model.variables();
     let variable_names = model.variables_names();
-    let mut trajectory_tensors: Vec<Vec<Tensor>> =
-        variables
-            .iter()
-            .map(|variable| vec![variable.as_tensor().copy().unwrap()])
-            .collect();
+    let mut trajectory_tensors: Vec<Vec<Tensor>> = variables
+        .iter()
+        .map(|variable| vec![variable.as_tensor().copy().unwrap()])
+        .collect();
     let mut opt = candle_nn::optim::AdamW::new_lr(variables, 0.05).unwrap();
     let parameter = candle_nn::optim::ParamsAdamW {
         lr: 0.03,
@@ -247,9 +262,7 @@ fn optimize(
         opt.step(&grads).unwrap();
 
         for (traj, new) in &mut trajectory_tensors.iter_mut().zip(variables.iter()) {
-            traj.push(
-                new.as_tensor().copy().unwrap()
-            );
+            traj.push(new.as_tensor().copy().unwrap());
         }
         if iteration > min_iterations.saturating_sub(no_improve_patience) {
             let rel_improvement = (best_opt - current_opt) / best_opt.abs().max(1e-12);
@@ -286,8 +299,14 @@ fn optimize(
         .map(|tensors| Tensor::stack(&tensors, 0).unwrap())
         .collect();
     let filename = format!("{}.traj_{}.npz", prefix, model.model_name());
-    Tensor::write_npz(&variable_names.iter().zip(trajectory_tensors.iter()).collect::<Vec<_>>(), Path::new(&filename)).unwrap();
-    
+    Tensor::write_npz(
+        &variable_names
+            .iter()
+            .zip(trajectory_tensors.iter())
+            .collect::<Vec<_>>(),
+        Path::new(&filename),
+    )
+    .unwrap();
 }
 
 pub fn optimize_branch_lengths(
@@ -296,7 +315,7 @@ pub fn optimize_branch_lengths(
     Mu: &Tensor,
     log_branch_lengths: &Tensor,
     verbosity: Verbosity,
-    prefix: &str
+    prefix: &str,
 ) -> Tensor {
     let model = BranchParameters {
         felsenstein_op,
@@ -316,7 +335,7 @@ pub fn two_step_light_pmsf(
     weights: &[f64],
     log_branch_lengths: &Tensor,
     verbosity: Verbosity,
-    prefix: &str
+    prefix: &str,
 ) -> (Tensor, Tensor) {
     let step1_site_freq = light_pmsf(
         felsenstein_op.into_with_edge_op(),
@@ -335,7 +354,7 @@ pub fn two_step_light_pmsf(
         &Mu,
         log_branch_lengths,
         verbosity,
-        prefix
+        prefix,
     );
 
     let final_site_freq = light_pmsf(
@@ -433,7 +452,6 @@ pub fn Mu(log_parameter: &Tensor) -> Tensor {
     let sum = row_sum.dot(&pi_vec).unwrap();
     let Q = Q.broadcast_div(&sum).unwrap();
 
-
     // The scaling of Q does not matter, since we always scale it so the subsitution rate over all rate averages to 1.0.
 
     // diagonal is zero here, but they are not used anyway
@@ -478,7 +496,7 @@ pub fn optimize_internal(
         crate::data::UDM256_WEIGHTS,
         &log_branch_lengths,
         verbosity,
-        out_prefix
+        out_prefix,
     );
 
     // Variable which gets optimized
@@ -496,6 +514,7 @@ pub fn optimize_internal(
         log_R,
         pca_coordinates: Var::from_tensor(&pca_coordinates).unwrap(),
         log_branch_lengths: Var::from_tensor(&log_branch_length_scaling).unwrap(),
+        init_log_branch_lengths: log_branch_length_scaling.detach().copy().unwrap(),
         pi_reg: mutsel_params.pi_reg,
         R_reg: mutsel_params.Mu_reg,
         init_log_R,
