@@ -62,8 +62,14 @@ impl Optimizable for BranchParameters {
     }
 
     fn penalty(&self) -> Tensor {
-        (BRANCH_LENGTH_PENALTY * self.log_branch_length.exp().unwrap().powf(2.0).unwrap().sum_all().unwrap()).unwrap()
-        //tensor_full(0.0, &[])
+        let branch_lengths = self.log_branch_length.exp().unwrap();
+
+        // RELU on branches bigger than 1.0, since we don't want to penalize small branches
+        let branch_lengths = branch_lengths.broadcast_sub(&tensor_full(1.0, &[])).unwrap();
+        let branch_lengths = branch_lengths.relu().unwrap();
+
+        let branch_penalty = (BRANCH_LENGTH_PENALTY * 10.0 * branch_lengths.powf(2.0).unwrap().sum_all().unwrap()).unwrap();
+        branch_penalty
     }
 
     fn print_state(&self) {
@@ -167,7 +173,13 @@ impl Optimizable for ModelParameters {
             .unwrap();
         let R_penalty = (Mu * self.R_reg).unwrap();
 
-        let branch_penalty = (BRANCH_LENGTH_PENALTY * self.log_branch_lengths.exp().unwrap().powf(2.0).unwrap().sum_all().unwrap()).unwrap();
+        let branch_lengths = self.log_branch_lengths.exp().unwrap();
+
+        // RELU on branches bigger than 1.0, since we don't want to penalize small branches
+        let branch_lengths = branch_lengths.broadcast_sub(&tensor_full(1.0, &[])).unwrap();
+        let branch_lengths = branch_lengths.relu().unwrap();
+
+        let branch_penalty = (BRANCH_LENGTH_PENALTY * 10.0 * branch_lengths.powf(2.0).unwrap().sum_all().unwrap()).unwrap();
 
         (pi_penalty + R_penalty + branch_penalty).unwrap()
     }
