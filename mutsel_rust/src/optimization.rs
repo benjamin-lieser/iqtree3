@@ -79,7 +79,6 @@ impl Optimizable for BranchParameters {
     }
 
     fn print_state(&self) {
-        println!("branch_length: {:?}", self.log_branch_length.exp().unwrap());
     }
 }
 
@@ -89,6 +88,7 @@ pub struct ModelParameters {
     /// Defines the log pi per site
     pub pca_coordinates: Var,
     pub log_branch_lengths: Var,
+    pub log_global_scaling: Var,
     pub init_log_branch_lengths: Tensor,
     pub pi_reg: f64,
     pub R_reg: f64,
@@ -148,7 +148,7 @@ impl Optimizable for ModelParameters {
         calc_likelihood(
             &Mu(&self.log_R),
             &self.log_pi(),
-            &self.log_branch_lengths,
+            &(self.log_branch_lengths.broadcast_add(&self.log_global_scaling)).unwrap(),
             self.felsenstein_op.clone(),
         )
     }
@@ -196,8 +196,8 @@ impl Optimizable for ModelParameters {
 
     fn print_state(&self) {
         println!(
-            "branch_lengths: {:?}",
-            self.log_branch_lengths.exp().unwrap()
+            "global_scaling: {:?}",
+            self.log_global_scaling.exp().unwrap()
         );
     }
 }
@@ -514,6 +514,7 @@ pub fn optimize_internal(
         log_R,
         pca_coordinates: Var::from_tensor(&pca_coordinates).unwrap(),
         log_branch_lengths: Var::from_tensor(&log_branch_length_scaling).unwrap(),
+        log_global_scaling: Var::from_tensor(&tensor_full(0.0, &[])).unwrap(),
         init_log_branch_lengths: log_branch_length_scaling.detach().copy().unwrap(),
         pi_reg: mutsel_params.pi_reg,
         R_reg: mutsel_params.Mu_reg,
