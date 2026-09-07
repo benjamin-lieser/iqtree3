@@ -35,7 +35,7 @@ fn main() {
         log_pi: pi.log().unwrap(),
     };
 
-    mutsel_tools::optimize_lbfgs(&model, 10, mutsel_rust::Verbosity::Med).unwrap();
+    //mutsel_tools::optimize_lbfgs(&model, 10, mutsel_rust::Verbosity::Med).unwrap();
 
     model.log_branch_length.set(&Tensor::zeros(&[distances.dim(0).unwrap()], F64, &candle_core::Device::Cpu).unwrap()).unwrap();
 
