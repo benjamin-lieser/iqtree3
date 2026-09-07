@@ -1,9 +1,62 @@
-use candle_core::Tensor;
+use candle_core::{Result as CandleResult, Tensor};
+use candle_optimisers::{LossOptimizer, Model, ModelOutcome};
+use candle_optimisers::lbfgs::{Lbfgs, LineSearch, ParamsLBFGS};
 use lazy_static::lazy_static;
 use seq_io::fasta::Record;
 use std::{collections::HashMap, io::Read, path::Path, vec};
 
 use anyhow::{Context, Result};
+
+struct LbfgsModel<'a, T: mutsel_rust::optimization::Optimizable> {
+    model: &'a T,
+}
+
+impl<T: mutsel_rust::optimization::Optimizable> Model for LbfgsModel<'_, T> {
+    fn loss(&self) -> CandleResult<Tensor> {
+        let neg_likelihood = self.model.likelihood().neg()?;
+        &neg_likelihood + &self.model.penalty()
+    }
+}
+
+/// Optimize an existing mutsel model with limited-memory BFGS and strong-Wolfe line search.
+pub fn optimize_lbfgs<T: mutsel_rust::optimization::Optimizable>(
+    model: &T,
+    max_iterations: usize,
+    verbosity: mutsel_rust::Verbosity,
+) -> CandleResult<()> {
+    let objective = LbfgsModel { model };
+    let params = ParamsLBFGS {
+        line_search: Some(LineSearch::StrongWolfe(1e-4, 0.9, 1e-9)),
+        ..Default::default()
+    };
+    let mut optimizer = Lbfgs::new(model.variables(), params, objective)?;
+    let mut loss = optimizer_model_loss(model)?;
+
+    for iteration in 0..max_iterations {
+        if verbosity >= mutsel_rust::Verbosity::Med {
+            println!(
+                "LBFGS iteration {}: Optfn {:.3}",
+                iteration,
+                loss.to_scalar::<f64>()?
+            );
+            model.print_state();
+        }
+
+        match optimizer.backward_step(&loss)? {
+            ModelOutcome::Stepped(next_loss, _) => loss = next_loss,
+            ModelOutcome::Converged(_, _) => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn optimizer_model_loss<T: mutsel_rust::optimization::Optimizable>(
+    model: &T,
+) -> CandleResult<Tensor> {
+    let neg_likelihood = model.likelihood().neg()?;
+    &neg_likelihood + &model.penalty()
+}
 
 lazy_static! {
     static ref AMINO_MAPPING: HashMap<u8, u8> = {

@@ -35,11 +35,11 @@ fn main() {
         log_pi: pi.log().unwrap(),
     };
 
-    mutsel_rust::optimization::optimize(&model, 10, 10, 1e-6, 5, mutsel_rust::Verbosity::Med, &"debug");
+    mutsel_tools::optimize_lbfgs(&model, 10, mutsel_rust::Verbosity::Med).unwrap();
 
     model.log_branch_length.set(&Tensor::zeros(&[distances.dim(0).unwrap()], F64, &candle_core::Device::Cpu).unwrap()).unwrap();
 
-    mutsel_rust::optimization::optimize(&model, 100, 1000, 1e-7, 5, mutsel_rust::Verbosity::Med, &"debug");
+    mutsel_tools::optimize_lbfgs(&model, 1000, mutsel_rust::Verbosity::Med).unwrap();
 
     println!("Final log branch lengths: {:?}", model.log_branch_length.to_vec1::<f64>().unwrap());
 }
