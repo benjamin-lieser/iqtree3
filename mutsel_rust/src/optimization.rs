@@ -182,10 +182,11 @@ impl Optimizable for ModelParameters {
             .unwrap();
         let R_penalty = (Mu * self.R_reg).unwrap();
 
-        let branch_penalty = (&self
-            .log_branch_lengths
-            .sub(&self.init_log_branch_lengths)
-            .unwrap())
+
+        let init = self.init_log_branch_lengths.clamp(-1000.0, 1000.0).unwrap();
+        let current = self.log_branch_lengths.clamp(-1000.0, 1000.0).unwrap();
+
+        let branch_penalty = (&current.sub(&init).unwrap())
             .powf(2.0)
             .unwrap()
             .sum_all()
