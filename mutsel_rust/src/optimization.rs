@@ -7,7 +7,7 @@ use candle_core::{Tensor, Var};
 use candle_nn::{Optimizer, ops::softmax};
 use phylo_grad::FelsensteinTree;
 
-const BRANCH_LENGTH_PENALTY: f64 = 20.0;
+const BRANCH_LENGTH_PENALTY: f64 = 50.0;
 
 use crate::{
     Verbosity,
