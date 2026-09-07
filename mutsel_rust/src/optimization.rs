@@ -327,7 +327,7 @@ pub fn optimize_branch_lengths(
         log_pi: log_pi.clone(),
     };
 
-    optimize(&model, 10, 100, 1e-5, 5, verbosity, prefix);
+    optimize(&model, 10, 200, 1e-7, 5, verbosity, prefix);
 
     model.log_branch_length.as_tensor().copy().unwrap()
 }
@@ -525,7 +525,7 @@ pub fn optimize_internal(
         pca_data: pca,
     };
 
-    optimize(&model, 100, 500, 1e-5, 5, verbosity, out_prefix);
+    optimize(&model, 100, 500, 1e-6, 5, verbosity, out_prefix);
 
     let (S, sqrt_pi) = model.calc_rate_matrix();
 
