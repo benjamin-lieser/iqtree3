@@ -66,7 +66,7 @@ pub fn read_alignment(fasta_file: &Path) -> HashMap<String, Vec<u8>> {
     let mut sequences = HashMap::new();
     while let Some(result) = alignment.next() {
         let record = result.expect("Error reading fasta record");
-        let seq: Vec<u8> = record.seq().iter().copied().collect();
+        let seq: Vec<u8> = record.full_seq().iter().copied().collect();
         sequences.insert(record.id().unwrap().to_string(), seq);
     }
     sequences

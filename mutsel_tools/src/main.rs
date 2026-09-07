@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use candle_core::{Tensor, Var};
+use candle_core::{DType::F64, Tensor, Var};
 
 fn main() {
     let args = std::env::args().collect::<Vec<String>>();
@@ -35,6 +35,9 @@ fn main() {
         log_pi: pi.log().unwrap(),
     };
 
-    mutsel_rust::optimization::optimize(&model, 100, 1000, 1e-6, 5, mutsel_rust::Verbosity::Med, &"debug");
+    mutsel_rust::optimization::optimize(&model, 10, 10, 1e-6, 5, mutsel_rust::Verbosity::Med, &"debug");
 
+    model.log_branch_length.set(&Tensor::zeros(&[distances.dim(0).unwrap()], F64, &candle_core::Device::Cpu).unwrap()).unwrap();
+
+    mutsel_rust::optimization::optimize(&model, 100, 1000, 1e-6, 5, mutsel_rust::Verbosity::Med, &"debug");
 }
