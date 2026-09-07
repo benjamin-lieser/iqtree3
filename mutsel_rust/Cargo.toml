@@ -12,7 +12,7 @@ libc = "0.2.182"
 
 [lib]
 name = "mutsel_rust"
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "rlib"]
 
 [profile.release]
 lto = false # There seems to be an issue with LLVM which makes the code slower when using lto

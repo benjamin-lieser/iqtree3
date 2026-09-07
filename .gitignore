@@ -36,3 +36,4 @@ zlib-1.2.7/
 /.envrc
 softwipe_build
 mutsel_rust/target/
+mutsel_tools/target/

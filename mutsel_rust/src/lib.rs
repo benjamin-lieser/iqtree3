@@ -3,9 +3,9 @@
 pub mod data;
 pub mod felsenstein;
 mod io;
-mod model;
+pub mod model;
 mod pca;
-mod optimization;
+pub mod optimization;
 mod utils;
 
 use std::{
@@ -195,7 +195,7 @@ fn create_felsenstein_tree(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Verbosity {
+pub enum Verbosity {
     Quiet,
     Min,
     Med,

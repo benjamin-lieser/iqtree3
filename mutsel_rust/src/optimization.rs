@@ -17,7 +17,7 @@ use crate::{
     utils::tensor_full,
 };
 
-trait Optimizable {
+pub trait Optimizable {
     fn variables(&self) -> Vec<Var>;
     fn variables_names(&self) -> Vec<String>;
     fn model_name(&self) -> String;
@@ -205,7 +205,7 @@ impl Optimizable for ModelParameters {
     }
 }
 
-fn optimize(
+pub fn optimize(
     model: &impl Optimizable,
     min_iterations: usize,
     max_iterations: usize,
