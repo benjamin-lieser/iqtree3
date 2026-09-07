@@ -8,25 +8,6 @@ use candle_nn::{Optimizer, ops::softmax};
 use phylo_grad::FelsensteinTree;
 
 const BRANCH_LENGTH_PENALTY: f64 = 50.0;
-const INITIAL_LEARNING_RATE: f64 = 0.03;
-const WARMUP_FRACTION: f64 = 0.05;
-
-fn warmup_cosine_learning_rate(step: usize, total_steps: usize) -> f64 {
-    let total_steps = total_steps.max(1);
-    let warmup_steps = ((total_steps as f64 * WARMUP_FRACTION).round() as usize)
-        .clamp(1, total_steps);
-
-    if step < warmup_steps {
-        return INITIAL_LEARNING_RATE * (step + 1) as f64 / warmup_steps as f64;
-    }
-
-    if warmup_steps == total_steps {
-        return INITIAL_LEARNING_RATE;
-    }
-
-    let progress = (step - warmup_steps) as f64 / (total_steps - warmup_steps) as f64;
-    INITIAL_LEARNING_RATE * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
-}
 
 use crate::{
     Verbosity,
@@ -239,9 +220,9 @@ pub fn optimize(
         .iter()
         .map(|variable| vec![variable.as_tensor().copy().unwrap()])
         .collect();
-    let mut opt = candle_nn::optim::AdamW::new_lr(variables, INITIAL_LEARNING_RATE).unwrap();
+    let mut opt = candle_nn::optim::AdamW::new_lr(variables, 0.05).unwrap();
     let parameter = candle_nn::optim::ParamsAdamW {
-        lr: INITIAL_LEARNING_RATE,
+        lr: 0.03,
         weight_decay: 0.0,
         ..Default::default()
     };
@@ -256,13 +237,7 @@ pub fn optimize(
         .collect();
     let mut no_improve_count = 0;
 
-    for iteration in 0..max_iterations {
-        opt.set_params(candle_nn::optim::ParamsAdamW {
-            lr: warmup_cosine_learning_rate(iteration, max_iterations),
-            weight_decay: 0.0,
-            ..Default::default()
-        });
-
+    for iteration in 0.. {
         let neg_likelihood = model.likelihood().neg().unwrap();
         let penalty = model.penalty();
         let opt_fn = (&neg_likelihood + &penalty).unwrap();
@@ -308,10 +283,13 @@ pub fn optimize(
             }
         }
 
+        if iteration > max_iterations {
+            println!("Reached maximum iterations ({})", max_iterations);
+            break;
+        }
+
         best_opt = current_opt.min(best_opt);
     }
-
-    println!("Reached maximum iterations ({})", max_iterations);
 
     // Obtain parameters from best iteration
     for (variable, value) in variables.iter().zip(best_params.iter()) {
@@ -332,22 +310,6 @@ pub fn optimize(
         Path::new(&filename),
     )
     .unwrap();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{warmup_cosine_learning_rate, INITIAL_LEARNING_RATE};
-
-    #[test]
-    fn warmup_cosine_schedule_warms_up_then_decays() {
-        let total_steps = 100;
-
-        assert_eq!(warmup_cosine_learning_rate(0, total_steps), INITIAL_LEARNING_RATE / 5.0);
-        assert_eq!(warmup_cosine_learning_rate(4, total_steps), INITIAL_LEARNING_RATE);
-        assert_eq!(warmup_cosine_learning_rate(5, total_steps), INITIAL_LEARNING_RATE);
-        assert!(warmup_cosine_learning_rate(50, total_steps) < INITIAL_LEARNING_RATE);
-        assert!(warmup_cosine_learning_rate(99, total_steps) < 1e-5);
-    }
 }
 
 pub fn optimize_branch_lengths(
