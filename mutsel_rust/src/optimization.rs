@@ -129,6 +129,7 @@ impl Optimizable for ModelParameters {
             self.log_R.clone(),
             self.pca_coordinates.clone(),
             self.log_branch_lengths.clone(),
+            self.log_global_scaling.clone(),
         ]
     }
 
@@ -137,6 +138,7 @@ impl Optimizable for ModelParameters {
             "log_R".to_string(),
             "pca_coordinates".to_string(),
             "log_branch_lengths".to_string(),
+            "log_global_scaling".to_string(),
         ]
     }
 
