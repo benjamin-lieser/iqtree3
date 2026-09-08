@@ -30,9 +30,14 @@ fn calc_likelihood(
     mu: &Tensor,
     log_pi: &Tensor,
     log_branch_lengths: &Tensor,
+    log_site_rate: Option<&Tensor>,
     felsenstein_op: FelsensteinWithEdgeOp,
 ) -> Tensor {
-    let (S, sqrt_pi) = calc_rate_matrix(mu, log_pi, &tensor_full(1.0, &[]));
+    let (mut S, sqrt_pi) = calc_rate_matrix(mu, log_pi, &tensor_full(1.0, &[]));
+
+    if let Some(log_site_rate) = log_site_rate {
+        S = S.broadcast_mul(&log_site_rate.exp().unwrap().unsqueeze(1).unwrap().unsqueeze(2).unwrap()).unwrap();
+    }
 
     let branch_lengths = log_branch_lengths.exp().unwrap();
 
@@ -70,6 +75,7 @@ impl Optimizable for BranchParameters {
             &self.Mu,
             &self.log_pi,
             &self.log_branch_length,
+            None,
             self.felsenstein_op.clone(),
         )
     }
@@ -89,6 +95,7 @@ pub struct ModelParameters {
     pub pca_coordinates: Var,
     pub log_branch_lengths: Var,
     pub log_global_scaling: Var,
+    pub log_site_rate: Var,
     pub init_log_branch_lengths: Tensor,
     pub pi_reg: f64,
     pub R_reg: f64,
@@ -130,6 +137,7 @@ impl Optimizable for ModelParameters {
             self.pca_coordinates.clone(),
             self.log_branch_lengths.clone(),
             self.log_global_scaling.clone(),
+            self.log_site_rate.clone()
         ]
     }
 
@@ -139,6 +147,7 @@ impl Optimizable for ModelParameters {
             "pca_coordinates".to_string(),
             "log_branch_lengths".to_string(),
             "log_global_scaling".to_string(),
+            "log_site_rate".to_string()
         ]
     }
 
@@ -151,6 +160,7 @@ impl Optimizable for ModelParameters {
             &Mu(&self.log_R),
             &self.log_pi(),
             &(self.log_branch_lengths.broadcast_add(&self.log_global_scaling)).unwrap(),
+            Some(&self.log_site_rate),
             self.felsenstein_op.clone(),
         )
     }
@@ -518,6 +528,7 @@ pub fn optimize_internal(
         pca_coordinates: Var::from_tensor(&pca_coordinates).unwrap(),
         log_branch_lengths: Var::from_tensor(&log_branch_length_scaling).unwrap(),
         log_global_scaling: Var::from_tensor(&tensor_full(0.0, &[])).unwrap(),
+        log_site_rate: Var::from_tensor(&tensor_full(0.0, &[init_log_pi.dim(0).unwrap()])).unwrap(),
         init_log_branch_lengths: log_branch_length_scaling.detach().copy().unwrap(),
         pi_reg: mutsel_params.pi_reg,
         R_reg: mutsel_params.Mu_reg,
