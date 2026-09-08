@@ -130,6 +130,8 @@ pub unsafe extern "C" fn rust_mutsel(
     std::io::stdout().flush().unwrap();
     io::restore_stdout_stderr(saved_stdout, saved_stderr, tee_handle);
 }
+
+#[derive(Debug, Clone, Copy)]
 pub struct MutselParams {
     pi_reg: f64,
     Mu_reg: f64,
