@@ -36,7 +36,17 @@ fn calc_likelihood(
     let (mut S, sqrt_pi) = calc_rate_matrix(mu, log_pi, &tensor_full(1.0, &[]));
 
     if let Some(log_site_rate) = log_site_rate {
-        S = S.broadcast_mul(&log_site_rate.exp().unwrap().unsqueeze(1).unwrap().unsqueeze(2).unwrap()).unwrap();
+        S = S
+            .broadcast_mul(
+                &log_site_rate
+                    .exp()
+                    .unwrap()
+                    .unsqueeze(1)
+                    .unwrap()
+                    .unsqueeze(2)
+                    .unwrap(),
+            )
+            .unwrap();
     }
 
     let branch_lengths = log_branch_lengths.exp().unwrap();
@@ -84,8 +94,7 @@ impl Optimizable for BranchParameters {
         tensor_full(0.0, &[])
     }
 
-    fn print_state(&self) {
-    }
+    fn print_state(&self) {}
 }
 
 pub struct ModelParameters {
@@ -110,7 +119,25 @@ impl ModelParameters {
     }
 
     pub fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
-        calc_rate_matrix(&Mu(&self.log_R), &self.log_pi(), &tensor_full(1.0, &[]))
+        let (S, sqrt_pi) =
+            calc_rate_matrix(&Mu(&self.log_R), &self.log_pi(), &tensor_full(1.0, &[]));
+        let S = S
+            .broadcast_mul(
+                &self
+                    .log_site_rate
+                    .exp()
+                    .unwrap()
+                    .unsqueeze(1)
+                    .unwrap()
+                    .unsqueeze(2)
+                    .unwrap(),
+            )
+            .unwrap();
+        let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi)
+            .mean_all()
+            .unwrap();
+        let S = S.broadcast_div(&average_rate).unwrap();
+        (S, sqrt_pi)
     }
 
     pub fn save_npz(&self, path: &Path) {
@@ -137,7 +164,7 @@ impl Optimizable for ModelParameters {
             self.pca_coordinates.clone(),
             self.log_branch_lengths.clone(),
             self.log_global_scaling.clone(),
-            self.log_site_rate.clone()
+            self.log_site_rate.clone(),
         ]
     }
 
@@ -147,7 +174,7 @@ impl Optimizable for ModelParameters {
             "pca_coordinates".to_string(),
             "log_branch_lengths".to_string(),
             "log_global_scaling".to_string(),
-            "log_site_rate".to_string()
+            "log_site_rate".to_string(),
         ]
     }
 
@@ -156,13 +183,12 @@ impl Optimizable for ModelParameters {
     }
 
     fn likelihood(&self) -> Tensor {
-        calc_likelihood(
-            &Mu(&self.log_R),
-            &self.log_pi(),
-            &(self.log_branch_lengths.broadcast_add(&self.log_global_scaling)).unwrap(),
-            Some(&self.log_site_rate),
-            self.felsenstein_op.clone(),
-        )
+        let (S, sqrt_pi) = self.calc_rate_matrix();
+        let branch_lengths = self.log_branch_lengths.broadcast_add(&self.log_global_scaling).unwrap().exp().unwrap();
+        S.apply_op3(&sqrt_pi, &branch_lengths, self.felsenstein_op.clone())
+            .unwrap()
+            .sum_all()
+            .unwrap()
     }
 
     fn penalty(&self) -> Tensor {
@@ -191,7 +217,6 @@ impl Optimizable for ModelParameters {
             .sum_all()
             .unwrap();
         let R_penalty = (Mu * self.R_reg).unwrap();
-
 
         let init = self.init_log_branch_lengths.clamp(-1000.0, 1000.0).unwrap();
         let current = self.log_branch_lengths.clamp(-1000.0, 1000.0).unwrap();
