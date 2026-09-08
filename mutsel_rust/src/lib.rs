@@ -133,14 +133,15 @@ pub unsafe extern "C" fn rust_mutsel(
 pub struct MutselParams {
     pi_reg: f64,
     Mu_reg: f64,
+    site_rate_reg: f64,
 }
 
 fn parse_mustel_str(model_str: &str) -> MutselParams {
     let model_str = model_str.trim();
     let model_upper = model_str.to_ascii_uppercase();
 
-    let (pi_reg, Mu_reg) = if model_upper == "MUTSEL" {
-        (0.3, 0.5)
+    let (pi_reg, Mu_reg, site_rate_reg) = if model_upper == "MUTSEL" {
+        (0.32, 9.67, 2.0)
     } else if model_upper.starts_with("MUTSEL{") && model_str.ends_with('}') {
         let params_str = &model_str[7..model_str.len() - 1];
         let values = params_str
@@ -148,14 +149,14 @@ fn parse_mustel_str(model_str: &str) -> MutselParams {
             .map(|value| value.trim().parse::<f64>().unwrap())
             .collect::<Vec<_>>();
         assert!(
-            values.len() == 2,
-            "Invalid MUTSEL format: expected MUTSEL{{pi_reg/Mu_reg}}, got {}",
+            values.len() == 3,
+            "Invalid MUTSEL format: expected MUTSEL{{pi_reg/Mu_reg/site_rate_reg}}, got {}",
             model_str
         );
-        (values[0], values[1])
+        (values[0], values[1], values[2])
     } else {
         panic!(
-            "Invalid MUTSEL format: expected MUTSEL or MUTSEL{{pi_reg/Mu_reg}}, got {}",
+            "Invalid MUTSEL format: expected MUTSEL or MUTSEL{{pi_reg/Mu_reg/site_rate_reg}}, got {}",
             model_str
         );
     };
@@ -163,6 +164,7 @@ fn parse_mustel_str(model_str: &str) -> MutselParams {
     MutselParams {
         pi_reg,
         Mu_reg,
+        site_rate_reg,
     }
 }
 

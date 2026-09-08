@@ -7,8 +7,6 @@ use candle_core::{Tensor, Var};
 use candle_nn::{Optimizer, ops::softmax};
 use phylo_grad::FelsensteinTree;
 
-const BRANCH_LENGTH_PENALTY: f64 = 0.0;
-
 use crate::{
     Verbosity,
     felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp},
@@ -30,24 +28,9 @@ fn calc_likelihood(
     mu: &Tensor,
     log_pi: &Tensor,
     log_branch_lengths: &Tensor,
-    log_site_rate: Option<&Tensor>,
     felsenstein_op: FelsensteinWithEdgeOp,
 ) -> Tensor {
-    let (mut S, sqrt_pi) = calc_rate_matrix(mu, log_pi, &tensor_full(1.0, &[]));
-
-    if let Some(log_site_rate) = log_site_rate {
-        S = S
-            .broadcast_mul(
-                &log_site_rate
-                    .exp()
-                    .unwrap()
-                    .unsqueeze(1)
-                    .unwrap()
-                    .unsqueeze(2)
-                    .unwrap(),
-            )
-            .unwrap();
-    }
+    let (S, sqrt_pi) = calc_rate_matrix(mu, log_pi, &tensor_full(1.0, &[]));
 
     let branch_lengths = log_branch_lengths.exp().unwrap();
 
@@ -85,7 +68,6 @@ impl Optimizable for BranchParameters {
             &self.Mu,
             &self.log_pi,
             &self.log_branch_length,
-            None,
             self.felsenstein_op.clone(),
         )
     }
@@ -108,6 +90,7 @@ pub struct ModelParameters {
     pub init_log_branch_lengths: Tensor,
     pub pi_reg: f64,
     pub R_reg: f64,
+    pub site_rate_reg: f64,
     pub init_log_R: Tensor,
     pub pca_data: PCA,
 }
@@ -218,20 +201,10 @@ impl Optimizable for ModelParameters {
             .unwrap();
         let R_penalty = (Mu * self.R_reg).unwrap();
 
-        let init = self.init_log_branch_lengths.clamp(-1000.0, 1000.0).unwrap();
-        let current = self.log_branch_lengths.clamp(-1000.0, 1000.0).unwrap();
-
-        let branch_penalty = (&current.sub(&init).unwrap())
-            .powf(2.0)
-            .unwrap()
-            .sum_all()
-            .unwrap();
-
-        let branch_penalty = (branch_penalty * BRANCH_LENGTH_PENALTY).unwrap();
-
         let rate_penalty = (&self.log_site_rate.powf(2.0).unwrap()).sum_all().unwrap();
+        let rate_penalty = (rate_penalty * self.site_rate_reg).unwrap();
 
-        (pi_penalty + R_penalty + branch_penalty + rate_penalty).unwrap()
+        (pi_penalty + R_penalty + rate_penalty).unwrap()
     }
 
     fn print_state(&self) {
@@ -559,6 +532,7 @@ pub fn optimize_internal(
         init_log_branch_lengths: log_branch_length_scaling.detach().copy().unwrap(),
         pi_reg: mutsel_params.pi_reg,
         R_reg: mutsel_params.Mu_reg,
+        site_rate_reg: mutsel_params.site_rate_reg,
         init_log_R,
         pca_data: pca,
     };
