@@ -204,7 +204,9 @@ impl Optimizable for ModelParameters {
 
         let branch_penalty = (branch_penalty * BRANCH_LENGTH_PENALTY).unwrap();
 
-        (pi_penalty + R_penalty + branch_penalty).unwrap()
+        let rate_penalty = (&self.log_site_rate.powf(2.0).unwrap()).sum_all().unwrap();
+
+        (pi_penalty + R_penalty + branch_penalty + rate_penalty).unwrap()
     }
 
     fn print_state(&self) {
