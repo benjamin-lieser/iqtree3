@@ -5292,10 +5292,7 @@ void runPhyloAnalysis(Params &params, Checkpoint *checkpoint, IQTree *&tree, Ali
     tree = newIQTree(params, alignment);
 
     tree->setCheckpoint(checkpoint);
-    // Increase the maximum branch length if MutSel is used because the time unit is different.
-    if (params.model_name.rfind("MUTSEL") == 0) {
-        params.max_branch_length = 200.0;
-    }
+
     if (tree->isTreeMix()) {
         ((IQTreeMix*) tree)->setMinBranchLen(params);
     } else if (params.min_branch_length <= 0.0) {
