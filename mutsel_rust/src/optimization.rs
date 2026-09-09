@@ -117,12 +117,12 @@ impl Optimizable for BranchParameters {
 
     fn penalty(&self) -> Tensor {
         let rate_penalty = (&self.log_site_rate.powf(2.0).unwrap()).sum_all().unwrap();
-        let rate_penalty = (rate_penalty * self.reg_para.site_rate_reg).unwrap();
+        let rate_penalty = (rate_penalty * 1.0).unwrap();
 
         let branch_penalty = (&self.log_branch_lengths.exp().unwrap()).sum_all().unwrap();
         let branch_penalty = (branch_penalty * self.reg_para.branch_length_reg).unwrap();
 
-        branch_penalty
+        (rate_penalty + branch_penalty).unwrap()
     }
 
     fn print_state(&self) {}
