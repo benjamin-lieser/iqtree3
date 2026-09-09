@@ -8,7 +8,11 @@ use candle_nn::{Optimizer, ops::softmax};
 use phylo_grad::FelsensteinTree;
 
 use crate::{
-    MutselParams, Verbosity, felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp}, model::{self, calc_rate_matrix}, pca::PCA, utils::tensor_full,
+    MutselParams, Verbosity,
+    felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp},
+    model::{self, calc_rate_matrix},
+    pca::PCA,
+    utils::tensor_full,
 };
 
 pub trait Optimizable {
@@ -63,12 +67,39 @@ pub struct BranchParameters {
     pub log_pi: Tensor,
 }
 
+impl BranchParameters {
+    fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
+        let (S, sqrt_pi) = calc_rate_matrix(&self.Mu, &self.log_pi, &tensor_full(1.0, &[]));
+
+        let S = S
+            .broadcast_mul(
+                &self.log_site_rate
+                    .exp()
+                    .unwrap()
+                    .unsqueeze(1)
+                    .unwrap()
+                    .unsqueeze(2)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi)
+            .mean_all()
+            .unwrap();
+        let S = S.broadcast_div(&average_rate).unwrap();
+        (S, sqrt_pi)
+    }
+}
+
 impl Optimizable for BranchParameters {
     fn variables(&self) -> Vec<Var> {
         vec![self.log_branch_lengths.clone(), self.log_site_rate.clone()]
     }
     fn variables_names(&self) -> Vec<String> {
-        vec!["log_branch_lengths".to_string(), "log_site_rate".to_string()]
+        vec![
+            "log_branch_lengths".to_string(),
+            "log_site_rate".to_string(),
+        ]
     }
     fn model_name(&self) -> String {
         "BranchParameters".to_string()
@@ -91,7 +122,7 @@ impl Optimizable for BranchParameters {
         let branch_penalty = (&self.log_branch_lengths.exp().unwrap()).sum_all().unwrap();
         let branch_penalty = (branch_penalty * self.reg_para.branch_length_reg).unwrap();
 
-        (rate_penalty + branch_penalty).unwrap()
+        branch_penalty
     }
 
     fn print_state(&self) {}
@@ -103,7 +134,7 @@ pub struct ModelParameters {
     /// Defines the log pi per site
     pub pca_coordinates: Var,
     pub log_branch_lengths: Var,
-    pub log_site_rate: Var,
+    pub log_site_rate_target: Tensor,
     pub init_log_branch_lengths: Tensor,
     pub reg_para: MutselParams,
     pub init_log_R: Tensor,
@@ -119,18 +150,7 @@ impl ModelParameters {
     pub fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
         let (S, sqrt_pi) =
             calc_rate_matrix(&Mu(&self.log_R), &self.log_pi(), &tensor_full(1.0, &[]));
-        let S = S
-            .broadcast_mul(
-                &self
-                    .log_site_rate
-                    .exp()
-                    .unwrap()
-                    .unsqueeze(1)
-                    .unwrap()
-                    .unsqueeze(2)
-                    .unwrap(),
-            )
-            .unwrap();
+
         let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi)
             .mean_all()
             .unwrap();
@@ -161,7 +181,6 @@ impl Optimizable for ModelParameters {
             self.log_R.clone(),
             self.pca_coordinates.clone(),
             self.log_branch_lengths.clone(),
-            self.log_site_rate.clone(),
         ]
     }
 
@@ -170,7 +189,6 @@ impl Optimizable for ModelParameters {
             "log_R".to_string(),
             "pca_coordinates".to_string(),
             "log_branch_lengths".to_string(),
-            "log_site_rate".to_string(),
         ]
     }
 
@@ -214,17 +232,26 @@ impl Optimizable for ModelParameters {
             .unwrap();
         let Mu_penalty = (Mu * self.reg_para.Mu_reg).unwrap();
 
-        let rate_penalty = (&self.log_site_rate.powf(2.0).unwrap()).sum_all().unwrap();
-        let rate_penalty = (rate_penalty * self.reg_para.site_rate_reg).unwrap();
-
         let branch_penalty = (&self.log_branch_lengths.exp().unwrap()).sum_all().unwrap();
         let branch_penalty = (branch_penalty * self.reg_para.branch_length_reg).unwrap();
+
+        let (S, sqrt_pi) = self.calc_rate_matrix();
+        let current_rates = model::substitution_rates_tensor(&S, &sqrt_pi)
+            .log()
+            .unwrap();
+
+        let rate_penalty = (&current_rates
+            .sub(&self.log_site_rate_target)
+            .unwrap()
+            .powf(2.0)
+            .unwrap())
+            .sum_all()
+            .unwrap();
 
         (pi_penalty + Mu_penalty + rate_penalty + branch_penalty).unwrap()
     }
 
-    fn print_state(&self) {
-    }
+    fn print_state(&self) {}
 }
 
 pub fn optimize(
@@ -341,9 +368,8 @@ pub fn optimize_branch_lengths(
     log_branch_lengths: &Tensor,
     verbosity: Verbosity,
     prefix: &str,
-    mutsel_params: super::MutselParams
+    mutsel_params: super::MutselParams,
 ) -> (Tensor, Tensor) {
-
     let L = log_pi.dim(0).unwrap();
 
     let model = BranchParameters {
@@ -357,9 +383,13 @@ pub fn optimize_branch_lengths(
 
     optimize(&model, 10, 200, 1e-6, 5, verbosity, prefix);
 
+    let (S, sqrt_pi) = model.calc_rate_matrix();
+
+    let site_rates = model::substitution_rates_tensor(&S, &sqrt_pi);
+
     (
         model.log_branch_lengths.as_tensor().copy().unwrap(),
-        model.log_site_rate.as_tensor().copy().unwrap(),
+        site_rates.log().unwrap(),
     )
 }
 
@@ -551,7 +581,7 @@ pub fn optimize_internal(
         log_R,
         pca_coordinates: Var::from_tensor(&pca_coordinates).unwrap(),
         log_branch_lengths: Var::from_tensor(&log_branch_lengths).unwrap(),
-        log_site_rate: Var::from_tensor(&log_site_rate).unwrap(),
+        log_site_rate_target: log_site_rate,
         init_log_branch_lengths: log_branch_lengths.detach().copy().unwrap(),
         reg_para: mutsel_params,
         init_log_R,
