@@ -152,7 +152,7 @@ fn parse_mutsel_str(model_str: &str) -> MutselParams {
             .map(|value| value.trim().parse::<f64>().unwrap())
             .collect::<Vec<_>>();
         assert!(
-            values.len() == 3,
+            values.len() == 4,
             "Invalid MUTSEL format: expected MUTSEL{{pi_reg/Mu_reg/site_rate_reg/branch_length_reg}}, got {}",
             model_str
         );
