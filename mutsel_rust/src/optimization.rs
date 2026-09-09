@@ -8,11 +8,7 @@ use candle_nn::{Optimizer, ops::softmax};
 use phylo_grad::FelsensteinTree;
 
 use crate::{
-    Verbosity,
-    felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp},
-    model::{self, calc_rate_matrix},
-    pca::PCA,
-    utils::tensor_full,
+    MutselParams, Verbosity, felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp}, model::{self, calc_rate_matrix}, pca::PCA, utils::tensor_full,
 };
 
 pub trait Optimizable {
@@ -62,7 +58,7 @@ pub struct BranchParameters {
     pub felsenstein_op: FelsensteinWithEdgeOp,
     pub log_branch_lengths: Var,
     pub log_site_rate: Var,
-    pub reg_site_rate: f64,
+    pub reg_para: MutselParams,
     pub Mu: Tensor,
     pub log_pi: Tensor,
 }
@@ -90,7 +86,12 @@ impl Optimizable for BranchParameters {
 
     fn penalty(&self) -> Tensor {
         let rate_penalty = (&self.log_site_rate.powf(2.0).unwrap()).sum_all().unwrap();
-        (rate_penalty * self.reg_site_rate).unwrap()
+        let rate_penalty = (rate_penalty * self.reg_para.site_rate_reg).unwrap();
+
+        let branch_penalty = (&self.log_branch_lengths.exp().unwrap()).sum_all().unwrap();
+        let branch_penalty = (branch_penalty * self.reg_para.branch_length_reg).unwrap();
+
+        (rate_penalty + branch_penalty).unwrap()
     }
 
     fn print_state(&self) {}
@@ -104,9 +105,7 @@ pub struct ModelParameters {
     pub log_branch_lengths: Var,
     pub log_site_rate: Var,
     pub init_log_branch_lengths: Tensor,
-    pub pi_reg: f64,
-    pub R_reg: f64,
-    pub site_rate_reg: f64,
+    pub reg_para: MutselParams,
     pub init_log_R: Tensor,
     pub pca_data: PCA,
 }
@@ -192,7 +191,7 @@ impl Optimizable for ModelParameters {
         let pi_penalty = self
             .pca_data
             .penalty_on_pca_coordinates(&self.pca_coordinates);
-        let pi_penalty = (pi_penalty * self.pi_reg).unwrap();
+        let pi_penalty = (pi_penalty * self.reg_para.pi_reg).unwrap();
 
         fn log_Mu(log_R: &Tensor) -> Tensor {
             let Mu = Mu(log_R);
@@ -213,12 +212,15 @@ impl Optimizable for ModelParameters {
             .unwrap()
             .sum_all()
             .unwrap();
-        let R_penalty = (Mu * self.R_reg).unwrap();
+        let Mu_penalty = (Mu * self.reg_para.Mu_reg).unwrap();
 
         let rate_penalty = (&self.log_site_rate.powf(2.0).unwrap()).sum_all().unwrap();
-        let rate_penalty = (rate_penalty * self.site_rate_reg).unwrap();
+        let rate_penalty = (rate_penalty * self.reg_para.site_rate_reg).unwrap();
 
-        (pi_penalty + R_penalty + rate_penalty).unwrap()
+        let branch_penalty = (&self.log_branch_lengths.exp().unwrap()).sum_all().unwrap();
+        let branch_penalty = (branch_penalty * self.reg_para.branch_length_reg).unwrap();
+
+        (pi_penalty + Mu_penalty + rate_penalty + branch_penalty).unwrap()
     }
 
     fn print_state(&self) {
@@ -348,7 +350,7 @@ pub fn optimize_branch_lengths(
         felsenstein_op,
         log_branch_lengths: Var::from_tensor(log_branch_lengths).unwrap(),
         log_site_rate: Var::from_tensor(&tensor_full(0.0, &[L])).unwrap(),
-        reg_site_rate: mutsel_params.site_rate_reg,
+        reg_para: mutsel_params,
         Mu: Mu.clone(),
         log_pi: log_pi.clone(),
     };
@@ -551,9 +553,7 @@ pub fn optimize_internal(
         log_branch_lengths: Var::from_tensor(&log_branch_lengths).unwrap(),
         log_site_rate: Var::from_tensor(&log_site_rate).unwrap(),
         init_log_branch_lengths: log_branch_lengths.detach().copy().unwrap(),
-        pi_reg: mutsel_params.pi_reg,
-        R_reg: mutsel_params.Mu_reg,
-        site_rate_reg: mutsel_params.site_rate_reg,
+        reg_para: mutsel_params,
         init_log_R,
         pca_data: pca,
     };
