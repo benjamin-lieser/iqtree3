@@ -258,6 +258,8 @@ impl Optimizable for ModelParameters {
             .sum_all()
             .unwrap();
 
+        let rate_penalty = (rate_penalty * self.reg_para.site_rate_reg).unwrap();
+
         (pi_penalty + Mu_penalty + rate_penalty + branch_penalty).unwrap()
     }
 
