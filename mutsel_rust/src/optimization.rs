@@ -202,7 +202,11 @@ impl Optimizable for ModelParameters {
     }
 
     fn model_name(&self) -> String {
-        "ModelParameters".to_string()
+        if self.reg_para.site_rate_reg > 0.0 {
+            "ModelParametersWithSiteRate".to_string()
+        } else {
+            "ModelParameters".to_string()
+        }
     }
 
     fn likelihood(&self) -> Tensor {
@@ -245,14 +249,12 @@ impl Optimizable for ModelParameters {
         let branch_penalty = (branch_penalty * self.reg_para.branch_length_reg).unwrap();
 
         let (S, sqrt_pi) = self.calc_rate_matrix();
-        let current_rates = model::substitution_rates_tensor(&S, &sqrt_pi)
-            .log()
-            .unwrap();
+        let current_rates = model::substitution_rates_tensor(&S, &sqrt_pi);
 
         let rate_penalty = (&current_rates
-            .sub(&self.log_site_rate_target)
+            .sub(&self.log_site_rate_target.exp().unwrap())
             .unwrap()
-            .powf(2.0)
+            .abs()
             .unwrap())
             .sum_all()
             .unwrap();
