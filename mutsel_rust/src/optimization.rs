@@ -32,18 +32,8 @@ pub struct RateParameters {
     pub log_site_rate: Var,
 }
 
-impl Optimizable for RateParameters {
-    fn variables(&self) -> Vec<Var> {
-        vec![self.log_site_rate.clone()]
-    }
-    fn variables_names(&self) -> Vec<String> {
-        vec!["log_site_rate".to_string()]
-    }
-    fn model_name(&self) -> String {
-        "RateParameters".to_string()
-    }
-
-    fn likelihood(&self) -> Tensor {
+impl RateParameters {
+    fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
         let (S, sqrt_pi) = calc_rate_matrix(&self.Mu, &self.log_pi, &tensor_full(1.0, &[]));
 
         let S = S
@@ -58,6 +48,27 @@ impl Optimizable for RateParameters {
                     .unwrap(),
             )
             .unwrap();
+        let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi)
+            .mean_all()
+            .unwrap();
+        let S = S.broadcast_div(&average_rate).unwrap();
+        (S, sqrt_pi)
+    }
+}
+
+impl Optimizable for RateParameters {
+    fn variables(&self) -> Vec<Var> {
+        vec![self.log_site_rate.clone()]
+    }
+    fn variables_names(&self) -> Vec<String> {
+        vec!["log_site_rate".to_string()]
+    }
+    fn model_name(&self) -> String {
+        "RateParameters".to_string()
+    }
+
+    fn likelihood(&self) -> Tensor {
+        let (S, sqrt_pi) = self.calc_rate_matrix();
 
         S.apply_op3(
             &sqrt_pi,
