@@ -144,7 +144,6 @@ pub struct ModelParameters {
     pub pca_coordinates: Var,
     pub log_branch_lengths: Var,
     pub log_site_rate_target: Tensor,
-    pub init_log_branch_lengths: Tensor,
     pub reg_para: MutselParams,
     pub init_log_R: Tensor,
     pub pca_data: PCA,
@@ -591,7 +590,6 @@ pub fn optimize_internal(
         pca_coordinates: Var::from_tensor(&pca_coordinates).unwrap(),
         log_branch_lengths: Var::from_tensor(&log_branch_lengths).unwrap(),
         log_site_rate_target: log_site_rate,
-        init_log_branch_lengths: log_branch_lengths.detach().copy().unwrap(),
         reg_para: MutselParams {
             pi_reg: mutsel_params.pi_reg,
             Mu_reg: mutsel_params.Mu_reg,
@@ -625,13 +623,12 @@ pub fn optimize_internal(
 
     let final_model = ModelParameters {
         felsenstein_op: op.into_with_edge_op(),
-        log_R: model.log_R,
-        pca_coordinates: model.pca_coordinates,
-        log_branch_lengths: model.log_branch_lengths,
-        log_site_rate_target: target_rates,
-        init_log_branch_lengths: model.init_log_branch_lengths,
+        log_R: Var::from_tensor(&model.log_R).unwrap(),
+        pca_coordinates: Var::from_tensor(&model.pca_coordinates).unwrap(),
+        log_branch_lengths: Var::from_tensor(&model.log_branch_lengths).unwrap(),
+        log_site_rate_target: target_rates.detach().copy().unwrap(),
         reg_para: mutsel_params,
-        init_log_R: model.init_log_R,
+        init_log_R: model.init_log_R.detach().copy().unwrap(),
         pca_data: model.pca_data,
     };
 
