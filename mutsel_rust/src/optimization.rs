@@ -614,7 +614,28 @@ pub fn optimize_internal(
 
     optimize(&site_rate_model, 100, 500, 1e-6, 5, verbosity, out_prefix);
 
-    let (S, sqrt_pi) = model.calc_rate_matrix();
+    let target_rates = {
+        let (S, sqrt_pi) = site_rate_model.calc_rate_matrix();
+        model::substitution_rates_tensor(&S, &sqrt_pi)
+            .log()
+            .unwrap()
+    };
+
+    let final_model = ModelParameters {
+        felsenstein_op: op.into_with_edge_op(),
+        log_R: model.log_R,
+        pca_coordinates: model.pca_coordinates,
+        log_branch_lengths: model.log_branch_lengths,
+        log_site_rate_target: target_rates,
+        init_log_branch_lengths: model.init_log_branch_lengths,
+        reg_para: mutsel_params,
+        init_log_R: model.init_log_R,
+        pca_data: model.pca_data,
+    };
+
+    optimize(&final_model, 100, 500, 1e-6, 5, verbosity, out_prefix);
+
+    let (S, sqrt_pi) = final_model.calc_rate_matrix();
 
     let substitution_rates = model::substitution_rates(&S, &sqrt_pi);
 
@@ -623,7 +644,7 @@ pub fn optimize_internal(
         println!("Average substitution rate: {:.3}", average_rate);
     }
     if verbosity.should_print(Verbosity::Med) {
-        model.save_npz(Path::new(&format!("{}.mutsel.npz", out_prefix)));
+        final_model.save_npz(Path::new(&format!("{}.mutsel.npz", out_prefix)));
     }
 
     let S = S.broadcast_div(&tensor_full(average_rate, &[])).unwrap();
