@@ -8,7 +8,7 @@ pub struct FelsensteinOp {
 }
 pub struct FelsensteinWithEdgeOp {
     felsenstein : Arc<Mutex<phylo_grad::FelsensteinTree<20>>>,
-    result_storage: Mutex<Option<phylo_grad::FelsensteinResultWithTree<20>>>,
+    result_storage: Mutex<Option<phylo_grad::FelsensteinResultWithSingleTree<20>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -287,15 +287,17 @@ impl candle_core::CustomOp3 for FelsensteinWithEdgeOp {
         let branch_lengths = tensor2vec(s3, l3);
 
         let mut felsenstein = self.felsenstein.lock().unwrap();
-        let mut result = felsenstein.calculate_gradients_with_branch_lengths(&s, &sqrt_pi, &branch_lengths);
+        let mut result = felsenstein.calculate_gradients_with_branch_lengths_sum(&s, &sqrt_pi, &branch_lengths);
 
         let likelihood = std::mem::take(&mut result.log_likelihood);
+
+        let likelihood_sum = likelihood.iter().sum::<f64>();
 
         let mut storage = self.result_storage.lock().unwrap();
         *storage = Some(result);
 
-        let shape = candle_core::Shape::from(&[likelihood.len()]);
-        let cpu_storage = candle_core::CpuStorage::F64(likelihood);
+        let shape = candle_core::Shape::from(&[]);
+        let cpu_storage = candle_core::CpuStorage::F64(vec![likelihood_sum]);
         return Ok((cpu_storage, shape))
     }
 
@@ -315,21 +317,14 @@ impl candle_core::CustomOp3 for FelsensteinWithEdgeOp {
         let grad_sqrt_pi = std::mem::take(&mut result.as_mut().unwrap().grad_sqrt_pi);
         let grad_sqrt_pi_tensor = nalgebra2tensor1d(&grad_sqrt_pi);
         let grad_branch_lengths = std::mem::take(&mut result.as_mut().unwrap().grad_tree);
-        let L = grad_branch_lengths.len();
-        let num_branch = grad_branch_lengths[0].len();
-        let grad_branch_lengths_flat: Vec<f64> = grad_branch_lengths.into_iter().flatten().collect();
-
-        let grad_branch_lengths_tensor = candle_core::Tensor::from_vec(grad_branch_lengths_flat, &candle_core::Shape::from(&[L, num_branch]), &candle_core::Device::Cpu).unwrap();
-
-
-        let grad_2 = grad_res.unsqueeze(1).unwrap().unsqueeze(2).unwrap();
-        let grad_1 = grad_res.unsqueeze(1).unwrap();
+        let num_branch_lengths = grad_branch_lengths.len();
+        let grad_branch_lengths_tensor = candle_core::Tensor::from_vec(grad_branch_lengths, &candle_core::Shape::from(&[num_branch_lengths]), &candle_core::Device::Cpu).unwrap();
 
 
         Ok((
-            Some(grad_2.broadcast_mul(&grad_s_tensor).unwrap()),
-            Some(grad_1.broadcast_mul(&grad_sqrt_pi_tensor).unwrap()),
-            Some(grad_1.broadcast_mul(&grad_branch_lengths_tensor).unwrap().sum(0).unwrap()),
+            Some(grad_res.broadcast_mul(&grad_s_tensor).unwrap()),
+            Some(grad_res.broadcast_mul(&grad_sqrt_pi_tensor).unwrap()),
+            Some(grad_res.broadcast_mul(&grad_branch_lengths_tensor).unwrap()),
         ))
 
     }

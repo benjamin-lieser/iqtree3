@@ -931,8 +931,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 [[package]]
 name = "phylo_grad"
 version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a32e43c3993e183b682b08ec459c88f90085d278ed0526cd1ad6ada425a41fb0"
+source = "git+https://github.com/soedinglab/phylo_grad?rev=527e79c5b2ed5a705aaf711f1c00f342e3379569#527e79c5b2ed5a705aaf711f1c00f342e3379569"
 dependencies = [
  "faer",
  "glam 0.30.10",
