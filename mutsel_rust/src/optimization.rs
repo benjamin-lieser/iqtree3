@@ -562,17 +562,9 @@ pub fn optimize_internal(
 
     let (S, sqrt_pi) = model.calc_rate_matrix();
 
-    let substitution_rates = model::substitution_rates(&S, &sqrt_pi);
-
-    let average_rate = substitution_rates.iter().sum::<f64>() / substitution_rates.len() as f64;
-    if verbosity.should_print(Verbosity::Min) {
-        println!("Average substitution rate: {:.3}", average_rate);
-    }
     if verbosity.should_print(Verbosity::Med) {
         model.save_npz(Path::new(&format!("{}.mutsel.npz", out_prefix)));
     }
-
-    let S = S.broadcast_div(&tensor_full(average_rate, &[])).unwrap();
 
     Ok((S, sqrt_pi))
 }
