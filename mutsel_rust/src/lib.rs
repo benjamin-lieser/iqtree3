@@ -233,46 +233,6 @@ fn create_felsenstein_tree_codon(
     felsenstein
 }
 
-/// Builds an amino-acid (20-state) view of a codon alignment: each leaf
-/// codon state is translated to its encoded amino acid through
-/// `codon_aa` (gap/ambiguous codon states, or an ambiguous amino acid,
-/// -> uniform over the 20 amino acids). Used only to run the amino-acid
-/// model's light-PMSF initialization phase unchanged on codon data.
-fn create_aa_view_of_codon_alignment(
-    parents: &[i32],
-    distances: &[f64],
-    alignment: &[u8],
-    L: usize,
-    N: usize,
-    codon_aa: &[u8; codon::N_CODON],
-) -> phylo_grad::FelsensteinTree<20> {
-    let mut felsenstein = phylo_grad::FelsensteinTree::<20>::new(parents, distances);
-
-    let mut sites = vec![];
-    sites.resize(L, vec![]);
-    for site_idx in 0..L {
-        sites[site_idx].resize(N, phylo_grad::nalgebra::SVector::<f64, 20>::zeros());
-        for seq_idx in 0..N {
-            let residue = alignment[site_idx * N + seq_idx] as usize;
-            let aa = if residue < codon::N_CODON {
-                Some(codon_aa[residue] as usize)
-            } else {
-                None
-            };
-            match aa {
-                Some(aa) if aa < 20 => sites[site_idx][seq_idx][aa] = 1.0,
-                _ => {
-                    for i in 0..20 {
-                        sites[site_idx][seq_idx][i] = 1.0;
-                    }
-                }
-            }
-        }
-    }
-    felsenstein.bind_leaf_pl(sites);
-    felsenstein
-}
-
 /// Number of upper-triangle rate entries for the 61-state codon model.
 const N_CODON_RATE_ENTRIES: usize = codon::N_CODON * (codon::N_CODON - 1) / 2;
 
@@ -364,17 +324,8 @@ pub unsafe extern "C" fn rust_mutsel_codon(
         num_sites as usize,
         num_leaves as usize,
     );
-    let felsenstein_aa = create_aa_view_of_codon_alignment(
-        parents,
-        branch_lengths,
-        alignment,
-        num_sites as usize,
-        num_leaves as usize,
-        &codon_aa_table,
-    );
 
     let (S, sqrt_pi) = optimization_codon::optimize_internal_codon(
-        felsenstein_aa,
         felsenstein_codon,
         branch_lengths,
         mutsel_params,

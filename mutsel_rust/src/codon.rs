@@ -1,19 +1,27 @@
 //! Codon-level (61-state) version of the mutation-selection model.
 //!
-//! The mutation process is a single 4-state nucleotide GTR (see [`Mu4`]),
-//! shared identically across all 3 codon positions, expanded into a 61x61
-//! codon mutation matrix (see [`expand_nt_to_codon_mu`]): the rate between
-//! two codons that differ at exactly one nucleotide position is the
-//! corresponding GTR rate at that position; codons differing at 0 or >=2
-//! positions get rate 0.
+//! The mutation process is a single 4-state nucleotide rate matrix (see
+//! [`Mu4`]), shared identically across all 3 codon positions, expanded into
+//! a 61x61 codon mutation matrix (see [`expand_nt_to_codon_mu`]): the rate
+//! between two codons that differ at exactly one nucleotide position is the
+//! corresponding nucleotide rate at that position; codons differing at 0 or
+//! >=2 positions get rate 0.
+//!
+//! `Mu4`/`expand_nt_to_codon_mu` build the *literal* mutation rate matrix --
+//! there is no "equilibrium packed into the diagonal" convention here (the
+//! diagonal is unused and just held at a fixed positive placeholder so
+//! `.log()` stays finite). Instead, the Halpern & Bruno (1998) fixation
+//! probability is computed directly from the mutation rate ratio, exactly
+//! as in the original paper: the scaled selection coefficient between
+//! states i and j is `S_ij = ln((pi_j * Mu_ji) / (pi_i * Mu_ij))` (see
+//! [`calc_rate_matrix_codon`]) -- no separately-tracked neutral equilibrium
+//! is needed.
 //!
 //! The fitness/selection landscape is *exactly* the amino-acid model's: the
 //! same per-site 20-dimensional PCA-parametrized amino-acid log-frequency
 //! vector is used, broadcast to the 61 codons through the genetic code (see
 //! [`broadcast_aa_fitness_to_codon`]) so that synonymous codons of the same
-//! amino acid always share the same fitness. Combined with the Halpern &
-//! Bruno fixation-probability formula (`model::GOp`, reused unchanged),
-//! this means synonymous substitution rates reduce to pure mutation rates.
+//! amino acid always share the same target frequency `pi`.
 //!
 //! This module only supports the standard genetic code (61 sense codons) —
 //! [`FelsensteinTree`](phylo_grad::FelsensteinTree) is generic over a
@@ -83,56 +91,68 @@ pub fn standard_genetic_code_tables() -> ([[u8; 3]; N_CODON], [u8; N_CODON]) {
     (codon_nt, codon_aa)
 }
 
-/// Builds the reversible 4-state nucleotide mutation process ("Mu") from a
-/// lower-triangular log-parametrized matrix, exactly like
-/// `optimization::Mu` but for 4 states instead of 20. Returns a [4,4]
-/// tensor with the mutation rates off the diagonal and the equilibrium
-/// nucleotide frequencies on the diagonal.
+/// Builds the literal 4-state nucleotide mutation rate matrix from 10
+/// log-parameters given as a 1D tensor: the first 6 are symmetric
+/// exchangeabilities (`r_ab == r_ba`, in the same pair order as
+/// `data::load_lower_R_with_equi`'s lower triangle: (1,0),(2,0),(2,1),
+/// (3,0),(3,1),(3,2)), the last 4 are per-state frequency-like scale
+/// factors. `Mu[a,b] = r_ab * freq[b]` for `a != b` -- this *is* the actual
+/// mutation rate from `a` to `b`, not a normalized/softmaxed frequency.
+/// Because the exchangeabilities are symmetric, `Mu` satisfies detailed
+/// balance for the equilibrium implied by `freq`:
+/// `Mu[a,b] / Mu[b,a] == freq[b] / freq[a]` -- which is exactly what
+/// [`calc_rate_matrix_codon`] uses instead of tracking a separate
+/// equilibrium. The diagonal is unused; it's fixed at 1.0 so `.log()`
+/// stays finite.
 #[allow(non_snake_case)]
-pub fn Mu4(log_parameter: &Tensor) -> Tensor {
+pub fn Mu4(log_params: &Tensor) -> Tensor {
+    assert_eq!(log_params.elem_count(), 10, "Mu4 expects 10 log-parameters");
     let device = candle_core::Device::Cpu;
-    let parameter = log_parameter.exp().unwrap();
-    let diagonal = (&parameter * Tensor::eye(4, candle_core::DType::F64, &device).unwrap()).unwrap();
-    let off_diagonal = (parameter - &diagonal).unwrap();
+    let params = log_params.reshape(&[10]).unwrap().exp().unwrap();
+    let exch = params.narrow(0, 0, 6).unwrap();
+    let freq = params.narrow(0, 6, 4).unwrap();
 
-    // Mutation equilibrium should stay fixed to neutral
-    let diagonal = diagonal.detach();
+    // Scatter the 6 symmetric exchangeabilities into the off-diagonal
+    // entries of a 4x4 matrix (diagonal masked to 0), same pair order as
+    // `data::load_lower_R_with_equi`: (1,0),(2,0),(2,1),(3,0),(3,1),(3,2).
+    let idx: [u32; 16] = [
+        0, 0, 1, 3, //
+        0, 0, 2, 4, //
+        1, 2, 0, 5, //
+        3, 4, 5, 0, //
+    ];
+    let mask: [f64; 16] = [
+        0.0, 1.0, 1.0, 1.0, //
+        1.0, 0.0, 1.0, 1.0, //
+        1.0, 1.0, 0.0, 1.0, //
+        1.0, 1.0, 1.0, 0.0, //
+    ];
+    let idx_tensor = Tensor::from_vec(idx.to_vec(), &[16], &device).unwrap();
+    let mask_tensor = Tensor::from_vec(mask.to_vec(), &[4, 4], &device).unwrap();
 
-    let pi = diagonal.broadcast_div(&diagonal.sum_all().unwrap()).unwrap();
-    let pi_vec = pi.sum(1).unwrap();
-    let sqrt_pi = pi_vec.sqrt().unwrap();
-    let sqrt_pi_inv = sqrt_pi.recip().unwrap();
-
-    let S = (&off_diagonal + off_diagonal.t().unwrap()).unwrap();
-
-    let Q = sqrt_pi_inv
-        .unsqueeze(1)
+    let exch_matrix = exch
+        .index_select(&idx_tensor, 0)
         .unwrap()
-        .broadcast_mul(&S)
+        .reshape(&[4, 4])
         .unwrap()
-        .broadcast_mul(&sqrt_pi.unsqueeze(0).unwrap())
+        .mul(&mask_tensor)
         .unwrap();
-    let Q = (&Q - &Q * Tensor::eye(4, candle_core::DType::F64, &device).unwrap()).unwrap();
 
-    let row_sum = Q.sum(1).unwrap();
-    let sum = row_sum.dot(&pi_vec).unwrap();
-    let Q = Q.broadcast_div(&sum).unwrap();
+    let off_diagonal = exch_matrix.broadcast_mul(&freq.unsqueeze(0).unwrap()).unwrap();
 
-    (Q + pi).unwrap()
+    (off_diagonal + Tensor::eye(4, candle_core::DType::F64, &device).unwrap()).unwrap()
 }
 
-/// Expands the 4x4 nucleotide mutation process into the 61x61 codon
+/// Expands the 4x4 nucleotide mutation rate matrix into the 61x61 codon
 /// mutation matrix implied by applying it independently and identically at
 /// each of the 3 codon positions. The rate between two codons differing at
 /// exactly one nucleotide position is the corresponding nucleotide rate;
-/// codons differing at 0 or >=2 positions get rate 0. The diagonal holds
-/// the codon equilibrium frequency (product of the 3 positions' nucleotide
-/// equilibrium frequencies), matching the convention used throughout this
-/// crate ("Mu" tensors carry mutation rates off-diagonal and equilibrium
-/// frequencies on the diagonal).
+/// codons differing at 0 or >=2 positions get rate 0. The diagonal is
+/// unused (like `Mu4`'s); it's fixed at 1.0 so `.log()` stays finite.
 ///
 /// The construction is built entirely from `index_select`/elementwise ops
-/// on `nt_mu`, so gradients flow back to the underlying GTR log-parameters.
+/// on `nt_mu`, so gradients flow back to the underlying rate-matrix
+/// log-parameters.
 pub fn expand_nt_to_codon_mu(nt_mu: &Tensor, codon_nt: &[[u8; 3]; N_CODON]) -> Tensor {
     let device = candle_core::Device::Cpu;
     let flat_nt_mu = nt_mu.reshape(&[16]).unwrap();
@@ -173,30 +193,7 @@ pub fn expand_nt_to_codon_mu(nt_mu: &Tensor, codon_nt: &[[u8; 3]; N_CODON]) -> T
     }
     let off_diag = off_diag.unwrap();
 
-    // Neutral nucleotide equilibrium frequencies (diagonal of nt_mu).
-    let nt_pi = (nt_mu * Tensor::eye(4, candle_core::DType::F64, &device).unwrap())
-        .unwrap()
-        .sum(1)
-        .unwrap();
-
-    let mut codon_pi: Option<Tensor> = None;
-    for pos in 0..3usize {
-        let idx: Vec<u32> = (0..N_CODON).map(|c| codon_nt[c][pos] as u32).collect();
-        let idx_tensor = Tensor::from_vec(idx, &[N_CODON], &device).unwrap();
-        let gathered = nt_pi.index_select(&idx_tensor, 0).unwrap();
-        codon_pi = Some(match codon_pi {
-            None => gathered,
-            Some(acc) => (acc * gathered).unwrap(),
-        });
-    }
-    let codon_pi = codon_pi.unwrap();
-
-    let pi_diag = Tensor::eye(N_CODON, candle_core::DType::F64, &device)
-        .unwrap()
-        .broadcast_mul(&codon_pi.unsqueeze(0).unwrap())
-        .unwrap();
-
-    (off_diag + pi_diag).unwrap()
+    (off_diag + Tensor::eye(N_CODON, candle_core::DType::F64, &device).unwrap()).unwrap()
 }
 
 /// Broadcasts a per-site amino-acid log-frequency tensor `[L, 20]` to a
@@ -209,29 +206,41 @@ pub fn broadcast_aa_fitness_to_codon(log_pi_aa: &Tensor, codon_aa: &[u8; N_CODON
     log_pi_aa.index_select(&idx_tensor, 1).unwrap()
 }
 
-/// Codon-dimension (61-state) counterpart of `model::calc_rate_matrix`. See
-/// that function for the Halpern & Bruno math; this is a separate,
-/// dimension-specialized copy (not a generalization of the original) so the
+/// Codon-dimension (61-state) counterpart of `model::calc_rate_matrix`,
+/// using the Halpern & Bruno (1998) fixation-probability formula directly
+/// in its original form -- the scaled selection coefficient between states
+/// `i` and `j` is `S_ij = ln((pi_j * Mu_ji) / (pi_i * Mu_ij))`, computed
+/// straight from the mutation rate ratio `Mu_ji / Mu_ij` rather than from a
+/// separately-tracked neutral equilibrium. A separate, dimension-specialized
+/// copy (not a generalization of `model::calc_rate_matrix`) so the
 /// amino-acid path is left untouched.
 pub fn calc_rate_matrix_codon(
     Mu: &Tensor,
     log_pi: &Tensor,
     global_scaling: &Tensor,
 ) -> (Tensor, Tensor) {
-    let device = candle_core::Device::Cpu;
     let L = log_pi.dims()[0];
 
-    let equi_mutation = (Mu * Tensor::eye(N_CODON, candle_core::DType::F64, &device).unwrap()).unwrap();
-    let equi_mutation = equi_mutation.sum(1).unwrap();
-    let log_equi_mutation = equi_mutation.log().unwrap();
+    // Codon pairs differing at more than one nucleotide position (and the
+    // unused diagonal, at least for `expand_nt_to_codon_mu`'s output) are
+    // structurally 0 in Mu -- a direct `.log()` would give -inf, and when
+    // both Mu[i,j] and Mu[j,i] are 0 the ratio below becomes NaN. Adding a
+    // tiny epsilon here (only for the log/ratio computation, not for `Mu`
+    // itself below) keeps that finite; those entries still end up exactly
+    // 0 in Q since they're multiplied by the *unperturbed* Mu, which is
+    // genuinely 0 there.
+    let log_mu = (Mu + 1e-30).unwrap().log().unwrap();
+    // log_mu_ratio[i,j] = log(Mu[j,i]) - log(Mu[i,j])
+    let log_mu_ratio = log_mu.t().unwrap().sub(&log_mu).unwrap();
 
-    // Correction because of the equilibrium of the mutation process.
-    let fitness = log_pi.broadcast_sub(&log_equi_mutation.unsqueeze(0).unwrap()).unwrap();
-
-    let log_pi_diff = fitness
+    // log_pi_diff[l,i,j] = (log_pi[l,j] - log_pi[l,i]) + log_mu_ratio[i,j]
+    //                    = ln((pi_j * Mu_ji) / (pi_i * Mu_ij))
+    let log_pi_diff = log_pi
         .unsqueeze(1)
         .unwrap()
-        .broadcast_sub(&fitness.unsqueeze(2).unwrap())
+        .broadcast_sub(&log_pi.unsqueeze(2).unwrap())
+        .unwrap()
+        .broadcast_add(&log_mu_ratio.unsqueeze(0).unwrap())
         .unwrap();
 
     let fixation = log_pi_diff.apply_op1(crate::model::GOp {}).unwrap();
@@ -285,7 +294,7 @@ mod tests {
 
     #[test]
     fn codon_mu_is_reversible() {
-        let log_r = Tensor::rand(-1.0, 1.0, &[4, 4], &candle_core::Device::Cpu).unwrap();
+        let log_r = Tensor::rand(-1.0, 1.0, &[10], &candle_core::Device::Cpu).unwrap();
         let nt_mu = Mu4(&log_r);
         let (codon_nt, _codon_aa) = standard_genetic_code_tables();
         let codon_mu = expand_nt_to_codon_mu(&nt_mu, &codon_nt);
@@ -311,7 +320,7 @@ mod tests {
 
     #[test]
     fn single_nt_difference_rate_matches_nucleotide_gtr() {
-        let log_r = Tensor::rand(-1.0, 1.0, &[4, 4], &candle_core::Device::Cpu).unwrap();
+        let log_r = Tensor::rand(-1.0, 1.0, &[10], &candle_core::Device::Cpu).unwrap();
         let nt_mu = Mu4(&log_r);
         let (codon_nt, codon_aa) = standard_genetic_code_tables();
         let codon_mu = expand_nt_to_codon_mu(&nt_mu, &codon_nt);
@@ -357,29 +366,27 @@ mod tests {
 
     #[test]
     fn synonymous_rate_equals_pure_mutation_rate() {
-        // `calc_rate_matrix_codon` (like the amino-acid `calc_rate_matrix`)
-        // corrects the target log-frequency by the neutral mutation
-        // equilibrium of each state before computing fitness differences,
-        // so that softmax(log_pi) is exactly the resulting Markov chain's
-        // stationary distribution. That correction differs between two
-        // synonymous codons whenever they have different neutral codon
-        // frequencies (e.g. differ at a position with unequal nucleotide
-        // frequencies), so equal target amino-acid frequency alone does not
-        // generally collapse the fixation probability to exactly 1.
+        // `calc_rate_matrix_codon` derives the fixation probability from
+        // the mutation rate ratio Mu_ji/Mu_ij, which for two states with
+        // unequal nucleotide frequencies at the differing position is not
+        // 1 in general, even when the two codons share the same target
+        // (amino-acid) frequency: the Halpern & Bruno formula folds
+        // mutation bias into the fixation probability by design.
         //
         // To isolate and directly test "fitness identical to the amino
         // acid model" (equal target frequency for synonymous codons implies
-        // equal *fitness*, hence g(0)=1 and rate = pure mutation rate), use
-        // a nucleotide GTR with uniform equilibrium frequencies (equal
-        // diagonal log-parameters), so every codon shares the same neutral
-        // mutation equilibrium and the correction term cancels between any
-        // two codons -- isolating the effect of equal target frequency.
-        let log_r = Tensor::from_vec(
-            vec![
-                0.0, 1.2, 0.7, -0.3, 0.5, 0.0, -0.6, 0.9, 1.1, 0.2, 0.0, 0.4, -0.8, 0.3, 0.6, 0.0,
+        // equal Halpern-Bruno selection *coefficient* only when the
+        // mutation rate ratio is itself 1, i.e. g(0)=1 and rate = pure
+        // mutation rate), use a nucleotide rate matrix with uniform
+        // frequency factors (the last 4 of the 10 log-parameters all 0, so
+        // freq = [1,1,1,1]) -- arbitrary (random) exchangeabilities are
+        // fine, since with equal freq, Mu[a,b] == Mu[b,a] for every pair.
+        let log_r = Tensor::cat(
+            &[
+                &Tensor::rand(-1.0, 1.0, &[6], &candle_core::Device::Cpu).unwrap(),
+                &Tensor::zeros(&[4], candle_core::DType::F64, &candle_core::Device::Cpu).unwrap(),
             ],
-            &[4, 4],
-            &candle_core::Device::Cpu,
+            0,
         )
         .unwrap();
         let nt_mu = Mu4(&log_r);
@@ -428,7 +435,7 @@ mod tests {
 
     #[test]
     fn substitution_rates_tensor_codon_matches_manual_sum() {
-        let log_r = Tensor::rand(-1.0, 1.0, &[4, 4], &candle_core::Device::Cpu).unwrap();
+        let log_r = Tensor::rand(-1.0, 1.0, &[10], &candle_core::Device::Cpu).unwrap();
         let nt_mu = Mu4(&log_r);
         let (codon_nt, _codon_aa) = standard_genetic_code_tables();
         let codon_mu = expand_nt_to_codon_mu(&nt_mu, &codon_nt);
