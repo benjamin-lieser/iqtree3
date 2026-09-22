@@ -523,10 +523,13 @@ void ModelMarkov::computeTransMatrix(double time, double *trans_matrix, int mixt
         return;
     } else {
         VectorXd eval_exp(num_states);
-        ArrayXd eval = Map<ArrayXd,Aligned>(eigenvalues, num_states);
+        // Not using the Aligned hint: eigenvalues/eigenvectors/inv_eigenvectors may be an
+        // unaligned slice into ModelSet's shared eigen memory pool (e.g. for an odd
+        // num_states, such as the 61-state codon MutSel model).
+        ArrayXd eval = Map<ArrayXd>(eigenvalues, num_states);
         eval_exp = (eval*evol_time).exp().matrix();
-        Map<Matrix<double,Dynamic,Dynamic,RowMajor>,Aligned> evectors(eigenvectors, num_states, num_states);
-        Map<Matrix<double,Dynamic,Dynamic,RowMajor>,Aligned> inv_evectors(inv_eigenvectors, num_states, num_states);
+        Map<Matrix<double,Dynamic,Dynamic,RowMajor>> evectors(eigenvectors, num_states, num_states);
+        Map<Matrix<double,Dynamic,Dynamic,RowMajor>> inv_evectors(inv_eigenvectors, num_states, num_states);
         MatrixXd res = evectors * eval_exp.asDiagonal() * inv_evectors;
         Map<Matrix<double,Dynamic,Dynamic,RowMajor> >map_trans(trans_matrix,num_states,num_states);
         map_trans = res;
@@ -790,12 +793,15 @@ void ModelMarkov::computeTransDerv(double time, double *trans_matrix,
     else
     {
         //EIGEN version
-        ArrayXd eval = Map<ArrayXd,Aligned>(eigenvalues, num_states);
+        // Not using the Aligned hint: eigenvalues/eigenvectors/inv_eigenvectors may be an
+        // unaligned slice into ModelSet's shared eigen memory pool (e.g. for an odd
+        // num_states, such as the 61-state codon MutSel model).
+        ArrayXd eval = Map<ArrayXd>(eigenvalues, num_states);
         ArrayXd eval_exp = (eval*evol_time).exp();
         ArrayXd eval_exp_derv1 = eval_exp*eval;
         ArrayXd eval_exp_derv2 = eval_exp_derv1*eval;
-        Map<Matrix<double,Dynamic,Dynamic,RowMajor>,Aligned> evectors(eigenvectors, num_states, num_states);
-        Map<Matrix<double,Dynamic,Dynamic,RowMajor>,Aligned> inv_evectors(inv_eigenvectors, num_states, num_states);
+        Map<Matrix<double,Dynamic,Dynamic,RowMajor>> evectors(eigenvectors, num_states, num_states);
+        Map<Matrix<double,Dynamic,Dynamic,RowMajor>> inv_evectors(inv_eigenvectors, num_states, num_states);
         MatrixXd res = evectors * eval_exp.matrix().asDiagonal() * inv_evectors;
         Map<Matrix<double,Dynamic,Dynamic,RowMajor> >map_trans(trans_matrix,num_states,num_states);
         map_trans = res;
@@ -1545,7 +1551,9 @@ void ModelMarkov::decomposeRateMatrix(){
         }
 
         if (n == num_states) {
-            Map<VectorXd,Aligned> eval(eigenvalues,num_states);
+            // Not Aligned: eigenvalues may be an unaligned slice into ModelSet's shared
+            // eigen memory pool (e.g. for an odd num_states, such as codon MutSel's 61 states).
+            Map<VectorXd> eval(eigenvalues,num_states);
             eval = eigensolver.eigenvalues();
             
             // Handle cases when eigenvalues[0] = NaN -> MORPH{1}
@@ -1555,10 +1563,10 @@ void ModelMarkov::decomposeRateMatrix(){
             if (verbose_mode >= VB_DEBUG)
                 cout << "eval: " << eval << endl;
 
-            Map<Matrix<double,Dynamic,Dynamic,RowMajor>,Aligned> evec(eigenvectors,num_states,num_states);
+            Map<Matrix<double,Dynamic,Dynamic,RowMajor>> evec(eigenvectors,num_states,num_states);
             evec = pi_sqrt_inv * eigensolver.eigenvectors();
 
-            Map<Matrix<double,Dynamic,Dynamic,RowMajor>,Aligned> inv_evec(inv_eigenvectors,num_states,num_states);
+            Map<Matrix<double,Dynamic,Dynamic,RowMajor>> inv_evec(inv_eigenvectors,num_states,num_states);
             inv_evec = eigensolver.eigenvectors().transpose() * pi_sqrt;
         } else {
             // manual copy non-zero entries

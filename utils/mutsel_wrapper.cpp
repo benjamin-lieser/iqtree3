@@ -21,6 +21,26 @@ void rust_mutsel(int32_t *parents,
     exit(1);
 }
 
+void rust_mutsel_codon(int32_t *parents,
+                       double *branch_lengths,
+                       uint8_t *alignment,
+                       uint32_t site_num,
+                       uint32_t leave_num,
+                       uint32_t node_num,
+                       const uint8_t *codon_nt,
+                       const uint8_t *codon_aa,
+                       const char *model_string,
+                       const char *priorMuFile,
+                       const char *priorPiFile,
+                       uint8_t verbose,
+                       double *out_site_freq,
+                       double *out_R_matrices,
+                       const char *output_prefix)
+{
+    std::cout << "Mutsel support not compiled in!" << std::endl;
+    exit(1);
+}
+
 void rust_set_rayon_threads(int32_t num_threads)
 {
     return;
@@ -88,13 +108,15 @@ std::pair<std::vector<double>, std::vector<int32_t>> prepare_mutsel_tree(MTree *
     return {std::move(branch_lengths), std::move(parent_indices)};
 }
 
-// Returns the alignment in the format required by mutsel library as dense [L, N] matrix and returns L the sequence length
+// Returns the alignment in the format required by mutsel library as dense [L, N] matrix and returns L the sequence length.
+// Works for any alignment state count (amino acid or codon): unknown/ambiguous states map to the gap sentinel alignment->num_states.
 std::tuple<std::vector<uint8_t>, int32_t, int32_t> prepare_mutsel_alignment(Alignment *alignment)
 {
     // [L, N] matrix where L is sequence length and N is number of sequences
     std::vector<uint8_t> sequences;
     size_t L = alignment->getNSite();
     size_t N = alignment->getNSeq();
+    size_t nstates = alignment->num_states;
 
     std::cout << "Preparing alignment for mutsel inference: " << N << " sequences, " << L << " sites" << std::endl;
 
@@ -106,10 +128,10 @@ std::tuple<std::vector<uint8_t>, int32_t, int32_t> prepare_mutsel_alignment(Alig
         for (size_t seq_idx = 0; seq_idx < N; ++seq_idx)
         {
             auto state = static_cast<uint8_t>(pat.at(seq_idx));
-            if (!(state < 20))
+            if (!(state < nstates))
             {
-                // map unknown states to gaps (state 20)
-                state = 20;
+                // map unknown/ambiguous states to gaps (state nstates)
+                state = static_cast<uint8_t>(nstates);
             }
             sequences[site * N + seq_idx] = state;
         }
@@ -118,7 +140,34 @@ std::tuple<std::vector<uint8_t>, int32_t, int32_t> prepare_mutsel_alignment(Alig
     return std::make_tuple(std::move(sequences), static_cast<int32_t>(L), static_cast<int32_t>(N));
 }
 
-std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model)
+void buildCodonMutationTables(Alignment *alignment, std::vector<uint8_t> &codon_nt, std::vector<uint8_t> &codon_aa)
+{
+    ASSERT(alignment->seq_type == SEQ_CODON);
+    // Same alphabet/order as Alignment's protein states (alignment.cpp: symbols_protein).
+    static const char aa_alphabet[] = "ARNDCQEGHILKMFPSTWYV";
+
+    size_t nstates = alignment->num_states;
+    codon_nt.assign(nstates * 3, 0);
+    codon_aa.assign(nstates, 0);
+
+    for (size_t state = 0; state < nstates; ++state)
+    {
+        int raw = (int)(unsigned char)alignment->codon_table[state]; // 0..63
+        codon_nt[state * 3 + 0] = (uint8_t)(raw / 16);
+        codon_nt[state * 3 + 1] = (uint8_t)((raw % 16) / 4);
+        codon_nt[state * 3 + 2] = (uint8_t)(raw % 4);
+
+        char aa_char = alignment->genetic_code[raw];
+        const char *pos = strchr(aa_alphabet, aa_char);
+        if (pos == nullptr)
+        {
+            outError(std::string("Unknown amino acid letter '") + aa_char + "' in genetic code table");
+        }
+        codon_aa[state] = (uint8_t)(pos - aa_alphabet);
+    }
+}
+
+std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model, int nstates)
 {
     cout << endl
          << "Reading site-specific model file " << filename << " ..." << endl;
@@ -170,42 +219,44 @@ std::string read_binary_site_model_file_internal(std::string &filename, std::vec
         uint64_t num_sites;
         read_exact(reinterpret_cast<char *>(&num_sites), sizeof(uint64_t), "number of sites");
 
-        // num_sites * 20 doubles for site frequencies
-        site_freq.resize(num_sites * 20);
+        int nrates = nstates * (nstates - 1) / 2;
+
+        // num_sites * nstates doubles for site frequencies
+        site_freq.resize(num_sites * nstates);
         read_exact(reinterpret_cast<char *>(site_freq.data()),
-                   static_cast<std::streamsize>(num_sites * 20 * sizeof(double)),
+                   static_cast<std::streamsize>(num_sites * nstates * sizeof(double)),
                    "site frequencies");
 
-        // num_sites * 190 doubles for rate matrices
-        rate_matrices.resize(num_sites * 190);
+        // num_sites * nrates doubles for rate matrices
+        rate_matrices.resize(num_sites * nrates);
         read_exact(reinterpret_cast<char *>(rate_matrices.data()),
-                   static_cast<std::streamsize>(num_sites * 190 * sizeof(double)),
+                   static_cast<std::streamsize>(num_sites * nrates * sizeof(double)),
                    "rate matrices");
 
         for (size_t i = 0; i < num_sites; ++i)
         {
             site_model.push_back(i);
-            for (int j = 0; j < 20; ++j)
+            for (int j = 0; j < nstates; ++j)
             {
-                if (site_freq[i * 20 + j] <= 1e-10)
+                if (site_freq[i * nstates + j] <= 1e-10)
                     throw std::runtime_error("Frequencies must be strictly bigger than 1e-10");
             }
             double sum = 0;
-            for (int j = 0; j < 20; ++j)
+            for (int j = 0; j < nstates; ++j)
             {
-                sum += site_freq[i * 20 + j];
+                sum += site_freq[i * nstates + j];
             }
             if (std::abs(sum - 1.0) > 1e-4)
             {
                 std::cout << "Warning: frequencies for site " << i + 1 << " do not sum to 1, normalizing..." << std::endl;
-                for (int j = 0; j < 20; ++j)
+                for (int j = 0; j < nstates; ++j)
                 {
-                    site_freq[i * 20 + j] /= sum;
+                    site_freq[i * nstates + j] /= sum;
                 }
             }
-            for (int j = 0; j < 190; ++j)
+            for (int j = 0; j < nrates; ++j)
             {
-                if (rate_matrices[i * 190 + j] <= 0.0)
+                if (rate_matrices[i * nrates + j] <= 0.0)
                     throw "Rate parameters must be positive";
             }
         }
@@ -223,10 +274,8 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
     ASSERT(alignment.ptn_rate_mat.empty() &&
            alignment.ptn_state_freq.empty());
 
-    // currently we only support 20 states for mutsel model,
-    // so this function should only be called for protein alignments
-    ASSERT(alignment.num_states == 20);
-    //alignment.num_rates = 190;
+    int nstates = alignment.num_states;
+    int nrates = alignment.getNumRates();
 
     size_t nsite = alignment.getNSite();
     if (len != static_cast<int>(nsite))
@@ -252,8 +301,8 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
     {
         site_model[site] = models_freq.size();
 
-        const double *state_freq_ptr = site_freq + site * 20;
-        const double *rate_mat_ptr = rate_matrices + site * 190;
+        const double *state_freq_ptr = site_freq + site * nstates;
+        const double *rate_mat_ptr = rate_matrices + site * nrates;
 
         bool add = true;
         int first_site = pattern_first_site[alignment.getPatternID(site)];
@@ -261,7 +310,7 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
         {
             int first_model = site_model[first_site];
             bool matched_freq_and_rate = true;
-            for (int i = 0; i < 20; ++i)
+            for (int i = 0; i < nstates; ++i)
             {
                 if (state_freq_ptr[i] != models_freq[first_model][i])
                 {
@@ -271,7 +320,7 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
             }
             if (matched_freq_and_rate)
             {
-                for (int i = 0; i < 190; ++i)
+                for (int i = 0; i < nrates; ++i)
                 {
                     if (rate_mat_ptr[i] != models_rate[first_model][i])
                     {
@@ -294,11 +343,11 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
 
         if (add)
         {
-            double *site_freq_entry = new double[20];
-            memcpy(site_freq_entry, state_freq_ptr, sizeof(double) * 20);
+            double *site_freq_entry = new double[nstates];
+            memcpy(site_freq_entry, state_freq_ptr, sizeof(double) * nstates);
             models_freq.push_back(site_freq_entry);
-            double *site_rate_entry = new double[190];
-            memcpy(site_rate_entry, rate_mat_ptr, sizeof(double) * 190);
+            double *site_rate_entry = new double[nrates];
+            memcpy(site_rate_entry, rate_mat_ptr, sizeof(double) * nrates);
             models_rate.push_back(site_rate_entry);
         }
     }
@@ -346,7 +395,7 @@ void read_site_model_file(const std::string &filename, Alignment &alignment)
     auto site_freq = std::vector<double>();
     auto rate_matrices = std::vector<double>();
     auto site_model = std::vector<int>();
-    auto _custom_str = read_binary_site_model_file_internal(const_cast<std::string &>(filename), site_freq, rate_matrices, site_model);
+    auto _custom_str = read_binary_site_model_file_internal(const_cast<std::string &>(filename), site_freq, rate_matrices, site_model, alignment.num_states);
     write_site_models_to_alignment(alignment, site_freq.data(), rate_matrices.data(), site_model.size());
     return;
 }
@@ -356,8 +405,8 @@ void write_binary_site_model_file(const std::string &filename, Alignment &alignm
     size_t nsites = alignment.getNSite();
     size_t nstates = alignment.num_states;
     size_t nrates = alignment.getNumRates();
-    ASSERT(nstates == 20);
-    ASSERT(nrates == 190);
+    // 20 states = amino acid MUTSEL, 61 states = codon MUTSEL (standard genetic code)
+    ASSERT(nstates == 20 || nstates == 61);
     try
     {
         ofstream out;
@@ -395,9 +444,10 @@ void write_binary_site_model_file(const std::string &filename, Alignment &alignm
 
 DoubleVector computeMutselSiteRates(Alignment &alignment)
 {
-    ASSERT(alignment.num_states == 20);
     ASSERT(alignment.ptn_rate_mat.size() == alignment.getNPattern());
     ASSERT(alignment.ptn_state_freq.size() == alignment.getNPattern());
+
+    int nstates = alignment.num_states;
 
     size_t npattern = alignment.getNPattern();
     DoubleVector pattern_rates(npattern);
@@ -407,9 +457,9 @@ DoubleVector computeMutselSiteRates(Alignment &alignment)
         double *pi = alignment.ptn_state_freq[ptn];
         double rate = 0.0;
         int idx = 0;
-        for (int i = 0; i < 20; ++i)
+        for (int i = 0; i < nstates; ++i)
         {
-            for (int j = i + 1; j < 20; ++j)
+            for (int j = i + 1; j < nstates; ++j)
             {
                 rate += R[idx] * pi[i] * pi[j];
                 idx++;
@@ -430,6 +480,23 @@ DoubleVector computeMutselSiteRates(Alignment &alignment)
 void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
 {
     ASSERT(params.tree_freq_file);
+
+    // Codon data uses a different mutation process (a 4-state nucleotide
+    // GTR expanded through the genetic code, see rust_mutsel_codon) than
+    // amino-acid data (a single 20-state GTR, see rust_mutsel); everything
+    // else -- the model name, guide tree loading, and site model file
+    // writing -- is shared.
+    bool is_codon = (alignment->seq_type == SEQ_CODON);
+    std::vector<uint8_t> codon_nt, codon_aa;
+    if (is_codon)
+    {
+        if (!alignment->isStandardGeneticCode() || alignment->num_states != 61)
+        {
+            outError("MUTSEL on codon data currently only supports the standard genetic code (61 sense codons)");
+        }
+        buildCodonMutationTables(alignment, codon_nt, codon_aa);
+    }
+
     cout << endl
          << "===> COMPUTING MUTSEL MODEL BASED ON TREE FILE " << params.tree_freq_file << endl;
     PhyloTree *tree = new PhyloTree(alignment);
@@ -446,9 +513,12 @@ void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
     auto [branch_lengths, parent_indices] = prepare_mutsel_tree(tree);
     auto [sequences, L, N] = prepare_mutsel_alignment(alignment);
 
-    double *site_freq = new double[L * 20];
+    int nstates = alignment->num_states;
+    int nrates = alignment->getNumRates();
 
-    double *site_rate = new double[L * 190];
+    double *site_freq = new double[(size_t)L * nstates];
+
+    double *site_rate = new double[(size_t)L * nrates];
 
     // Close log file, so we can append in the mutsel library without messing up the order of log messages from IQ-TREE and mutsel library
     std::cout << std::flush;
@@ -464,19 +534,40 @@ void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
 
     // Calls into the Rust code
     rust_set_rayon_threads(params.num_threads);
-    rust_mutsel(parent_indices.data(),
-                branch_lengths.data(),
-                sequences.data(),
-                L,
-                N,
-                parent_indices.size(),
-                params.model_name.c_str(),
-                params.mutsel_prior_rate_file.empty() ? nullptr : params.mutsel_prior_rate_file.c_str(),
-                params.mutsel_prior_freq_file.empty() ? nullptr : params.mutsel_prior_freq_file.c_str(),
-                verbose_mode,
-                site_freq,
-                site_rate,
-                ((string)params.out_prefix).c_str());
+    if (is_codon)
+    {
+        rust_mutsel_codon(parent_indices.data(),
+                          branch_lengths.data(),
+                          sequences.data(),
+                          L,
+                          N,
+                          parent_indices.size(),
+                          codon_nt.data(),
+                          codon_aa.data(),
+                          params.model_name.c_str(),
+                          params.mutsel_prior_rate_file.empty() ? nullptr : params.mutsel_prior_rate_file.c_str(),
+                          params.mutsel_prior_freq_file.empty() ? nullptr : params.mutsel_prior_freq_file.c_str(),
+                          verbose_mode,
+                          site_freq,
+                          site_rate,
+                          ((string)params.out_prefix).c_str());
+    }
+    else
+    {
+        rust_mutsel(parent_indices.data(),
+                    branch_lengths.data(),
+                    sequences.data(),
+                    L,
+                    N,
+                    parent_indices.size(),
+                    params.model_name.c_str(),
+                    params.mutsel_prior_rate_file.empty() ? nullptr : params.mutsel_prior_rate_file.c_str(),
+                    params.mutsel_prior_freq_file.empty() ? nullptr : params.mutsel_prior_freq_file.c_str(),
+                    verbose_mode,
+                    site_freq,
+                    site_rate,
+                    ((string)params.out_prefix).c_str());
+    }
 
     outstream->open(((string)params.out_prefix + ".log").c_str(), std::ios::app); // reopen log file
 
