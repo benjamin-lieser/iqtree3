@@ -3186,6 +3186,8 @@ void parseArg(int argc, char *argv[], Params &params) {
                 cnt++;
 				if (cnt >= argc)
 					throw "Use -ft <treefile_to_infer_site_frequency_model>";
+                if (iEquals(argv[cnt], "AUTO"))
+                    throw "-ft AUTO is not supported; please infer a guide tree first and pass it to -ft";
                 params.tree_freq_file = argv[cnt];
                 if (params.print_site_state_freq == WSF_NONE)
                     params.print_site_state_freq = WSF_POSTERIOR_MEAN;
@@ -4549,22 +4551,27 @@ void parseArg(int argc, char *argv[], Params &params) {
 			}
 			if (strcmp(argv[cnt], "-AIC") == 0) {
 				params.model_test_criterion = MTC_AIC;
+				params.marginal_lh_aic = false;
 				continue;
 			}
 			if (strcmp(argv[cnt], "-AICc") == 0 || strcmp(argv[cnt], "-AICC") == 0) {
 				params.model_test_criterion = MTC_AICC;
+				params.marginal_lh_aic = false;
 				continue;
 			}
 			if (strcmp(argv[cnt], "-merit") == 0 || strcmp(argv[cnt], "--merit") == 0) {
                 cnt++;
 				if (cnt >= argc)
-					throw "Use -merit AIC|AICC|BIC";
+					throw "Use -merit AIC|AICC|BIC|mAIC";
                 if (strcmp(argv[cnt], "AIC") == 0) {
                     params.model_test_criterion = MTC_AIC;
+                    params.marginal_lh_aic = false;
                 } else if (strcmp(argv[cnt], "AICc") == 0 || strcmp(argv[cnt], "AICC") == 0) {
                     params.model_test_criterion = MTC_AICC;
+                    params.marginal_lh_aic = false;
                 } else if (strcmp(argv[cnt], "BIC") == 0) {
                     params.model_test_criterion = MTC_BIC;
+                    params.marginal_lh_aic = false;
                 } else if (strcmp(argv[cnt], "mAIC") == 0) {
                     params.marginal_lh_aic = true;
                     params.model_test_criterion = MTC_AIC;
@@ -4572,7 +4579,7 @@ void parseArg(int argc, char *argv[], Params &params) {
                     params.marginal_lh_aic = true;
                     params.model_test_criterion = MTC_BIC;
                 } else {
-                    throw "Use -merit AIC|AICC|BIC";
+                    throw "Use -merit AIC|AICC|BIC|mAIC";
                 }
 				continue;
 			}
@@ -5003,16 +5010,6 @@ void parseArg(int argc, char *argv[], Params &params) {
 				continue;
 			}
 
-			if (strcmp(argv[cnt], "-mixlen") == 0) {
-				cnt++;
-				if (cnt >= argc)
-					throw "Use -mixlen <number of mixture branch lengths for heterotachy model>";
-				params.num_mixlen = convert_int(argv[cnt]);
-				if (params.num_mixlen < 1)
-					throw("-mixlen must be >= 1");
-				continue;
-			}
-            
 			if (strcmp(argv[cnt], "--link-alpha") == 0) {
 				params.link_alpha = true;
 				continue;
@@ -5649,8 +5646,24 @@ void parseArg(int argc, char *argv[], Params &params) {
     // terminate if using AliSim with -ft or -fs site-specific model (ModelSet)
     // computeTransMatix has not yet implemented for ModelSet
     if (params.alisim_active && (params.tree_freq_file || params.site_freq_file))
-        outError("Sorry! `-ft` (--site-freq) and `-fs` (--tree-freq) options are not fully supported in AliSim. However, AliSim can estimate posterior mean frequencies from the alignment. Please try again without `-ft` and `-fs` options!");
+        outError("Sorry! `-ft` (--tree-freq) and `-fs` (--site-freq) options are not fully supported in AliSim. However, AliSim can estimate posterior mean frequencies from the alignment. Please try again without `-ft` and `-fs` options!");
     
+    // Site-frequency models are read only on the non-partition code path. In
+    // runPhyloAnalysis() the call to Alignment::readSiteStateFreq() sits in the `else`
+    // branch of `if (params.partition_file)`, so combining a partition model with -fs or
+    // -ft silently DISCARDED the frequencies: the run completed, reported a likelihood,
+    // and printed no warning, while scoring under the plain model. Fail explicitly instead.
+    if (params.partition_file && params.site_freq_file)
+        outError("`-fs` (--site-freq) cannot be combined with a partition model (-p/-q/-Q/-S)."
+                 " Site frequencies are only applied to a single-partition alignment, and were"
+                 " previously ignored without warning. Run -fs without a partition file, or drop"
+                 " -fs and specify per-partition models in the partition file.");
+
+    if (params.partition_file && params.tree_freq_file)
+        outError("`-ft` (--tree-freq) cannot be combined with a partition model (-p/-q/-Q/-S)."
+                 " The site-frequency model is only estimated for a single-partition alignment,"
+                 " and was previously ignored without warning.");
+
     // Users have to specify a random seed to run AliSim
     if (params.alisim_active && !params.seed_specified)
         outError("To make the simulation reproducible, please specify a random seed via `-seed <NUM>`");
@@ -5938,7 +5951,9 @@ void usage_iqtree(char* argv[], bool full_command) {
     << "                       (e.g. -mrate E,I,G,I+G,R is used for -m MF)" << endl
     << "  --cmin NUM           Min categories for FreeRate model [+R] (default: 2)" << endl
     << "  --cmax NUM           Max categories for FreeRate model [+R] (default: 10)" << endl
-    << "  --merit AIC|AICc|BIC  Akaike|Bayesian information criterion (default: BIC)" << endl
+    << "  --merit AIC|AICc|BIC|mAIC" << endl
+    << "                       Akaike|Bayesian information criterion (default: BIC)" << endl
+    << "                       mAIC uses the marginal AIC to merge partitions in partition models" << endl
 //            << "  -msep                Perform model selection and then rate selection" << endl
     << "  --mtree              Perform full tree search for every model" << endl
     << "  --madd STR,...       List of mixture models to consider" << endl
@@ -7179,7 +7194,8 @@ void Params::setDefault() {
     merge_models = "1";
     merge_rates = "1";
     partfinder_log_rate = true;
-    
+    marginal_lh_aic = false;
+
     sequence_type = nullptr;
     aln_output = nullptr;
     aln_site_list = nullptr;
@@ -7460,7 +7476,6 @@ void Params::setDefault() {
     lmap_num_quartets = -1;
     lmap_cluster_file = nullptr;
     print_lmap_quartet_lh = false;
-    num_mixlen = 1;
     link_alpha = false;
     link_model = false;
     model_joint = "";

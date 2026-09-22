@@ -36,7 +36,7 @@
 #include "model/modelliemarkov.h"
 #include "model/modelpomo.h"
 #include "utils/timeutil.h"
-#include "model/modelfactorymixlen.h"
+#include "model/modelfactory.h"
 #include "tree/phylosupertreeplen.h"
 #include "tree/phylosupertreeunlinked.h"
 
@@ -757,26 +757,25 @@ string computeFastMLTree(Params &params, Alignment *aln,
 
     if (aln->isSuperAlignment()) {
         SuperAlignment *saln = (SuperAlignment*)aln;
-        if (params.partition_type == TOPO_UNLINKED)
+        if (params.partition_type == TOPO_UNLINKED) {
             iqtree = new PhyloSuperTreeUnlinked(saln);
-        else if (params.partition_type == BRLEN_OPTIMIZE)
+        } else if (params.partition_type == BRLEN_OPTIMIZE) {
             iqtree = new PhyloSuperTree(saln);
-        else
+        } else {
             iqtree = new PhyloSuperTreePlen(saln, brlen_type);
+        }
         for (int part = 0; part != subst_names.size(); part++) {
             saved_model_names.push_back(saln->partitions[part]->model_name);
             saln->partitions[part]->model_name = subst_names[part] + rate_names[part];
         }
     } else if (posRateHeterotachy(rate_names[0]) != string::npos) {
-        iqtree = new PhyloTreeMixlen(aln, 0);
+        iqtree = new PhyloTreeMixlen(aln);
     } else {
         iqtree = new IQTree(aln);
     }
-
     if (params.constraint_tree_file) {
         iqtree->constraintTree.readConstraint(params.constraint_tree_file, aln->getSeqNames());
     }
-
     if ((params.start_tree == STT_PLL_PARSIMONY || params.start_tree == STT_RANDOM_TREE || params.pll) && !iqtree->isInitializedPLL()) {
         /* Initialized all data structure for PLL*/
         iqtree->initializePLL(params);
@@ -819,9 +818,9 @@ string computeFastMLTree(Params &params, Alignment *aln,
         // disable thorough I+G optimization
         params.opt_gammai = false;
         initTree = iqtree->optimizeModelParameters(false, params.modelEps*50.0);
-        if (iqtree->isMixlen())
-            initTree = ((ModelFactoryMixlen*)iqtree->getModelFactory())->sortClassesByTreeLength();
-
+        if (iqtree->isMixlen()) {
+            initTree = iqtree->getModelFactory()->sortClassesByTreeLength();
+        }
         // do quick NNI search
         if (params.start_tree != STT_USER_TREE) {
             cout << "Perform nearest neighbor interchange..." << endl;
@@ -1936,27 +1935,30 @@ string CandidateModel::evaluate(Params &params,
     IQTree *iqtree = nullptr;
     if (in_aln->isSuperAlignment()) {
         SuperAlignment *saln = (SuperAlignment*)in_aln;
-        if (params.partition_type == BRLEN_OPTIMIZE)
+        if (params.partition_type == BRLEN_OPTIMIZE) {
             iqtree = new PhyloSuperTree(saln);
-        else
+        } else {
             iqtree = new PhyloSuperTreePlen(saln, brlen_type);
+        }
         StrVector subst_names;
         StrVector rate_names;
         convert_string_vec(subst_name.c_str(), subst_names);
         convert_string_vec(rate_name.c_str(), rate_names);
         ASSERT(subst_names.size() == rate_names.size());
-        for (int part = 0; part != subst_names.size(); part++)
+        for (int part = 0; part != subst_names.size(); part++) {
             saln->partitions[part]->model_name = subst_names[part]+rate_names[part];
-    } else if (posRateHeterotachy(getName()) != string::npos)
-        iqtree = new PhyloTreeMixlen(in_aln, 0);
-    else
+        }
+    } else if (posRateHeterotachy(getName()) != string::npos) {
+        iqtree = new PhyloTreeMixlen(in_aln);
+    } else {
         iqtree = new IQTree(in_aln);
+    }
     iqtree->setParams(&params);
     iqtree->setLikelihoodKernel(params.SSE);
     iqtree->optimize_by_newton = params.optimize_by_newton;
     iqtree->setNumThreads(num_threads);
-
     iqtree->setCheckpoint(&in_model_info);
+
 #ifdef _OPENMP
 #pragma omp critical
 #endif
@@ -3192,7 +3194,7 @@ CandidateModel CandidateModelSet::test(Params &params, PhyloTree* in_tree, Model
         else
             cout << getSeqTypeName(in_tree->aln->seq_type);
         cout << " models (sample size: " << ssize << " epsilon: " << params.modelfinder_eps << ") ..." << endl;
-        if (params.model_test_and_tree == 0)
+        if (params.model_test_and_tree == 0 && verbose_mode >= VB_MED)
             cout << " No. Model         -LnL         df  AIC          AICc         BIC" << endl;
 	}
 
@@ -4406,7 +4408,7 @@ void PartitionFinder::getBestModelforMergesMPI(int nthreads, vector<MergeJob* >&
 
 #endif // _IQTREE_MPI
 
-double PartitionFinder::getmAICforMergeScheme(vector<set<int> > gene_sets, StrVector model_names, int df, bool merge) {
+double PartitionFinder::getmAICforMergeScheme(vector<set<int> > gene_sets, StrVector model_names, int df, bool merge, bool warmup_cache) {
     PhyloSuperTree *maic_tree;
     double score_maic;
     if (merge) {
@@ -4437,18 +4439,68 @@ double PartitionFinder::getmAICforMergeScheme(vector<set<int> > gene_sets, StrVe
         maic_tree->at(j)->getModelFactory()->restoreCheckpoint();
         model_info->endStruct();
     }
+    // share the per-column cache with the marginal-LH computation (merge-round candidates only)
+    // cache for merged-scheme evaluations (merge==true) and for the one-off initial full-scheme
+    // call (warmup_cache==true: it computes exactly the original-partition columns round 1 reuses).
+    // The final full-scheme call (merge==false, warmup_cache==false) runs the original uncached path.
+    if (merge || warmup_cache) {
+        PartitionModel *pm = (PartitionModel*) maic_tree->getModelFactory();
+        pm->maic_cache = &maic_subcol_cache;
+        pm->maic_blocks = &maic_current_blocks;
+    }
     lh_marginal = maic_tree->getModelFactory()->computeMarginalLh(params->remove_empty_seq);
     score_maic = computeInformationScore(lh_marginal, df, ssize, MTC_AIC);
+
+    // when applying mergePartition(), the newly generated aln must be freed.
+    Alignment *maic_aln = merge ? maic_tree->aln : nullptr;
     delete maic_tree;
+    delete maic_aln;
 
     return score_maic;
 }
 
+// Drop every cached column whose data- or class-block overlaps the just-merged partition set,
+// except columns of the newly merged block itself.
+void PartitionFinder::evictMergedFromCache(set<int> &merged_set) {
+    if (maic_subcol_cache.empty())
+        return;
+    set<string> merged_names;                       // names of the absorbed original partitions
+    for (int idx : merged_set)
+        merged_names.insert(in_tree->at(idx)->aln->name);
+    string merged_block = getSubsetName(in_tree, merged_set); // name of the new merged block
+
+    auto blockDead = [&](const string &name, size_t begin, size_t end) -> bool {
+        if (name.compare(begin, end - begin, merged_block) == 0)
+            return false;                           // the new merged block itself: keep
+        size_t p = begin;
+        while (p < end) {
+            size_t plus = name.find('+', p);
+            if (plus == string::npos || plus > end) plus = end;
+            if (merged_names.count(name.substr(p, plus - p)))
+                return true;                        // shares an absorbed partition: dead
+            p = plus + 1;
+        }
+        return false;
+    };
+
+    for (auto it = maic_subcol_cache.begin(); it != maic_subcol_cache.end(); ) {
+        const string &key = it->first;              // "<data>\x01<class>"
+        size_t sep = key.find('\x01');
+        bool dead = blockDead(key, 0, sep) || blockDead(key, sep + 1, key.size());
+        if (dead) it = maic_subcol_cache.erase(it);
+        else ++it;
+    }
+}
 
 ModelPairSet PartitionFinder::getBetterPairsmAIC() {
     cout << "Compute mAIC score of partition models..." << endl;
     double cpu_time = getCPUTime();
     double real_time = getRealTime();
+
+    // reload this round's cacheable blocks from gene_sets.
+    maic_current_blocks.clear();
+    for (auto &gs : gene_sets)
+        maic_current_blocks.insert(getSubsetName(in_tree, gs));
 
     double cur_score_maic = 0;
     double greedy_lh_marginal;
@@ -4499,6 +4551,12 @@ ModelPairSet PartitionFinder::getBetterPairsmAIC() {
                 part_ids.insert(it->second.merged_set.begin(), it->second.merged_set.end());
                 cur_better_pairs.insertPair(it_bu->second);
 
+                // update the cacheable-block set
+                maic_current_blocks.erase(getSubsetName(in_tree, better_gene_sets[cur_pair.part1]));
+                maic_current_blocks.erase(getSubsetName(in_tree, better_gene_sets[cur_pair.part2]));
+                evictMergedFromCache(cur_pair.merged_set);
+                maic_current_blocks.insert(getSubsetName(in_tree, cur_pair.merged_set));
+
                 inf_score_maic = cur_score_maic;
                 better_df = cur_df;
                 better_gene_sets = cur_gene_sets;
@@ -4538,6 +4596,11 @@ ModelPairSet PartitionFinder::getBetterPairsmAIC() {
         int cur_df = dfsum - dfvec[it->second.part1] - dfvec[it->second.part2] + it->second.df;
         cout << "Merging " << it->second.set_name << " with mAIC score: " << greedy_score_maic
              << " (Marginal LnL: " << greedy_lh_marginal << "  df: " << cur_df << ")" << endl;
+        // greedy commits exactly this one pair (in test_PartitionModel); evict the columns of
+        // the two absorbed blocks here, symmetric with the cluster path above. The newly merged
+        // block becomes cacheable next round via the round-start reload of maic_current_blocks.
+        ModelPair best_pair = it->second;
+        evictMergedFromCache(best_pair.merged_set);
     }
     cout << cur_better_pairs.size() << " compatible better partition pairs found based on mAIC" << endl;
     /*if (cur_better_pairs.size() == 0 && better_pairs.size() == 0) {
@@ -5320,6 +5383,15 @@ void PartitionFinder::test_PartitionModel() {
 
     if (params->partition_merge != MERGE_NONE) {
         // show the parameters for partition finder
+        if (params->marginal_lh_aic) {
+            // cache columns are per-pattern; peak ~ (#blocks + 1) * (total #patterns) doubles
+            size_t total_nptn = 0;
+            for (int p = 0; p < in_tree->size(); p++)
+                total_nptn += in_tree->at(p)->aln->getNPattern();
+            size_t mem_cache = (in_tree->size() + 1) * total_nptn * sizeof(double);
+            cout << "NOTE: mAIC marginal likelihood cache during merging requires up to "
+                 << (mem_cache / 1048576) << " MB RAM (" << (mem_cache / 1073741824) << " GB)!" << endl;
+        }
         cout << endl;
         cout << "PartitionFinder's parameters:" << endl;
         cout << part_algo << endl;
@@ -5377,7 +5449,14 @@ void PartitionFinder::test_PartitionModel() {
 
     if (params->marginal_lh_aic) {
         //double score_bic = computeInformationScore(lhsum, dfsum, ssize, MTC_BIC);
-        inf_score_maic = getmAICforMergeScheme(gene_sets, model_names, dfsum, false);
+        // warm up the cache: this full-scheme call computes exactly the original-partition
+        // columns that the first merge round will reuse. The current blocks here are the
+        // original partitions (gene_sets is not populated yet at this point), so register their
+        // names as cacheable and let the call populate the cache (warmup_cache = true).
+        maic_current_blocks.clear();
+        for (int p = 0; p < in_tree->size(); p++)
+            maic_current_blocks.insert(in_tree->at(p)->aln->name);
+        inf_score_maic = getmAICforMergeScheme(gene_sets, model_names, dfsum, false, true);
         cout << "Full partition model mAIC score: " << inf_score_maic << " (Marginal LnL: " << lh_marginal << "  df:" << dfsum <<  ")" << endl;
     }
 
@@ -5620,6 +5699,11 @@ void PartitionFinder::test_PartitionModel() {
         }
         if (verbose_mode >= VB_MED) cout << "Agglomerative model selection: " << final_model_tree << endl;
     }
+
+    // merging finished, free the mAIC cache (and the cacheable-block set, so the final
+    // full-scheme call below runs uncached)
+    maic_subcol_cache.clear();
+    maic_current_blocks.clear();
 
 #ifdef _IQTREE_MPI
     if (num_processes > 1) {
@@ -7435,18 +7519,15 @@ void runMixtureFinder(Params &params, IQTree* &iqtree, ModelCheckpoint &model_in
     
 
     // create a new IQTree object for this mixture model
-    // allocate heterotachy tree if neccessary
-    int pos = posRateHeterotachy(aln->model_name);
-    if (params.num_mixlen > 1) {
-        new_iqtree = new PhyloTreeMixlen(aln, params.num_mixlen);
-    } else if (pos != string::npos) {
-        new_iqtree = new PhyloTreeMixlen(aln, 0);
+    if (posRateHeterotachy(aln->model_name) != string::npos) {
+        new_iqtree = new PhyloTreeMixlen(aln);
     } else {
         new_iqtree = new IQTree(aln);
     }
     new_iqtree->setCheckpoint(iqtree->getCheckpoint());
-    if (!iqtree->constraintTree.empty())
+    if (!iqtree->constraintTree.empty()) {
         new_iqtree->constraintTree.readConstraint(iqtree->constraintTree);
+    }
     new_iqtree->removed_seqs = iqtree->removed_seqs;
     new_iqtree->twin_seqs = iqtree->twin_seqs;
     if (params.start_tree == STT_PLL_PARSIMONY || params.start_tree == STT_RANDOM_TREE || params.pll) {
