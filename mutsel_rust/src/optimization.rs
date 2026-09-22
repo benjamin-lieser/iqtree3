@@ -234,14 +234,14 @@ pub fn optimize(
     min_rel_improvement: f64,
     no_improve_patience: usize,
     verbosity: Verbosity,
-    prefix: &str,
+    _prefix: &str,
 ) {
     let variables = model.variables();
-    let variable_names = model.variables_names();
-    let mut trajectory_tensors: Vec<Vec<Tensor>> = variables
-        .iter()
-        .map(|variable| vec![variable.as_tensor().copy().unwrap()])
-        .collect();
+    // let variable_names = model.variables_names();
+    // let mut trajectory_tensors: Vec<Vec<Tensor>> = variables
+    //     .iter()
+    //     .map(|variable| vec![variable.as_tensor().copy().unwrap()])
+    //     .collect();
     let mut opt = candle_nn::optim::AdamW::new_lr(variables, 0.05).unwrap();
     let parameter = candle_nn::optim::ParamsAdamW {
         lr: 0.03,
@@ -286,9 +286,9 @@ pub fn optimize(
         let grads = opt_fn.backward().unwrap();
         opt.step(&grads).unwrap();
 
-        for (traj, new) in &mut trajectory_tensors.iter_mut().zip(variables.iter()) {
-            traj.push(new.as_tensor().copy().unwrap());
-        }
+        // for (traj, new) in &mut trajectory_tensors.iter_mut().zip(variables.iter()) {
+        //     traj.push(new.as_tensor().copy().unwrap());
+        // }
         if iteration > min_iterations.saturating_sub(no_improve_patience) {
             let rel_improvement = (best_opt - current_opt) / best_opt.abs().max(1e-12);
             if rel_improvement > min_rel_improvement {
@@ -319,19 +319,19 @@ pub fn optimize(
     }
 
     // Combine trajectory tensors into a single tensor for each variable
-    let trajectory_tensors: Vec<Tensor> = trajectory_tensors
-        .into_iter()
-        .map(|tensors| Tensor::stack(&tensors, 0).unwrap())
-        .collect();
-    let filename = format!("{}.traj_{}.npz", prefix, model.model_name());
-    Tensor::write_npz(
-        &variable_names
-            .iter()
-            .zip(trajectory_tensors.iter())
-            .collect::<Vec<_>>(),
-        Path::new(&filename),
-    )
-    .unwrap();
+    // let trajectory_tensors: Vec<Tensor> = trajectory_tensors
+    //     .into_iter()
+    //     .map(|tensors| Tensor::stack(&tensors, 0).unwrap())
+    //     .collect();
+    // let filename = format!("{}.traj_{}.npz", _prefix, model.model_name());
+    // Tensor::write_npz(
+    //     &variable_names
+    //         .iter()
+    //         .zip(trajectory_tensors.iter())
+    //         .collect::<Vec<_>>(),
+    //     Path::new(&filename),
+    // )
+    // .unwrap();
 }
 
 pub fn optimize_branch_lengths(
