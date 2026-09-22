@@ -190,8 +190,7 @@ impl Optimizable for ModelParameters {
     fn penalty(&self) -> Tensor {
         let pi_penalty = self
             .pca_data
-            .penalty_on_pca_coordinates(&self.pca_coordinates);
-        let pi_penalty = (pi_penalty * self.reg_para.pi_reg).unwrap();
+            .penalty_on_pca_coordinates(&self.pca_coordinates, self.reg_para.pi_reg);
 
         fn log_Mu(log_R: &Tensor) -> Tensor {
             let Mu = Mu(log_R);
