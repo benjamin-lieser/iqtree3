@@ -2,6 +2,7 @@
 
 pub mod data;
 pub mod felsenstein;
+pub mod hmc;
 mod io;
 pub mod model;
 mod pca;
@@ -81,14 +82,6 @@ pub unsafe extern "C" fn rust_mutsel(
 
     let mutsel_params = parse_mutsel_str(model_str);
 
-    let felsenstein = create_felsenstein_tree(
-        parents,
-        branch_lengths,
-        alignment,
-        num_sites as usize,
-        num_leaves as usize,
-    );
-
     let prior_R_file = if prior_R_file.is_null() {
         None
     } else {
@@ -96,9 +89,13 @@ pub unsafe extern "C" fn rust_mutsel(
         Some(Path::new(cstr.to_str().unwrap()))
     };
 
-    let (S, sqrt_pi) = optimization::optimize_internal(
-        felsenstein,
+    // Posterior sampling of the per-site pca coordinates instead of the maximum likelihood estimate.
+    let (S, sqrt_pi) = hmc::sample_internal(
+        parents,
         branch_lengths,
+        alignment,
+        num_sites as usize,
+        num_leaves as usize,
         mutsel_params,
         prior_R_file,
         crate::Verbosity::from_u8(verbose),
@@ -135,7 +132,6 @@ pub unsafe extern "C" fn rust_mutsel(
 pub struct MutselParams {
     pi_reg: f64,
     Mu_reg: f64,
-    site_rate_reg: f64,
     branch_length_reg: f64,
 }
 
@@ -143,7 +139,8 @@ fn parse_mutsel_str(model_str: &str) -> MutselParams {
     let model_str = model_str.trim();
     let model_upper = model_str.to_ascii_uppercase();
 
-    let (pi_reg, Mu_reg, site_rate_reg, branch_length_reg) = if model_upper == "MUTSEL" {
+    // site_rate_reg is still parsed for compatibility, but site rates are fixed to 1.
+    let (pi_reg, Mu_reg, _site_rate_reg, branch_length_reg) = if model_upper == "MUTSEL" {
         (0.32, 9.67, 2.0, 10.0)
     } else if model_upper.starts_with("MUTSEL{") && model_str.ends_with('}') {
         let params_str = &model_str[7..model_str.len() - 1];
@@ -167,7 +164,6 @@ fn parse_mutsel_str(model_str: &str) -> MutselParams {
     MutselParams {
         pi_reg,
         Mu_reg,
-        site_rate_reg,
         branch_length_reg,
     }
 }
