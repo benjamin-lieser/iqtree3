@@ -68,10 +68,9 @@ impl PCA {
         log_freq
     }
 
-    pub fn penalty_on_pca_coordinates(&self, pca_coordinates: &Tensor, strength: f64) -> Tensor {
+    pub fn penalty_on_pca_coordinates(&self, pca_coordinates: &Tensor) -> Tensor {
         let means = self.mean.narrow(0, 0, self.num_components).unwrap();
         let alpha = self.alpha.narrow(0, 0, self.num_components).unwrap();
-        let alpha = (alpha / strength).unwrap();
         let beta = self.beta.narrow(0, 0, self.num_components).unwrap();
 
         let centered_pca_coordinates = pca_coordinates
@@ -155,7 +154,7 @@ mod tests {
         let pca = PCA::new(5);
         let mean_coords = pca.mean.narrow(0, 0, 5).unwrap().unsqueeze(0).unwrap();
 
-        let penalty = pca.penalty_on_pca_coordinates(&mean_coords, 1.0);
+        let penalty = pca.penalty_on_pca_coordinates(&mean_coords);
 
         assert!(penalty.to_scalar::<f64>().unwrap().abs() < 1e-12);
     }
