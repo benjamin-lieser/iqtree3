@@ -157,26 +157,7 @@ impl Optimizable for ModelParameters {
             .pca_data
             .penalty_on_pca_coordinates(&self.pca_coordinates, self.reg_para.pi_reg);
 
-        fn log_Mu(log_R: &Tensor) -> Tensor {
-            let Mu = Mu(log_R);
-
-            // One out the diagonal, since we only want to penalize the off-diagonal elements
-            let Mu = (&Mu
-                - (&Mu - 1.0).unwrap()
-                    * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
-            .unwrap();
-
-            return Mu.log().unwrap();
-        }
-
-        let Mu = log_Mu(&self.log_R)
-            .sub(&log_Mu(&self.init_log_R))
-            .unwrap()
-            .powf(2.0)
-            .unwrap()
-            .sum_all()
-            .unwrap();
-        let Mu_penalty = (Mu * self.reg_para.Mu_reg).unwrap();
+        let Mu_penalty = Mu_penalty(&self.log_R, &self.init_log_R, self.reg_para.Mu_reg);
 
         let branch_penalty = (&self.log_branch_lengths.exp().unwrap()).sum_all().unwrap();
         let branch_penalty = (branch_penalty * self.reg_para.branch_length_reg).unwrap();
@@ -186,6 +167,30 @@ impl Optimizable for ModelParameters {
 
     fn print_state(&self) {
     }
+}
+
+/// Squared difference of the log off-diagonal Mu entries to the initial ones, times Mu_reg
+pub fn Mu_penalty(log_R: &Tensor, init_log_R: &Tensor, Mu_reg: f64) -> Tensor {
+    fn log_Mu(log_R: &Tensor) -> Tensor {
+        let Mu = Mu(log_R);
+
+        // One out the diagonal, since we only want to penalize the off-diagonal elements
+        let Mu = (&Mu
+            - (&Mu - 1.0).unwrap()
+                * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
+        .unwrap();
+
+        return Mu.log().unwrap();
+    }
+
+    let Mu = log_Mu(log_R)
+        .sub(&log_Mu(init_log_R))
+        .unwrap()
+        .powf(2.0)
+        .unwrap()
+        .sum_all()
+        .unwrap();
+    (Mu * Mu_reg).unwrap()
 }
 
 pub fn optimize(
@@ -455,19 +460,36 @@ fn loadMu() -> Tensor {
     Mu(&log_R)
 }
 
-/// Returns the optimal S, sqrt_pi and rate parameters.
-/// S: [L, 20, 20], sqrt_pi: [L, 20]
-/// rate parameters is either alpha shape: [1] or [2 * num_cat] for free rate model (first num_cat weights, second num_cat are rates)
-pub fn optimize_internal(
-    felsenstein: FelsensteinTree<20>,
+/// Convergence criteria of optimize
+#[derive(Debug, Clone, Copy)]
+pub struct Convergence {
+    pub min_iterations: usize,
+    pub max_iterations: usize,
+    pub min_rel_improvement: f64,
+    pub no_improve_patience: usize,
+}
+
+impl Convergence {
+    /// Criteria of the MAP estimate in optimize_internal
+    pub const MAP: Convergence = Convergence {
+        min_iterations: 100,
+        max_iterations: 500,
+        min_rel_improvement: 1e-6,
+        no_improve_patience: 5,
+    };
+}
+
+/// Joint MAP estimate of Mu, the pca coordinates of every site and the branch lengths,
+/// initialized with the two step light PMSF procedure.
+pub fn map_estimate(
+    op: FelsensteinOp,
     distances: &[f64],
     mutsel_params: super::MutselParams,
     prior_R_file: Option<&Path>,
+    convergence: Convergence,
     verbosity: Verbosity,
     out_prefix: &str,
-) -> Result<(Tensor, Tensor), candle_core::Error> {
-    let op = felsenstein::FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
-
+) -> Result<ModelParameters, candle_core::Error> {
     // Lower triangular matrix with zeros everywhere else
     let init_R = if let Some(prior_R_file) = prior_R_file {
         let file_content = std::fs::read_to_string(prior_R_file)?;
@@ -511,7 +533,41 @@ pub fn optimize_internal(
         pca_data: pca,
     };
 
-    optimize(&model, 100, 500, 1e-6, 5, verbosity, out_prefix);
+    optimize(
+        &model,
+        convergence.min_iterations,
+        convergence.max_iterations,
+        convergence.min_rel_improvement,
+        convergence.no_improve_patience,
+        verbosity,
+        out_prefix,
+    );
+
+    Ok(model)
+}
+
+/// Returns the optimal S, sqrt_pi and rate parameters.
+/// S: [L, 20, 20], sqrt_pi: [L, 20]
+/// rate parameters is either alpha shape: [1] or [2 * num_cat] for free rate model (first num_cat weights, second num_cat are rates)
+pub fn optimize_internal(
+    felsenstein: FelsensteinTree<20>,
+    distances: &[f64],
+    mutsel_params: super::MutselParams,
+    prior_R_file: Option<&Path>,
+    verbosity: Verbosity,
+    out_prefix: &str,
+) -> Result<(Tensor, Tensor), candle_core::Error> {
+    let op = felsenstein::FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
+
+    let model = map_estimate(
+        op,
+        distances,
+        mutsel_params,
+        prior_R_file,
+        Convergence::MAP,
+        verbosity,
+        out_prefix,
+    )?;
 
     let (S, sqrt_pi) = model.calc_rate_matrix();
 

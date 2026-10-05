@@ -1,9 +1,12 @@
 //! Per-site posterior sampling of the PCA coordinates with NUTS (nuts-rs).
 //!
 //! Mu, the branch lengths and the global rate normalization are shared and kept
-//! constant. Site rates are fixed to 1. With everything shared fixed, the
+//! constant while sampling. Site rates are fixed to 1. With everything shared fixed, the
 //! posterior factorizes over alignment columns, so every column gets its own
 //! independent 19-dimensional NUTS chain.
+//!
+//! Before the final sampling, Mu and the branch lengths are fitted with Monte Carlo EM
+//! (see sample_internal).
 
 use std::{
     path::Path,
@@ -13,7 +16,8 @@ use std::{
     },
 };
 
-use candle_core::Tensor;
+use candle_core::{Tensor, Var};
+use candle_nn::Optimizer;
 use nuts_rs::{
     Chain, CpuLogpFunc, CpuMath, CpuMathError, DiagNutsSettings, HasDims, LogpError, Settings,
     rand::{SeedableRng, rngs::ChaCha8Rng},
@@ -26,14 +30,24 @@ use rayon::prelude::*;
 
 use crate::{
     MutselParams, Verbosity,
-    felsenstein::FelsensteinOp,
+    felsenstein::{FelsensteinOp, FelsensteinWithEdgeOp},
     model::{self, calc_rate_matrix},
-    optimization::{Mu, two_step_light_pmsf},
+    optimization::{Convergence, Mu, Mu_penalty, map_estimate},
     pca::PCA,
     utils::tensor_full,
 };
 
 const NUM_COMPONENTS: usize = 19;
+
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("Could not parse {}={}", name, value)),
+        Err(_) => default,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct HmcSettings {
@@ -53,15 +67,6 @@ impl HmcSettings {
     /// Reads MUTSEL_HMC_TUNE, MUTSEL_HMC_DRAWS, MUTSEL_HMC_ESS, MUTSEL_HMC_MAX_DRAWS,
     /// MUTSEL_HMC_SAMPLES and MUTSEL_HMC_SEED from the environment.
     pub fn from_env() -> HmcSettings {
-        fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
-            match std::env::var(name) {
-                Ok(value) => value
-                    .trim()
-                    .parse()
-                    .unwrap_or_else(|_| panic!("Could not parse {}={}", name, value)),
-                Err(_) => default,
-            }
-        }
         HmcSettings {
             num_tune: env_or("MUTSEL_HMC_TUNE", 400),
             num_draws: env_or("MUTSEL_HMC_DRAWS", 500),
@@ -443,77 +448,78 @@ fn leaf_partial_likelihoods(alignment: &[u8], site: usize, num_leaves: usize) ->
         .collect()
 }
 
-/// Samples the PCA coordinates of every site from its posterior and returns (S, sqrt_pi)
-/// evaluated at the posterior mean of the site frequencies.
-pub fn sample_internal(
-    parents: &[i32],
-    branch_lengths: &[f64],
-    alignment: &[u8],
-    num_sites: usize,
-    num_leaves: usize,
-    mutsel_params: MutselParams,
-    prior_R_file: Option<&Path>,
-    verbosity: Verbosity,
-    out_prefix: &str,
-) -> Result<(Tensor, Tensor), candle_core::Error> {
-    let settings = HmcSettings::from_env();
-    println!(
-        "MUTSEL HMC: sampling pca coordinates per site with NUTS ({} tuning, at least {} draws, until ESS >= {} or {} draws, {} thinned samples per site, seed {}), Mu fixed, branch lengths fixed to the two step PMSF estimate, site rates 1",
-        settings.num_tune,
-        settings.num_draws,
-        settings.target_ess,
-        settings.max_draws,
-        settings.num_output_samples,
-        settings.seed
-    );
-    assert!(settings.num_output_samples >= 1 && settings.num_draws as usize >= settings.num_output_samples);
+/// Settings of the Monte Carlo EM for Mu and the branch lengths
+#[derive(Debug, Clone, Copy)]
+pub struct EmSettings {
+    /// EM iterations (E-step and M-step) before the final sampling, 0 keeps the MAP Mu and branch lengths
+    pub iterations: usize,
+    /// Posterior samples per site the M-step averages the log likelihood over
+    pub num_samples: usize,
+    /// NUTS tuning draws per site in the first E-step
+    pub num_tune: u64,
+    /// NUTS tuning draws per site in the later E-steps, whose chains start at the previous draws
+    pub num_retune: u64,
+    /// Maximum number of optimizer steps per M-step
+    pub max_mstep_iterations: usize,
+    /// Convergence of the MAP estimate EM starts from
+    pub map_convergence: Convergence,
+    /// pi_reg of the MAP estimate, None uses the model's pi_reg
+    pub map_pi_reg: Option<f64>,
+}
 
-    let init_R = if let Some(prior_R_file) = prior_R_file {
-        let file_content = std::fs::read_to_string(prior_R_file)?;
-        crate::data::load_lower_R_with_equi(&file_content)
-    } else {
-        crate::data::load_lower_R_with_equi(crate::data::M_TXT)
-    };
-    let Mu = Mu(&init_R.log()?).detach();
-
-    let log_branch_lengths =
-        Tensor::from_slice(branch_lengths, &[branch_lengths.len()], &candle_core::Device::Cpu)?.log()?;
-
-    // Branch lengths and initial site frequencies from the two step light PMSF procedure.
-    let felsenstein = crate::create_felsenstein_tree(parents, branch_lengths, alignment, num_sites, num_leaves);
-    let op = FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
-    let (site_freq, log_branch_lengths) = two_step_light_pmsf(
-        op,
-        crate::data::UDM256,
-        crate::data::UDM256_WEIGHTS,
-        &log_branch_lengths,
-        mutsel_params,
-        verbosity,
-        out_prefix,
-    );
-    let branch_lengths = log_branch_lengths.exp()?.to_vec1::<f64>()?;
-    let branch_lengths = branch_lengths.as_slice();
-
-    let pca = Arc::new(PCA::new(NUM_COMPONENTS));
-    let init_pca_coordinates = pca.log_freq_to_pca_coordinates(&site_freq.log()?);
-    let init_log_pi = pca.pca_coordinates_to_log_freq(&init_pca_coordinates);
-
-    // Fixed global normalization: average substitution rate 1 at the initial frequencies.
-    let (S_init, sqrt_pi_init) = calc_rate_matrix(&Mu, &init_log_pi, &tensor_full(1.0, &[]));
-    let average_rate = model::substitution_rates_tensor(&S_init, &sqrt_pi_init)
-        .mean_all()?
-        .to_scalar::<f64>()?;
-    let rate_scaling = tensor_full(1.0 / average_rate, &[]);
-    if verbosity.should_print(Verbosity::Min) {
-        println!("MUTSEL HMC: fixed rate normalization 1/{:.5}", average_rate);
+impl EmSettings {
+    /// Reads MUTSEL_EM_ITERATIONS, MUTSEL_EM_SAMPLES, MUTSEL_EM_TUNE, MUTSEL_EM_RETUNE, MUTSEL_EM_MSTEP_ITERATIONS,
+    /// MUTSEL_MAP_MIN_ITERATIONS, MUTSEL_MAP_MAX_ITERATIONS, MUTSEL_MAP_REL_IMPROVEMENT and MUTSEL_MAP_PI_REG
+    /// from the environment.
+    pub fn from_env() -> EmSettings {
+        EmSettings {
+            iterations: env_or("MUTSEL_EM_ITERATIONS", 5),
+            num_samples: env_or("MUTSEL_EM_SAMPLES", 8),
+            num_tune: env_or("MUTSEL_EM_TUNE", 200),
+            num_retune: env_or("MUTSEL_EM_RETUNE", 50),
+            max_mstep_iterations: env_or("MUTSEL_EM_MSTEP_ITERATIONS", 200),
+            // Looser than Convergence::MAP, EM refines the estimate anyway
+            map_convergence: Convergence {
+                min_iterations: env_or("MUTSEL_MAP_MIN_ITERATIONS", 50),
+                max_iterations: env_or("MUTSEL_MAP_MAX_ITERATIONS", 300),
+                min_rel_improvement: env_or("MUTSEL_MAP_REL_IMPROVEMENT", 1e-5),
+                no_improve_patience: 5,
+            },
+            map_pi_reg: std::env::var("MUTSEL_MAP_PI_REG").ok().map(|value| {
+                value
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("Could not parse MUTSEL_MAP_PI_REG={}", value))
+            }),
+        }
     }
 
-    let shared = Arc::new(SharedModel::new(&Mu, 1.0 / average_rate, &pca, mutsel_params.pi_reg));
-    let tree = Arc::new(FelsensteinTree::<20>::new(parents, branch_lengths));
-    let num_nodes = tree.num_nodes();
-    let init_pca_tensor = init_pca_coordinates;
-    let init_pca_coordinates = init_pca_tensor.to_vec2::<f64>()?;
+    /// NUTS settings of the E-step: about num_samples independent samples per site
+    fn hmc_settings(&self, settings: &HmcSettings, iteration: usize) -> HmcSettings {
+        HmcSettings {
+            num_tune: if iteration == 0 { self.num_tune } else { self.num_retune },
+            num_draws: (10 * self.num_samples).max(50) as u64,
+            target_ess: self.num_samples,
+            max_draws: settings.max_draws,
+            num_output_samples: self.num_samples,
+            seed: settings.seed.wrapping_add(iteration as u64 + 1),
+        }
+    }
+}
 
+/// Runs an independent NUTS chain for every site, starting at init[site]
+fn sample_sites(
+    shared: &Arc<SharedModel>,
+    tree: &Arc<FelsensteinTree<20>>,
+    alignment: &[u8],
+    num_leaves: usize,
+    init: &[Vec<f64>],
+    settings: &HmcSettings,
+    verbosity: Verbosity,
+    label: &str,
+) -> Vec<SiteSamples> {
+    let num_sites = init.len();
+    let num_nodes = tree.num_nodes();
     let start = std::time::Instant::now();
     let num_done = AtomicUsize::new(0);
     let report_every = (num_sites / 10).max(1);
@@ -522,17 +528,18 @@ pub fn sample_internal(
         .into_par_iter()
         .map(|site| {
             let logp = SiteLogp {
-                shared: Arc::clone(&shared),
-                tree: Arc::clone(&tree),
+                shared: Arc::clone(shared),
+                tree: Arc::clone(tree),
                 leaf_pl: leaf_partial_likelihoods(alignment, site, num_leaves),
                 pl_buffer: vec![SVector::<f64, 20>::zeros(); num_nodes],
             };
-            let samples = sample_site(logp, &init_pca_coordinates[site], &settings, site);
+            let samples = sample_site(logp, &init[site], settings, site);
 
             let done = num_done.fetch_add(1, Ordering::Relaxed) + 1;
             if verbosity.should_print(Verbosity::Min) && (done % report_every == 0 || done == num_sites) {
                 println!(
-                    "MUTSEL HMC: {}/{} sites sampled ({:.1}s)",
+                    "MUTSEL HMC {}: {}/{} sites sampled ({:.1}s)",
+                    label,
                     done,
                     num_sites,
                     start.elapsed().as_secs_f64()
@@ -556,7 +563,8 @@ pub fn sample_internal(
         .filter(|s| s.ess < settings.target_ess as f64)
         .count();
     println!(
-        "MUTSEL HMC: done in {:.1}s, {} draws per site on average, {} divergent transitions in {} sites, mean {:.1} leapfrog steps per draw",
+        "MUTSEL HMC {}: done in {:.1}s, {} draws per site on average, {} divergent transitions in {} sites, mean {:.1} leapfrog steps per draw",
+        label,
         start.elapsed().as_secs_f64(),
         total_draws / num_sites.max(1),
         total_divergences,
@@ -564,9 +572,294 @@ pub fn sample_internal(
         mean_steps
     );
     println!(
-        "MUTSEL HMC: minimum ESS over sites {:.0}, {} sites below the target ESS {} after {} draws",
-        min_ess, sites_below_target, settings.target_ess, settings.max_draws
+        "MUTSEL HMC {}: minimum ESS over sites {:.0}, {} sites below the target ESS {} after {} draws",
+        label, min_ess, sites_below_target, settings.target_ess, settings.max_draws
     );
+    site_samples
+}
+
+/// log pi [num_sites, 20] (up to a constant per site) for each of the thinned draws
+fn thinned_log_pi(site_samples: &[SiteSamples], num_samples: usize, pca: &PCA) -> Result<Vec<Tensor>, candle_core::Error> {
+    (0..num_samples)
+        .map(|k| {
+            let coordinates: Vec<f64> = site_samples
+                .iter()
+                .flat_map(|s| s.thinned_draws[k * NUM_COMPONENTS..(k + 1) * NUM_COMPONENTS].iter().copied())
+                .collect();
+            let coordinates =
+                Tensor::from_vec(coordinates, &[site_samples.len(), NUM_COMPONENTS], &candle_core::Device::Cpu)?;
+            Ok(pca.pca_coordinates_to_log_freq(&coordinates))
+        })
+        .collect()
+}
+
+/// Average substitution rate over all sites and samples, without normalization
+fn mean_substitution_rate(Mu: &Tensor, log_pi_samples: &[Tensor]) -> Result<f64, candle_core::Error> {
+    let mut sum = 0.0;
+    for log_pi in log_pi_samples {
+        let (S, sqrt_pi) = calc_rate_matrix(Mu, log_pi, &tensor_full(1.0, &[]));
+        sum += model::substitution_rates_tensor(&S, &sqrt_pi).mean_all()?.to_scalar::<f64>()?;
+    }
+    Ok(sum / log_pi_samples.len() as f64)
+}
+
+/// M-step: maximizes the log likelihood averaged over the posterior samples of the site frequencies
+/// minus the penalties on Mu and the branch lengths (as in optimization::ModelParameters),
+/// with the rate normalization fixed. Returns the averaged log likelihood at the optimum.
+fn m_step(
+    op: &FelsensteinWithEdgeOp,
+    log_R: &Var,
+    init_log_R: &Tensor,
+    log_branch_lengths: &Var,
+    log_pi_samples: &[Tensor],
+    rate_scaling: f64,
+    mutsel_params: MutselParams,
+    max_iterations: usize,
+    verbosity: Verbosity,
+) -> Result<f64, candle_core::Error> {
+    const MIN_ITERATIONS: usize = 10;
+    const MIN_REL_IMPROVEMENT: f64 = 1e-6;
+    const NO_IMPROVE_PATIENCE: usize = 5;
+
+    let variables = vec![log_R.clone(), log_branch_lengths.clone()];
+    let mut opt = candle_nn::optim::AdamW::new(
+        variables.clone(),
+        candle_nn::optim::ParamsAdamW {
+            lr: 0.03,
+            weight_decay: 0.0,
+            ..Default::default()
+        },
+    )?;
+    let rate_scaling = tensor_full(rate_scaling, &[]);
+    let num_samples = log_pi_samples.len() as f64;
+
+    let mut best_objective = f64::INFINITY;
+    let mut best_log_likelihood = f64::NAN;
+    let mut best_values = variables
+        .iter()
+        .map(|v| v.as_tensor().copy())
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut no_improve_count = 0;
+    for iteration in 0..max_iterations {
+        let penalty = (Mu_penalty(log_R, init_log_R, mutsel_params.Mu_reg)
+            + (log_branch_lengths.exp()?.sum_all()? * mutsel_params.branch_length_reg)?)?;
+        // The penalty's GradStore receives the gradient of the whole objective
+        let mut grads = penalty.backward()?;
+        let mut summed_grads = variables
+            .iter()
+            .map(|v| match grads.get(v.as_tensor()) {
+                Some(g) => Ok(g.clone()),
+                None => v.zeros_like(),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // One backward pass per sample, so only one graph over all sites is alive at a time
+        let mut log_likelihood = 0.0;
+        for log_pi in log_pi_samples {
+            let (S, sqrt_pi) = calc_rate_matrix(&Mu(log_R), log_pi, &rate_scaling);
+            let sample_log_likelihood = S.apply_op3(&sqrt_pi, &log_branch_lengths.exp()?, op.clone())?;
+            log_likelihood += sample_log_likelihood.to_scalar::<f64>()? / num_samples;
+            let sample_grads = sample_log_likelihood.affine(-1.0 / num_samples, 0.0)?.backward()?;
+            for (sum, v) in summed_grads.iter_mut().zip(&variables) {
+                if let Some(g) = sample_grads.get(v.as_tensor()) {
+                    *sum = (&*sum + g)?;
+                }
+            }
+        }
+
+        let objective = penalty.to_scalar::<f64>()? - log_likelihood;
+        if verbosity.should_print(Verbosity::Med) {
+            println!(
+                "MUTSEL HMC M-step iteration {}: expected log likelihood {:.3}, objective {:.3}",
+                iteration, log_likelihood, objective
+            );
+        }
+        let rel_improvement = (best_objective - objective) / best_objective.abs().max(1e-12);
+        if objective < best_objective {
+            best_objective = objective;
+            best_log_likelihood = log_likelihood;
+            best_values = variables
+                .iter()
+                .map(|v| v.as_tensor().copy())
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        if iteration >= MIN_ITERATIONS {
+            if rel_improvement > MIN_REL_IMPROVEMENT {
+                no_improve_count = 0;
+            } else {
+                no_improve_count += 1;
+            }
+            if no_improve_count >= NO_IMPROVE_PATIENCE {
+                if verbosity.should_print(Verbosity::Med) {
+                    println!("MUTSEL HMC M-step: converged after {} iterations", iteration);
+                }
+                break;
+            }
+        }
+
+        for (sum, v) in summed_grads.into_iter().zip(&variables) {
+            grads.insert(v.as_tensor(), sum);
+        }
+        opt.step(&grads)?;
+    }
+
+    for (variable, value) in variables.iter().zip(best_values.iter()) {
+        variable.set(value)?;
+    }
+    Ok(best_log_likelihood)
+}
+
+/// Samples the PCA coordinates of every site from its posterior and returns (S, sqrt_pi)
+/// evaluated at the posterior mean of the site frequencies.
+///
+/// Mu and the branch lengths start at the joint MAP estimate (optimization::map_estimate, which also
+/// gives the initial site positions) and are then refined with Monte Carlo EM: the E-step samples the sites
+/// given Mu and the branch lengths, the M-step maximizes the log likelihood averaged over these
+/// samples plus the log prior of Mu and the branch lengths. This converges to their MAP estimate with
+/// the site frequencies integrated out. The rate normalization is kept fixed within each iteration and
+/// afterwards reset to an average substitution rate of 1 over the posterior samples, rescaling the
+/// branch lengths so that the likelihood stays the same.
+pub fn sample_internal(
+    parents: &[i32],
+    branch_lengths: &[f64],
+    alignment: &[u8],
+    num_sites: usize,
+    num_leaves: usize,
+    mutsel_params: MutselParams,
+    prior_R_file: Option<&Path>,
+    verbosity: Verbosity,
+    out_prefix: &str,
+) -> Result<(Tensor, Tensor), candle_core::Error> {
+    let settings = HmcSettings::from_env();
+    let em = EmSettings::from_env();
+    println!(
+        "MUTSEL HMC: sampling pca coordinates per site with NUTS ({} tuning, at least {} draws, until ESS >= {} or {} draws, {} thinned samples per site, seed {}), site rates 1",
+        settings.num_tune,
+        settings.num_draws,
+        settings.target_ess,
+        settings.max_draws,
+        settings.num_output_samples,
+        settings.seed
+    );
+    println!(
+        "MUTSEL HMC: Mu and branch lengths from the MAP estimate ({}-{} iterations, relative improvement {:.0e}) refined by {} Monte Carlo EM iterations ({} samples per site, {} tuning draws in the first and {} in later iterations, at most {} M-step iterations)",
+        em.map_convergence.min_iterations,
+        em.map_convergence.max_iterations,
+        em.map_convergence.min_rel_improvement,
+        em.iterations,
+        em.num_samples,
+        em.num_tune,
+        em.num_retune,
+        em.max_mstep_iterations
+    );
+    assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
+
+    // Start at the joint MAP estimate of Mu, the site frequencies and the branch lengths
+    let felsenstein = crate::create_felsenstein_tree(parents, branch_lengths, alignment, num_sites, num_leaves);
+    let op = FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
+    let map_params = MutselParams {
+        pi_reg: em.map_pi_reg.unwrap_or(mutsel_params.pi_reg),
+        ..mutsel_params
+    };
+    if verbosity.should_print(Verbosity::Min) {
+        println!("MUTSEL HMC: MAP estimate with pi_reg {}", map_params.pi_reg);
+    }
+    let map = map_estimate(
+        op,
+        branch_lengths,
+        map_params,
+        prior_R_file,
+        em.map_convergence,
+        verbosity,
+        out_prefix,
+    )?;
+    // The Mu penalty stays relative to the prior Mu
+    let init_log_R = map.init_log_R.clone();
+    let log_R = Var::from_tensor(map.log_R.as_tensor())?;
+    let log_branch_lengths = Var::from_tensor(map.log_branch_lengths.as_tensor())?;
+    let edge_op = map.felsenstein_op.clone();
+
+    let pca = Arc::new(PCA::new(NUM_COMPONENTS));
+    let init_pca_tensor = map.pca_coordinates.as_tensor().copy()?;
+    let init_log_pi = pca.pca_coordinates_to_log_freq(&init_pca_tensor);
+
+    // Initial normalization: average substitution rate 1 at the MAP frequencies, the same as in the
+    // MAP estimate, so the branch lengths stay valid.
+    let mut rate_scaling = 1.0 / mean_substitution_rate(&Mu(log_R.as_tensor()).detach(), &[init_log_pi])?;
+    if verbosity.should_print(Verbosity::Min) {
+        println!(
+            "MUTSEL HMC: starting from the MAP estimate, tree length {:.4}, rate normalization 1/{:.5}",
+            log_branch_lengths.exp()?.sum_all()?.to_scalar::<f64>()?,
+            1.0 / rate_scaling
+        );
+    }
+    drop(map);
+
+    let mut positions = init_pca_tensor.to_vec2::<f64>()?;
+    let mut em_log_likelihood = Vec::with_capacity(em.iterations);
+    let mut em_tree_length = Vec::with_capacity(em.iterations);
+    for iteration in 0..em.iterations {
+        let label = format!("EM iteration {}/{}", iteration + 1, em.iterations);
+        let old_Mu = Mu(log_R.as_tensor()).detach();
+        let shared = Arc::new(SharedModel::new(&old_Mu, rate_scaling, &pca, mutsel_params.pi_reg));
+        let tree = Arc::new(FelsensteinTree::<20>::new(
+            parents,
+            &log_branch_lengths.exp()?.to_vec1::<f64>()?,
+        ));
+        let em_settings = em.hmc_settings(&settings, iteration);
+        let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &em_settings, verbosity, &label);
+
+        // Next chains start at the last draw, which is the last thinned draw
+        let last = (em.num_samples - 1) * NUM_COMPONENTS;
+        positions = site_samples
+            .iter()
+            .map(|s| s.thinned_draws[last..last + NUM_COMPONENTS].to_vec())
+            .collect();
+
+        let log_pi_samples = thinned_log_pi(&site_samples, em.num_samples, &pca)?;
+        drop(site_samples);
+        let log_likelihood = m_step(
+            &edge_op,
+            &log_R,
+            &init_log_R,
+            &log_branch_lengths,
+            &log_pi_samples,
+            rate_scaling,
+            mutsel_params,
+            em.max_mstep_iterations,
+            verbosity,
+        )?;
+
+        let new_Mu = Mu(log_R.as_tensor()).detach();
+        let new_rate_scaling = 1.0 / mean_substitution_rate(&new_Mu, &log_pi_samples)?;
+        // Rescale the branch lengths so the likelihood is unchanged with the new normalization
+        log_branch_lengths.set(&(log_branch_lengths.as_tensor() + (rate_scaling / new_rate_scaling).ln())?)?;
+        rate_scaling = new_rate_scaling;
+
+        let tree_length = log_branch_lengths.exp()?.sum_all()?.to_scalar::<f64>()?;
+        let max_rel_Mu_change = ((&new_Mu - &old_Mu)?.abs()? / &old_Mu)?
+            .max_all()?
+            .to_scalar::<f64>()?;
+        em_log_likelihood.push(log_likelihood);
+        em_tree_length.push(tree_length);
+        if verbosity.should_print(Verbosity::Min) {
+            println!(
+                "MUTSEL HMC {}: expected log likelihood {:.3}, tree length {:.4}, rate normalization 1/{:.5}, max relative change of Mu {:.4}",
+                label,
+                log_likelihood,
+                tree_length,
+                1.0 / rate_scaling,
+                max_rel_Mu_change
+            );
+        }
+    }
+
+    let Mu = Mu(log_R.as_tensor()).detach();
+    let shared = Arc::new(SharedModel::new(&Mu, rate_scaling, &pca, mutsel_params.pi_reg));
+    let branch_lengths = log_branch_lengths.exp()?;
+    let tree = Arc::new(FelsensteinTree::<20>::new(parents, &branch_lengths.to_vec1::<f64>()?));
+    let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &settings, verbosity, "final");
+    let rate_scaling = tensor_full(rate_scaling, &[]);
 
     // pca_samples [num_sites, num_output_samples, 19]
     let num_output_samples = settings.num_output_samples;
@@ -614,7 +907,9 @@ pub fn sample_internal(
             ("mean_pi", &mean_pi),
             ("Mu", &Mu),
             ("rate_scaling", &rate_scaling),
-            ("branch_lengths", &Tensor::from_slice(branch_lengths, &[branch_lengths.len()], &candle_core::Device::Cpu)?),
+            ("branch_lengths", &branch_lengths),
+            ("em_log_likelihood", &Tensor::from_slice(&em_log_likelihood, &[em_log_likelihood.len()], &candle_core::Device::Cpu)?),
+            ("em_tree_length", &Tensor::from_slice(&em_tree_length, &[em_tree_length.len()], &candle_core::Device::Cpu)?),
             (
                 "ess",
                 &Tensor::from_iter(site_samples.iter().map(|s| s.ess), &candle_core::Device::Cpu)?,
@@ -1006,4 +1301,5 @@ mod tests {
         println!("logp+grad: {:.1} us", start.elapsed().as_secs_f64() * 1e6 / n as f64);
     }
 }
+
 
