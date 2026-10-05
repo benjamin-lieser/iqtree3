@@ -11,6 +11,7 @@ rayon = "1.11.0"
 libc = "0.2.182"
 nuts-rs = "0.18.3"
 thiserror = "2.0.20"
+zip = { version = "7.2.0", default-features = false }
 
 [lib]
 name = "mutsel_rust"

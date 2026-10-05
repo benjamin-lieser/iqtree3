@@ -372,7 +372,9 @@ fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index:
     let mut num_divergences = 0;
     let mut num_steps = 0u64;
     let mut step_size;
-    let mut next_check = settings.num_draws.min(settings.max_draws) as usize;
+    // Enough draws to pick num_output_samples distinct ones when thinning
+    let min_draws = (settings.num_draws as usize).max(settings.num_output_samples);
+    let mut next_check = min_draws.min(settings.max_draws as usize);
     let mut ess;
     loop {
         let (draw, progress) = chain
@@ -595,7 +597,7 @@ pub fn sample_internal(
     }
 
     let npz_path = format!("{}.hmc.npz", out_prefix);
-    Tensor::write_npz(
+    write_large_npz(
         &[
             ("pca_samples", &pca_samples),
             (
@@ -639,6 +641,51 @@ pub fn sample_internal(
     println!("MUTSEL HMC: samples written to {}", npz_path);
 
     Ok((S, sqrt_pi))
+}
+
+/// Like Tensor::write_npz, but with zip64 enabled so that arrays larger than 4 GiB can be written.
+/// All arrays are stored as little endian f64.
+fn write_large_npz(ts: &[(&str, &Tensor)], path: &Path) -> Result<(), candle_core::Error> {
+    use std::io::Write;
+
+    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(std::fs::File::create(path)?));
+    let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .large_file(true);
+    for (name, tensor) in ts {
+        let tensor = tensor.to_dtype(candle_core::DType::F64)?.contiguous()?;
+        zip.start_file(format!("{}.npy", name), options).map_err(candle_core::Error::wrap)?;
+
+        let shape: Vec<String> = tensor.dims().iter().map(|d| format!("{},", d)).collect();
+        let mut header = format!(
+            "{{'descr': '<f8', 'fortran_order': False, 'shape': ({}), }}",
+            shape.join(" ")
+        );
+        // Magic (6) + version (2) + header length (2) + header, padded with spaces to a multiple of 64
+        while (10 + header.len() + 1) % 64 != 0 {
+            header.push(' ');
+        }
+        header.push('\n');
+        zip.write_all(b"\x93NUMPY\x01\x00")?;
+        zip.write_all(&(header.len() as u16).to_le_bytes())?;
+        zip.write_all(header.as_bytes())?;
+
+        // Write in chunks to avoid a second full copy of large tensors
+        let flat = tensor.flatten_all()?;
+        let num_elements = flat.elem_count();
+        const CHUNK: usize = 1 << 20;
+        let mut bytes = Vec::with_capacity(CHUNK * 8);
+        for start in (0..num_elements).step_by(CHUNK) {
+            let len = CHUNK.min(num_elements - start);
+            bytes.clear();
+            for v in flat.narrow(0, start, len)?.to_vec1::<f64>()? {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            zip.write_all(&bytes)?;
+        }
+    }
+    zip.finish().map_err(candle_core::Error::wrap)?;
+    Ok(())
 }
 
 #[cfg(test)]

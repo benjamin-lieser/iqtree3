@@ -858,6 +858,7 @@ dependencies = [
  "phylo_grad",
  "rayon",
  "thiserror 2.0.20",
+ "zip",
 ]
 
 [[package]]
