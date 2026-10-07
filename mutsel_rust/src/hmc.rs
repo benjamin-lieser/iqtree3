@@ -478,12 +478,12 @@ impl EmSettings {
             num_tune: env_or("MUTSEL_EM_TUNE", 200),
             num_retune: env_or("MUTSEL_EM_RETUNE", 50),
             max_mstep_iterations: env_or("MUTSEL_EM_MSTEP_ITERATIONS", 200),
-            // Looser than Convergence::MAP, EM refines the estimate anyway
+            // Same as optimize_internal by default
             map_convergence: Convergence {
-                min_iterations: env_or("MUTSEL_MAP_MIN_ITERATIONS", 50),
-                max_iterations: env_or("MUTSEL_MAP_MAX_ITERATIONS", 300),
-                min_rel_improvement: env_or("MUTSEL_MAP_REL_IMPROVEMENT", 1e-5),
-                no_improve_patience: 5,
+                min_iterations: env_or("MUTSEL_MAP_MIN_ITERATIONS", Convergence::MAP.min_iterations),
+                max_iterations: env_or("MUTSEL_MAP_MAX_ITERATIONS", Convergence::MAP.max_iterations),
+                min_rel_improvement: env_or("MUTSEL_MAP_REL_IMPROVEMENT", Convergence::MAP.min_rel_improvement),
+                no_improve_patience: Convergence::MAP.no_improve_patience,
             },
             map_pi_reg: std::env::var("MUTSEL_MAP_PI_REG").ok().map(|value| {
                 value
@@ -754,7 +754,8 @@ pub fn sample_internal(
     );
     assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
 
-    // Start at the joint MAP estimate of Mu, the site frequencies and the branch lengths
+    // Start at the joint MAP estimate of Mu, the site frequencies and the branch lengths,
+    // the same estimate as optimization::optimize_internal with the default settings
     let felsenstein = crate::create_felsenstein_tree(parents, branch_lengths, alignment, num_sites, num_leaves);
     let op = FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
     let map_params = MutselParams {
@@ -861,11 +862,29 @@ pub fn sample_internal(
     let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &settings, verbosity, "final");
     let rate_scaling = tensor_full(rate_scaling, &[]);
 
+    // Tensor::write_npz does not support zip entries or files of 4 GiB or more, so pca_samples and
+    // pi_samples together are kept below that by writing an evenly spaced subset of the thinned draws.
+    const MAX_SAMPLE_BYTES: usize = (1 << 32) - (1 << 26);
+    let bytes_per_sample = num_sites * (NUM_COMPONENTS + 20) * std::mem::size_of::<f64>();
+    let num_output_samples = settings
+        .num_output_samples
+        .min(MAX_SAMPLE_BYTES / bytes_per_sample.max(1))
+        .max(1);
+    if num_output_samples < settings.num_output_samples {
+        println!(
+            "MUTSEL HMC: WARNING: writing only {} of the {} samples per site, the npz file would exceed 4 GiB",
+            num_output_samples, settings.num_output_samples
+        );
+    }
     // pca_samples [num_sites, num_output_samples, 19]
-    let num_output_samples = settings.num_output_samples;
     let pca_samples: Vec<f64> = site_samples
         .iter()
-        .flat_map(|s| s.thinned_draws.iter().copied())
+        .flat_map(|s| {
+            (0..num_output_samples).flat_map(move |i| {
+                let draw = i * settings.num_output_samples / num_output_samples;
+                s.thinned_draws[draw * NUM_COMPONENTS..(draw + 1) * NUM_COMPONENTS].iter().copied()
+            })
+        })
         .collect();
     let pca_samples = Tensor::from_vec(
         pca_samples,
@@ -890,7 +909,7 @@ pub fn sample_internal(
     }
 
     let npz_path = format!("{}.hmc.npz", out_prefix);
-    write_large_npz(
+    Tensor::write_npz(
         &[
             ("pca_samples", &pca_samples),
             (
@@ -936,51 +955,6 @@ pub fn sample_internal(
     println!("MUTSEL HMC: samples written to {}", npz_path);
 
     Ok((S, sqrt_pi))
-}
-
-/// Like Tensor::write_npz, but with zip64 enabled so that arrays larger than 4 GiB can be written.
-/// All arrays are stored as little endian f64.
-fn write_large_npz(ts: &[(&str, &Tensor)], path: &Path) -> Result<(), candle_core::Error> {
-    use std::io::Write;
-
-    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(std::fs::File::create(path)?));
-    let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored)
-        .large_file(true);
-    for (name, tensor) in ts {
-        let tensor = tensor.to_dtype(candle_core::DType::F64)?.contiguous()?;
-        zip.start_file(format!("{}.npy", name), options).map_err(candle_core::Error::wrap)?;
-
-        let shape: Vec<String> = tensor.dims().iter().map(|d| format!("{},", d)).collect();
-        let mut header = format!(
-            "{{'descr': '<f8', 'fortran_order': False, 'shape': ({}), }}",
-            shape.join(" ")
-        );
-        // Magic (6) + version (2) + header length (2) + header, padded with spaces to a multiple of 64
-        while (10 + header.len() + 1) % 64 != 0 {
-            header.push(' ');
-        }
-        header.push('\n');
-        zip.write_all(b"\x93NUMPY\x01\x00")?;
-        zip.write_all(&(header.len() as u16).to_le_bytes())?;
-        zip.write_all(header.as_bytes())?;
-
-        // Write in chunks to avoid a second full copy of large tensors
-        let flat = tensor.flatten_all()?;
-        let num_elements = flat.elem_count();
-        const CHUNK: usize = 1 << 20;
-        let mut bytes = Vec::with_capacity(CHUNK * 8);
-        for start in (0..num_elements).step_by(CHUNK) {
-            let len = CHUNK.min(num_elements - start);
-            bytes.clear();
-            for v in flat.narrow(0, start, len)?.to_vec1::<f64>()? {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            zip.write_all(&bytes)?;
-        }
-    }
-    zip.finish().map_err(candle_core::Error::wrap)?;
-    Ok(())
 }
 
 #[cfg(test)]
