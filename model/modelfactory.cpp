@@ -36,6 +36,7 @@
 #include "ratemeyerdiscrete.h"
 #include "ratekategory.h"
 #include "ratefree.h"
+#include "ratesitesamples.h"
 #include "ratefreeinvar.h"
 #include "rateheterotachy.h"
 #include "rateheterotachyinvar.h"
@@ -676,17 +677,29 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
         ModelSet *models = (ModelSet*)model; // assign pointer for convenience
         models->init((params.freq_type != FREQ_UNKNOWN) ? params.freq_type : FREQ_EMPIRICAL);
         models->fixParameters(true);
-        for (size_t i = 0; i < tree->aln->ptn_state_freq.size(); ++i) {
-            ModelMarkov *modeli = new ModelMarkov(tree, true, true); // dummy model for getting num_states and num_rate_entries
-            modeli->setStateFrequency(tree->aln->ptn_state_freq[i]);
-            modeli->setRateMatrix(tree->aln->ptn_rate_mat[i]);
-            // Minh/Thomas: Important to note: site Q matrices are not normalised
-            // But make sure to normalise across all sites, i.e.
-            // (1/nsites) * sum_i mu_i = 1.0, where mu_i = -sum_j pi^i_j * Q^i_{jj}
-            modeli->normalize_matrix = false;
-            modeli->init(FREQ_USER_DEFINED);
-            modeli->fixParameters(true);
-            models->push_back(modeli);
+        // With several models (samples) per pattern, the models of sample k are at k*stride + ptn, with the
+        // number of patterns rounded up to a multiple of 8 as stride, so that the SIMD interleaving of the
+        // eigen systems (ModelSet::decomposeRateMatrix) never mixes samples. Padding patterns repeat the last one.
+        size_t nptn = tree->aln->ptn_state_freq.size();
+        int num_samples = tree->aln->site_model_samples;
+        size_t stride = (num_samples > 1) ? ((nptn + 7) / 8) * 8 : nptn;
+        models->site_samples = num_samples;
+        models->site_sample_stride = (num_samples > 1) ? stride : 0;
+        int num_states = tree->aln->num_states, num_rates = tree->aln->getNumRates();
+        for (int sample = 0; sample < num_samples; ++sample) {
+            for (size_t i = 0; i < stride; ++i) {
+                size_t ptn = min(i, nptn - 1);
+                ModelMarkov *modeli = new ModelMarkov(tree, true, true); // dummy model for getting num_states and num_rate_entries
+                modeli->setStateFrequency(tree->aln->ptn_state_freq[ptn] + sample * num_states);
+                modeli->setRateMatrix(tree->aln->ptn_rate_mat[ptn] + sample * num_rates);
+                // Minh/Thomas: Important to note: site Q matrices are not normalised
+                // But make sure to normalise across all sites, i.e.
+                // (1/nsites) * sum_i mu_i = 1.0, where mu_i = -sum_j pi^i_j * Q^i_{jj}
+                modeli->normalize_matrix = false;
+                modeli->init(FREQ_USER_DEFINED);
+                modeli->fixParameters(true);
+                models->push_back(modeli);
+            }
         }
         models->joinEigenMemory();
         models->decomposeRateMatrix();
@@ -1019,10 +1032,16 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
 //            model_str = model_str.substr(0, model_str.find('+'));
 //        else
 //            model_str = model_str.substr(0, model_str.find('*'));
+    } else if (tree->aln->isSSM() && tree->aln->site_model_samples > 1) {
+        // one rate category per sample of the site-specific model
+        site_rate = new RateSiteSamples(tree->aln->site_model_samples, tree);
     } else {
         site_rate = new RateHeterogeneity();
         site_rate->setTree(tree);
     }
+    // With several samples per site, rate category c is sample c: no other rate heterogeneity
+    if (tree->aln->isSSM() && tree->aln->site_model_samples > 1 && dynamic_cast<RateSiteSamples*>(site_rate) == nullptr)
+        outError("Rate heterogeneity is not supported with several samples per site of the site-specific model");
 
     if (fused_mix_rate) {
         if (!model->isMixture()) {

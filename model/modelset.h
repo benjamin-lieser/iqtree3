@@ -36,6 +36,16 @@ public:
 	 */
 	virtual bool isSiteSpecificModel() { return true; }
 
+	virtual int getNSiteSamples() { return site_samples; }
+
+	virtual size_t getSiteSampleStride() { return site_sample_stride; }
+
+	/** number of models per pattern; the models of sample k are at k*site_sample_stride + ptn */
+	int site_samples = 1;
+
+	/** 0 if there is one model per pattern, else the number of patterns rounded up to a multiple of 8 */
+	size_t site_sample_stride = 0;
+
 	/**
 	 * get the size of transition matrix, default is num_states*num_states.
 	 * can be changed for e.g. site-specific model

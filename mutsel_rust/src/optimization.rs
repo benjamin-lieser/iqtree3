@@ -1,14 +1,10 @@
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::path::Path;
 
 use candle_core::{Tensor, Var};
-use candle_nn::{Optimizer, ops::softmax};
-use phylo_grad::FelsensteinTree;
+use candle_nn::Optimizer;
 
 use crate::{
-    MutselParams, Verbosity, felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp}, model::{self, calc_rate_matrix}, pca::PCA, utils::tensor_full,
+    Verbosity, felsenstein::{FelsensteinOp, FelsensteinWithEdgeOp}, model::{self, calc_rate_matrix}, utils::tensor_full,
 };
 
 pub trait Optimizable {
@@ -75,113 +71,28 @@ impl Optimizable for BranchParameters {
     fn print_state(&self) {}
 }
 
-pub struct ModelParameters {
-    pub felsenstein_op: FelsensteinWithEdgeOp,
-    pub log_R: Var,
-    /// Defines the log pi per site
-    pub pca_coordinates: Var,
-    pub log_branch_lengths: Var,
-    pub init_log_branch_lengths: Tensor,
-    pub reg_para: MutselParams,
-    pub init_log_R: Tensor,
-    pub pca_data: PCA,
-}
+/// Mu_reg times the squared difference of the log off-diagonal Mu entries to the initial ones
+pub fn Mu_penalty(log_R: &Tensor, init_log_R: &Tensor, Mu_reg: f64) -> Tensor {
+    fn log_Mu(log_R: &Tensor) -> Tensor {
+        let Mu = Mu(log_R);
 
-impl ModelParameters {
-    pub fn log_pi(&self) -> Tensor {
-        self.pca_data
-            .pca_coordinates_to_log_freq(&self.pca_coordinates)
-    }
-
-    pub fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
-        let (S, sqrt_pi) =
-            calc_rate_matrix(&Mu(&self.log_R), &self.log_pi(), &tensor_full(1.0, &[]));
-        let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi)
-            .mean_all()
-            .unwrap();
-        let S = S.broadcast_div(&average_rate).unwrap();
-        (S, sqrt_pi)
-    }
-
-    pub fn save_npz(&self, path: &Path) {
-        let Mu = Mu(&self.log_R.as_detached_tensor());
-        let pi = softmax(&self.log_pi().detach(), 1).unwrap();
-
-        Tensor::write_npz(
-            &[
-                ("Mu", &Mu),
-                ("pi", &pi),
-                ("init_log_R", &self.init_log_R),
-                ("branch_lengths", &self.log_branch_lengths.exp().unwrap()),
-            ],
-            path,
-        )
+        // One out the diagonal, since we only want to penalize the off-diagonal elements
+        let Mu = (&Mu
+            - (&Mu - 1.0).unwrap()
+                * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
         .unwrap();
-    }
-}
 
-impl Optimizable for ModelParameters {
-    fn variables(&self) -> Vec<Var> {
-        vec![
-            self.log_R.clone(),
-            self.pca_coordinates.clone(),
-            self.log_branch_lengths.clone(),
-        ]
+        return Mu.log().unwrap();
     }
 
-    fn variables_names(&self) -> Vec<String> {
-        vec![
-            "log_R".to_string(),
-            "pca_coordinates".to_string(),
-            "log_branch_lengths".to_string(),
-        ]
-    }
-
-    fn model_name(&self) -> String {
-        "ModelParameters".to_string()
-    }
-
-    fn likelihood(&self) -> Tensor {
-        let (S, sqrt_pi) = self.calc_rate_matrix();
-        let branch_lengths = self.log_branch_lengths.exp().unwrap();
-        S.apply_op3(&sqrt_pi, &branch_lengths, self.felsenstein_op.clone())
-            .unwrap()
-            .sum_all()
-            .unwrap()
-    }
-
-    fn penalty(&self) -> Tensor {
-        let pi_penalty = self
-            .pca_data
-            .penalty_on_pca_coordinates(&self.pca_coordinates);
-        let pi_penalty = (pi_penalty * self.reg_para.pi_reg).unwrap();
-
-        fn log_Mu(log_R: &Tensor) -> Tensor {
-            let Mu = Mu(log_R);
-
-            // One out the diagonal, since we only want to penalize the off-diagonal elements
-            let Mu = (&Mu
-                - (&Mu - 1.0).unwrap()
-                    * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
-            .unwrap();
-
-            return Mu.log().unwrap();
-        }
-
-        let Mu = log_Mu(&self.log_R)
-            .sub(&log_Mu(&self.init_log_R))
-            .unwrap()
-            .powf(2.0)
-            .unwrap()
-            .sum_all()
-            .unwrap();
-        let Mu_penalty = (Mu * self.reg_para.Mu_reg).unwrap();
-
-        (pi_penalty + Mu_penalty).unwrap()
-    }
-
-    fn print_state(&self) {
-    }
+    let Mu = log_Mu(log_R)
+        .sub(&log_Mu(init_log_R))
+        .unwrap()
+        .powf(2.0)
+        .unwrap()
+        .sum_all()
+        .unwrap();
+    (Mu * Mu_reg).unwrap()
 }
 
 pub fn optimize(
@@ -316,6 +227,7 @@ pub fn two_step_light_pmsf(
     categories: &[[f64; 20]],
     weights: &[f64],
     log_branch_lengths: &Tensor,
+    Mu: &Tensor,
     verbosity: Verbosity,
     prefix: &str,
 ) -> (Tensor, Tensor) {
@@ -324,16 +236,15 @@ pub fn two_step_light_pmsf(
         categories,
         weights,
         log_branch_lengths,
+        Mu,
     );
-
-    let Mu = loadMu();
 
     let log_pi = step1_site_freq.log().unwrap();
 
     let log_branch_lengths = optimize_branch_lengths(
         felsenstein_op.into_with_edge_op(),
         &log_pi,
-        &Mu,
+        Mu,
         log_branch_lengths,
         verbosity,
         prefix,
@@ -344,6 +255,7 @@ pub fn two_step_light_pmsf(
         categories,
         weights,
         &log_branch_lengths,
+        Mu,
     );
 
     (final_site_freq, log_branch_lengths)
@@ -354,17 +266,16 @@ pub fn light_pmsf(
     categories: &[[f64; 20]],
     weights: &[f64],
     log_branch_lengths: &Tensor,
+    Mu: &Tensor,
 ) -> Tensor {
     let mut likelihoods = vec![];
-
-    let Mu = loadMu();
 
     for category in categories.iter() {
         let category_tensor =
             Tensor::from_vec(category.to_vec(), &[20], &candle_core::Device::Cpu).unwrap();
         let log_pi = category_tensor.log().unwrap().unsqueeze(0).unwrap();
 
-        let (S, sqrt_pi) = model::calc_rate_matrix(&Mu, &log_pi, &tensor_full(1.0, &[]));
+        let (S, sqrt_pi) = model::calc_rate_matrix(Mu, &log_pi, &tensor_full(1.0, &[]));
 
         let likelihood = S
             .apply_op3(
@@ -440,75 +351,12 @@ pub fn Mu(log_parameter: &Tensor) -> Tensor {
     (Q + pi).unwrap()
 }
 
-// Used with the MutSel model.
-fn loadMu() -> Tensor {
-    let R_lower = crate::data::load_lower_R_with_equi(crate::data::M_TXT);
-    let log_R = R_lower.log().unwrap();
-    Mu(&log_R)
-}
-
-/// Returns the optimal S, sqrt_pi and rate parameters.
-/// S: [L, 20, 20], sqrt_pi: [L, 20]
-/// rate parameters is either alpha shape: [1] or [2 * num_cat] for free rate model (first num_cat weights, second num_cat are rates)
-pub fn optimize_internal(
-    felsenstein: FelsensteinTree<20>,
-    distances: &[f64],
-    mutsel_params: super::MutselParams,
-    prior_R_file: Option<&Path>,
-    verbosity: Verbosity,
-    out_prefix: &str,
-) -> Result<(Tensor, Tensor), candle_core::Error> {
-    let op = felsenstein::FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
-
-    // Lower triangular matrix with zeros everywhere else
-    let init_R = if let Some(prior_R_file) = prior_R_file {
+/// Lower triangular R with the mutation equilibrium on the diagonal, from the prior file or M_TXT
+pub fn load_init_R(prior_R_file: Option<&Path>) -> Result<Tensor, candle_core::Error> {
+    Ok(if let Some(prior_R_file) = prior_R_file {
         let file_content = std::fs::read_to_string(prior_R_file)?;
         crate::data::load_lower_R_with_equi(&file_content)
     } else {
         crate::data::load_lower_R_with_equi(crate::data::M_TXT)
-    };
-
-    let log_branch_lengths =
-        Tensor::from_slice(distances, &[distances.len()], &candle_core::Device::Cpu)?.log()?;
-
-    // Do our lightweight PMSF procedure for initialization:
-    let (site_freq, log_branch_lengths) = two_step_light_pmsf(
-        op.clone(),
-        crate::data::UDM256,
-        crate::data::UDM256_WEIGHTS,
-        &log_branch_lengths,
-        verbosity,
-        out_prefix,
-    );
-
-    // Variable which gets optimized
-    let log_R = Var::from_tensor(&init_R.log()?)?;
-    let init_log_pi = site_freq.log()?;
-
-    let init_log_R = log_R.detach().copy().unwrap();
-
-    let pca = PCA::new(19);
-
-    let pca_coordinates = pca.log_freq_to_pca_coordinates(&init_log_pi);
-
-    let model = ModelParameters {
-        felsenstein_op: op.into_with_edge_op(),
-        log_R,
-        pca_coordinates: Var::from_tensor(&pca_coordinates).unwrap(),
-        log_branch_lengths: Var::from_tensor(&log_branch_lengths).unwrap(),
-        init_log_branch_lengths: log_branch_lengths.detach().copy().unwrap(),
-        reg_para: mutsel_params,
-        init_log_R,
-        pca_data: pca,
-    };
-
-    optimize(&model, 100, 500, 1e-6, 5, verbosity, out_prefix);
-
-    let (S, sqrt_pi) = model.calc_rate_matrix();
-
-    if verbosity.should_print(Verbosity::Med) {
-        model.save_npz(Path::new(&format!("{}.mutsel.npz", out_prefix)));
-    }
-
-    Ok((S, sqrt_pi))
+    })
 }

@@ -35,6 +35,7 @@ extern "C" void rust_mutsel(int32_t *parents,
                             const char *priorMuFile,
                             const char *priorPiFile,
                             uint8_t verbose,
+                            uint32_t num_samples,
                             double *out_site_freq,
                             double *out_R_matrices,
                             const char *output_prefix);
@@ -51,6 +52,7 @@ void rust_mutsel(int32_t *parents,
                  const char *priorMuFile,
                  const char *priorPiFile,
                  uint8_t verbose,
+                 uint32_t num_samples,
                  double *out_site_freq,
                  double *out_R_matrices,
                  const char *output_prefix);
@@ -60,15 +62,16 @@ void rust_set_rayon_threads(int32_t num_threads);
 
 /**
  * Simple read function which just puts the binary file into vectors. frequences get normalized, rates are checked to be positive. It returns the rate model string of the file.
+ * num_samples is set to the number of models (posterior samples) per site.
  * Format is documented in the body of the function.
  */
-std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model);
+std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model, int &num_samples);
 
 /**
  * Takes the data from the file (or the rust_mutsel function) and updates the alignment object.
- * This deals with duplicated pattern and stuff.
+ * This deals with duplicated pattern and stuff. site_freq [len][num_samples][20], rate_matrices [len][num_samples][190].
  */
-void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len);
+void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len, int num_samples = 1);
 
 /**
  * Read a site model file and update the alignment object.
@@ -87,7 +90,7 @@ void write_binary_site_model_file(const std::string &filename, Alignment &alignm
 void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment);
 
 /**
- * Per-site substitution rate implied by the fitted MUTSEL model
+ * Per-site substitution rate implied by the fitted MUTSEL model, the mean over the samples of a site
  */
 DoubleVector computeMutselSiteRates(Alignment &alignment);
 

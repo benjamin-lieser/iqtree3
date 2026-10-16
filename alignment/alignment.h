@@ -953,11 +953,23 @@ public:
     //int num_rates;
     virtual int getNumRates() const { return num_states*(num_states-1)/2; }
     
-    /** pattern ID to rate matrix map */
+    /** pattern ID to rate matrix map, site_model_samples rate matrices per pattern */
     vector<double*> ptn_rate_mat;
 
-    /** pattern ID to state frequency vector map */
+    /** pattern ID to state frequency vector map, site_model_samples vectors per pattern */
     vector<double*> ptn_state_freq;
+
+    /**
+     * Number of rate matrices and state frequency vectors per pattern of a site-specific model,
+     * e.g. posterior samples of the MUTSEL model; the likelihood of a pattern is their mean
+     */
+    int site_model_samples = 1;
+
+    /** number of doubles per pattern in ptn_rate_mat */
+    int getSiteRateSize() const { return getNumRates() * site_model_samples; }
+
+    /** number of doubles per pattern in ptn_state_freq */
+    int getSiteFreqSize() const { return num_states * site_model_samples; }
 
     /**
      * @return true if data type is SEQ_CODON and state is a stop codon

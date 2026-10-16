@@ -13,6 +13,7 @@ void rust_mutsel(int32_t *parents,
                  const char *priorMuFile,
                  const char *priorPiFile,
                  uint8_t verbose,
+                 uint32_t num_samples,
                  double *out_site_freq,
                  double *out_R_matrices,
                  const char *output_prefix)
@@ -118,7 +119,7 @@ std::tuple<std::vector<uint8_t>, int32_t, int32_t> prepare_mutsel_alignment(Alig
     return std::make_tuple(std::move(sequences), static_cast<int32_t>(L), static_cast<int32_t>(N));
 }
 
-std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model)
+std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model, int &num_samples)
 {
     cout << endl
          << "Reading site-specific model file " << filename << " ..." << endl;
@@ -165,26 +166,39 @@ std::string read_binary_site_model_file_internal(std::string &filename, std::vec
         }
         rate_model_string = std::string(rate_model_string_buf.data(), rate_model_string_length);
 
+        // "SAMPLES=K": K models (posterior samples) per site, otherwise one
+        num_samples = 1;
+        if (rate_model_string.rfind("SAMPLES=", 0) == 0)
+        {
+            num_samples = std::stoi(rate_model_string.substr(8));
+            if (num_samples < 1)
+                throw std::runtime_error("Invalid number of samples per site " + rate_model_string);
+        }
+
         // Read number of sites. 8 bytes
 
         uint64_t num_sites;
         read_exact(reinterpret_cast<char *>(&num_sites), sizeof(uint64_t), "number of sites");
+        uint64_t num_models = num_sites * num_samples;
 
-        // num_sites * 20 doubles for site frequencies
-        site_freq.resize(num_sites * 20);
+        // num_sites * num_samples * 20 doubles for site frequencies, the samples of a site consecutive
+        site_freq.resize(num_models * 20);
         read_exact(reinterpret_cast<char *>(site_freq.data()),
-                   static_cast<std::streamsize>(num_sites * 20 * sizeof(double)),
+                   static_cast<std::streamsize>(num_models * 20 * sizeof(double)),
                    "site frequencies");
 
-        // num_sites * 190 doubles for rate matrices
-        rate_matrices.resize(num_sites * 190);
+        // num_sites * num_samples * 190 doubles for rate matrices
+        rate_matrices.resize(num_models * 190);
         read_exact(reinterpret_cast<char *>(rate_matrices.data()),
-                   static_cast<std::streamsize>(num_sites * 190 * sizeof(double)),
+                   static_cast<std::streamsize>(num_models * 190 * sizeof(double)),
                    "rate matrices");
 
         for (size_t i = 0; i < num_sites; ++i)
         {
             site_model.push_back(i);
+        }
+        for (size_t i = 0; i < num_models; ++i)
+        {
             for (int j = 0; j < 20; ++j)
             {
                 if (site_freq[i * 20 + j] <= 1e-10)
@@ -197,7 +211,7 @@ std::string read_binary_site_model_file_internal(std::string &filename, std::vec
             }
             if (std::abs(sum - 1.0) > 1e-4)
             {
-                std::cout << "Warning: frequencies for site " << i + 1 << " do not sum to 1, normalizing..." << std::endl;
+                std::cout << "Warning: frequencies for site " << i / num_samples + 1 << " do not sum to 1, normalizing..." << std::endl;
                 for (int j = 0; j < 20; ++j)
                 {
                     site_freq[i * 20 + j] /= sum;
@@ -218,8 +232,11 @@ std::string read_binary_site_model_file_internal(std::string &filename, std::vec
     return rate_model_string;
 }
 
-void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len)
+void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len, int num_samples)
 {
+    const int freq_size = 20 * num_samples;
+    const int rate_size = 190 * num_samples;
+    alignment.site_model_samples = num_samples;
     ASSERT(alignment.ptn_rate_mat.empty() &&
            alignment.ptn_state_freq.empty());
 
@@ -252,8 +269,8 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
     {
         site_model[site] = models_freq.size();
 
-        const double *state_freq_ptr = site_freq + site * 20;
-        const double *rate_mat_ptr = rate_matrices + site * 190;
+        const double *state_freq_ptr = site_freq + (size_t)site * freq_size;
+        const double *rate_mat_ptr = rate_matrices + (size_t)site * rate_size;
 
         bool add = true;
         int first_site = pattern_first_site[alignment.getPatternID(site)];
@@ -261,7 +278,7 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
         {
             int first_model = site_model[first_site];
             bool matched_freq_and_rate = true;
-            for (int i = 0; i < 20; ++i)
+            for (int i = 0; i < freq_size; ++i)
             {
                 if (state_freq_ptr[i] != models_freq[first_model][i])
                 {
@@ -271,7 +288,7 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
             }
             if (matched_freq_and_rate)
             {
-                for (int i = 0; i < 190; ++i)
+                for (int i = 0; i < rate_size; ++i)
                 {
                     if (rate_mat_ptr[i] != models_rate[first_model][i])
                     {
@@ -294,11 +311,11 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
 
         if (add)
         {
-            double *site_freq_entry = new double[20];
-            memcpy(site_freq_entry, state_freq_ptr, sizeof(double) * 20);
+            double *site_freq_entry = new double[freq_size];
+            memcpy(site_freq_entry, state_freq_ptr, sizeof(double) * freq_size);
             models_freq.push_back(site_freq_entry);
-            double *site_rate_entry = new double[190];
-            memcpy(site_rate_entry, rate_mat_ptr, sizeof(double) * 190);
+            double *site_rate_entry = new double[rate_size];
+            memcpy(site_rate_entry, rate_mat_ptr, sizeof(double) * rate_size);
             models_rate.push_back(site_rate_entry);
         }
     }
@@ -338,7 +355,10 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
         }
     }
 
-    cout << used_models << " distinct per-site models detected" << endl;
+    cout << used_models << " distinct per-site models detected";
+    if (num_samples > 1)
+        cout << ", each a mixture of " << num_samples << " equally weighted posterior samples";
+    cout << endl;
 }
 
 void read_site_model_file(const std::string &filename, Alignment &alignment)
@@ -346,18 +366,19 @@ void read_site_model_file(const std::string &filename, Alignment &alignment)
     auto site_freq = std::vector<double>();
     auto rate_matrices = std::vector<double>();
     auto site_model = std::vector<int>();
-    auto _custom_str = read_binary_site_model_file_internal(const_cast<std::string &>(filename), site_freq, rate_matrices, site_model);
-    write_site_models_to_alignment(alignment, site_freq.data(), rate_matrices.data(), site_model.size());
+    int num_samples = 1;
+    auto _custom_str = read_binary_site_model_file_internal(const_cast<std::string &>(filename), site_freq, rate_matrices, site_model, num_samples);
+    write_site_models_to_alignment(alignment, site_freq.data(), rate_matrices.data(), site_model.size(), num_samples);
     return;
 }
 
 void write_binary_site_model_file(const std::string &filename, Alignment &alignment)
 {
     size_t nsites = alignment.getNSite();
-    size_t nstates = alignment.num_states;
-    size_t nrates = alignment.getNumRates();
-    ASSERT(nstates == 20);
-    ASSERT(nrates == 190);
+    ASSERT(alignment.num_states == 20);
+    ASSERT(alignment.getNumRates() == 190);
+    size_t nstates = alignment.getSiteFreqSize();
+    size_t nrates = alignment.getSiteRateSize();
     try
     {
         ofstream out;
@@ -366,9 +387,10 @@ void write_binary_site_model_file(const std::string &filename, Alignment &alignm
         IntVector pattern_index;
         alignment.getSitePatternIndex(pattern_index);
 
-        uint64_t custom_string_length = 6; // length of "UNUSED"
+        std::string custom_string = alignment.site_model_samples > 1 ? "SAMPLES=" + std::to_string(alignment.site_model_samples) : "UNUSED";
+        uint64_t custom_string_length = custom_string.size();
         out.write(reinterpret_cast<const char *>(&custom_string_length), sizeof(uint64_t));
-        out.write("UNUSED", custom_string_length);
+        out.write(custom_string.data(), custom_string_length);
 
         uint64_t num_sites = nsites;
         out.write(reinterpret_cast<const char *>(&num_sites), sizeof(uint64_t));
@@ -401,21 +423,25 @@ DoubleVector computeMutselSiteRates(Alignment &alignment)
 
     size_t npattern = alignment.getNPattern();
     DoubleVector pattern_rates(npattern);
+    int num_samples = alignment.site_model_samples;
     for (size_t ptn = 0; ptn < npattern; ++ptn)
     {
-        double *R = alignment.ptn_rate_mat[ptn];
-        double *pi = alignment.ptn_state_freq[ptn];
         double rate = 0.0;
-        int idx = 0;
-        for (int i = 0; i < 20; ++i)
+        for (int k = 0; k < num_samples; ++k)
         {
-            for (int j = i + 1; j < 20; ++j)
+            double *R = alignment.ptn_rate_mat[ptn] + k * 190;
+            double *pi = alignment.ptn_state_freq[ptn] + k * 20;
+            int idx = 0;
+            for (int i = 0; i < 20; ++i)
             {
-                rate += R[idx] * pi[i] * pi[j];
-                idx++;
+                for (int j = i + 1; j < 20; ++j)
+                {
+                    rate += R[idx] * pi[i] * pi[j];
+                    idx++;
+                }
             }
         }
-        pattern_rates[ptn] = 2.0 * rate;
+        pattern_rates[ptn] = 2.0 * rate / num_samples;
     }
 
     size_t nsite = alignment.getNSite();
@@ -446,9 +472,26 @@ void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
     auto [branch_lengths, parent_indices] = prepare_mutsel_tree(tree);
     auto [sequences, L, N] = prepare_mutsel_alignment(alignment);
 
-    double *site_freq = new double[L * 20];
+    // Site models per site (tempered posterior samples, see mutsel_rust svi.rs); the likelihood of a
+    // site is their mean. MUTSEL_SITE_SAMPLES=1 gives a single model per site (the posterior mode).
+    int num_samples = 8;
+    if (const char *samples_env = std::getenv("MUTSEL_SITE_SAMPLES"))
+    {
+        try
+        {
+            num_samples = std::stoi(samples_env);
+        }
+        catch (const std::exception &)
+        {
+            throw std::runtime_error(std::string("MUTSEL_SITE_SAMPLES must be a number, got ") + samples_env);
+        }
+        if (num_samples < 1)
+            throw std::runtime_error("MUTSEL_SITE_SAMPLES must be at least 1");
+    }
 
-    double *site_rate = new double[L * 190];
+    double *site_freq = new double[(size_t)L * num_samples * 20];
+
+    double *site_rate = new double[(size_t)L * num_samples * 190];
 
     // Close log file, so we can append in the mutsel library without messing up the order of log messages from IQ-TREE and mutsel library
     std::cout << std::flush;
@@ -474,13 +517,14 @@ void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
                 params.mutsel_prior_rate_file.empty() ? nullptr : params.mutsel_prior_rate_file.c_str(),
                 params.mutsel_prior_freq_file.empty() ? nullptr : params.mutsel_prior_freq_file.c_str(),
                 verbose_mode,
+                num_samples,
                 site_freq,
                 site_rate,
                 ((string)params.out_prefix).c_str());
 
     outstream->open(((string)params.out_prefix + ".log").c_str(), std::ios::app); // reopen log file
 
-    write_site_models_to_alignment(*alignment, site_freq, site_rate, L);
+    write_site_models_to_alignment(*alignment, site_freq, site_rate, L, num_samples);
 
     write_binary_site_model_file(((string)params.out_prefix + ".sitemodel").c_str(), *alignment);
 

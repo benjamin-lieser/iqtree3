@@ -257,6 +257,11 @@ void PhyloTree::computeTipPartialLikelihood() {
 //        ModelSet *models = (ModelSet*)model;
         size_t nptn = aln->getNPattern(), max_nptn = ((nptn+vector_size-1)/vector_size)*vector_size, tip_block_size = max_nptn * aln->num_states;
         int nstates = aln->num_states;
+        // several models (samples) per pattern: the tip vectors of sample k at k*site_stride + ptn
+        size_t site_stride = getModel()->getSiteSampleStride();
+        size_t num_samples = site_stride ? getModel()->getNSiteSamples() : 1;
+        if (site_stride)
+            tip_block_size = site_stride * num_samples * nstates;
         size_t nseq = aln->getNSeq();
         ASSERT(vector_size > 0);
         
@@ -266,9 +271,10 @@ void PhyloTree::computeTipPartialLikelihood() {
 #endif
         for (int nodeid = 0; nodeid < nseq; nodeid++) {
             auto stateRow = getConvertedSequenceByNumber(nodeid);
-            double *partial_lh = tip_partial_lh + (tip_block_size*nodeid);
+            for (size_t sample = 0; sample < num_samples; sample++) {
+            double *partial_lh = tip_partial_lh + (tip_block_size*nodeid) + sample*site_stride*nstates;
             for (size_t ptn = 0; ptn < nptn; ptn+=vector_size, partial_lh += nstates*vector_size) {
-                const double *inv_evec = &model->getInverseEigenvectors()[ptn*nstates*nstates];
+                const double *inv_evec = &model->getInverseEigenvectors()[(sample*site_stride + ptn)*nstates*nstates];
                 for (int v = 0; v < vector_size; v++) {
                     int state = 0;
                     if (ptn+v < nptn) {
@@ -341,6 +347,7 @@ void PhyloTree::computeTipPartialLikelihood() {
                     
                 } // FOR v
             } // FOR ptn
+            } // FOR sample
             // NO Need to copy dummy anymore
             // dummy values
 //            for (ptn = nptn; ptn < max_nptn; ptn++, partial_lh += nstates)

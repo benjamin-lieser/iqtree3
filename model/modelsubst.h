@@ -91,6 +91,17 @@ public:
 	virtual bool isSiteSpecificModel() { return false; }
 
 	/**
+	 * @return number of models (e.g. posterior samples) per pattern of a site-specific model, 1 by default
+	 */
+	virtual int getNSiteSamples() { return 1; }
+
+	/**
+	 * For a site-specific model with several models per pattern: rate category c of pattern ptn uses
+	 * the model (eigen system) c*getSiteSampleStride() + ptn. 0 if there is one model per pattern.
+	 */
+	virtual size_t getSiteSampleStride() { return 0; }
+
+	/**
 	 * @return TRUE if this is a mixture model, FALSE otherwise
 	 */
 	virtual bool isMixture() { return false; }

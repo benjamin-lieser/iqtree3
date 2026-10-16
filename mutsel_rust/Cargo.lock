@@ -738,6 +738,9 @@ dependencies = [
  "candle-nn",
  "libc",
  "phylo_grad",
+ "rand",
+ "rand_chacha",
+ "rand_distr",
  "rayon",
 ]
 
