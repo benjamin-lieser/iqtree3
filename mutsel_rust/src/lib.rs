@@ -4,6 +4,8 @@ pub mod data;
 pub mod felsenstein;
 mod io;
 pub mod model;
+pub mod hmc;
+pub mod prior;
 mod pca;
 pub mod optimization;
 mod utils;
@@ -176,7 +178,16 @@ fn create_felsenstein_tree(
     N : usize,
 ) -> phylo_grad::FelsensteinTree<20> {
     let mut felsenstein = phylo_grad::FelsensteinTree::<20>::new(parents, distances);
+    felsenstein.bind_leaf_pl(leaf_partial_likelihoods(alignment, L, N));
+    felsenstein
+}
 
+/// One hot partial likelihoods of the leaves, [site][leaf]. Residues >= 20 are gaps and get all ones.
+fn leaf_partial_likelihoods(
+    alignment: &[u8],
+    L : usize,
+    N : usize,
+) -> Vec<Vec<phylo_grad::nalgebra::SVector<f64, 20>>> {
     let mut sites = vec![];
     sites.resize(L, vec![]);
     for site_idx in 0..L {
@@ -192,8 +203,7 @@ fn create_felsenstein_tree(
             }
         }
     }
-    felsenstein.bind_leaf_pl(sites);
-    felsenstein
+    sites
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
