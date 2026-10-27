@@ -61,11 +61,13 @@ pub struct HmcSettings {
     /// Number of (approximately independent) samples per site written to the npz file
     pub num_output_samples: usize,
     pub seed: u64,
+    /// Estimate the marginal likelihood of every site (see site_log_marginal)
+    pub marginal: bool,
 }
 
 impl HmcSettings {
     /// Reads MUTSEL_HMC_TUNE, MUTSEL_HMC_DRAWS, MUTSEL_HMC_ESS, MUTSEL_HMC_MAX_DRAWS,
-    /// MUTSEL_HMC_SAMPLES and MUTSEL_HMC_SEED from the environment.
+    /// MUTSEL_HMC_SAMPLES, MUTSEL_HMC_SEED and MUTSEL_HMC_MARGINAL (0 or 1) from the environment.
     pub fn from_env() -> HmcSettings {
         HmcSettings {
             num_tune: env_or("MUTSEL_HMC_TUNE", 400),
@@ -74,6 +76,7 @@ impl HmcSettings {
             max_draws: env_or("MUTSEL_HMC_MAX_DRAWS", 20000),
             num_output_samples: env_or("MUTSEL_HMC_SAMPLES", 100),
             seed: env_or("MUTSEL_HMC_SEED", 42),
+            marginal: env_or("MUTSEL_HMC_MARGINAL", 0u8) != 0,
         }
     }
 }
@@ -103,6 +106,197 @@ struct SharedModel {
     /// alpha / pi_reg
     prior_scale: SVector<f64, NUM_COMPONENTS>,
     prior_beta: SVector<f64, NUM_COMPONENTS>,
+    /// Replaces the generalized normal prior if set
+    mixture_prior: Option<Arc<MixturePrior>>,
+}
+
+/// Alternative priors on the pca coordinates, see MixturePrior::from_env
+pub enum MixturePrior {
+    Gaussian(GmmPrior),
+    Dirichlet(DirichletMixturePrior),
+}
+
+impl MixturePrior {
+    /// Reads MUTSEL_PRIOR_GMM (Gaussian mixture on the pca coordinates) or MUTSEL_PRIOR_DM
+    /// (Dirichlet mixture on the site frequencies), at most one of them may be set
+    pub fn from_env() -> Option<Arc<MixturePrior>> {
+        let gmm = std::env::var("MUTSEL_PRIOR_GMM").ok();
+        let dm = std::env::var("MUTSEL_PRIOR_DM").ok();
+        let prior = match (gmm, dm) {
+            (None, None) => return None,
+            (Some(path), None) => {
+                let prior = GmmPrior::read(Path::new(path.trim()))
+                    .unwrap_or_else(|e| panic!("Could not read MUTSEL_PRIOR_GMM={}: {}", path, e));
+                println!("MUTSEL HMC: Gaussian mixture prior with {} components from {}", prior.means.len(), path);
+                MixturePrior::Gaussian(prior)
+            }
+            (None, Some(path)) => {
+                let prior = DirichletMixturePrior::read(Path::new(path.trim()))
+                    .unwrap_or_else(|e| panic!("Could not read MUTSEL_PRIOR_DM={}: {}", path, e));
+                println!("MUTSEL HMC: Dirichlet mixture prior with {} components from {}", prior.alphas.len(), path);
+                MixturePrior::Dirichlet(prior)
+            }
+            (Some(_), Some(_)) => panic!("Only one of MUTSEL_PRIOR_GMM and MUTSEL_PRIOR_DM can be set"),
+        };
+        Some(Arc::new(prior))
+    }
+
+    /// Log density on the pca coordinates and its gradient
+    fn evaluate(
+        &self,
+        x: &SVector<f64, NUM_COMPONENTS>,
+        components: &SMatrix<f64, NUM_COMPONENTS, 20>,
+    ) -> (f64, SVector<f64, NUM_COMPONENTS>) {
+        match self {
+            MixturePrior::Gaussian(prior) => prior.evaluate(x),
+            MixturePrior::Dirichlet(prior) => prior.evaluate(x, components),
+        }
+    }
+}
+
+/// log Gamma(x) for x > 0 (Lanczos approximation, g = 7, relative error ~1e-15)
+fn ln_gamma(x: f64) -> f64 {
+    const COEFFICIENTS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        // Reflection formula
+        return (std::f64::consts::PI / (std::f64::consts::PI * x).sin()).ln() - ln_gamma(1.0 - x);
+    }
+    let x = x - 1.0;
+    let mut sum = COEFFICIENTS[0];
+    for (i, c) in COEFFICIENTS.iter().enumerate().skip(1) {
+        sum += c / (x + i as f64);
+    }
+    let t = x + 7.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + sum.ln()
+}
+
+/// Dirichlet mixture prior on the site frequencies, read from an npz file with weights [K] and alphas [K, 20].
+/// As a density on the pca coordinates (an orthonormal basis of the sum-zero log frequencies) it is
+/// sum_k w_k Dir(pi(x); alpha_k) * prod_i pi_i * sqrt(20).
+pub struct DirichletMixturePrior {
+    /// log weight + log Gamma(sum alpha) - sum log Gamma(alpha_i) + log(sqrt(20))
+    log_norm: Vec<f64>,
+    alphas: Vec<SVector<f64, 20>>,
+}
+
+impl DirichletMixturePrior {
+    pub fn read(path: &Path) -> Result<DirichletMixturePrior, candle_core::Error> {
+        let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
+        let get = |name: &str| {
+            arrays
+                .get(name)
+                .ok_or_else(|| candle_core::Error::Msg(format!("{} not found in {}", name, path.display())))
+        };
+        let weights = get("weights")?.to_dtype(candle_core::DType::F64)?.to_vec1::<f64>()?;
+        let alphas = get("alphas")?.to_dtype(candle_core::DType::F64)?.to_vec2::<f64>()?;
+        let mut prior = DirichletMixturePrior { log_norm: vec![], alphas: vec![] };
+        for (weight, alpha) in weights.iter().zip(&alphas) {
+            let alpha = SVector::<f64, 20>::from_column_slice(alpha);
+            prior.log_norm.push(
+                weight.ln() + ln_gamma(alpha.sum()) - alpha.iter().map(|&a| ln_gamma(a)).sum::<f64>() + 0.5 * 20f64.ln(),
+            );
+            prior.alphas.push(alpha);
+        }
+        Ok(prior)
+    }
+
+    fn evaluate(
+        &self,
+        x: &SVector<f64, NUM_COMPONENTS>,
+        components: &SMatrix<f64, NUM_COMPONENTS, 20>,
+    ) -> (f64, SVector<f64, NUM_COMPONENTS>) {
+        let unnormalized = components.transpose() * x;
+        let max = unnormalized.max();
+        let log_sum = unnormalized.map(|l| (l - max).exp()).sum().ln() + max;
+        let log_pi = unnormalized.add_scalar(-log_sum);
+        let pi = log_pi.map(f64::exp);
+        // The Jacobian prod_i pi_i adds 1 to every alpha
+        let log_densities: Vec<f64> = self
+            .log_norm
+            .iter()
+            .zip(&self.alphas)
+            .map(|(log_norm, alpha)| log_norm + alpha.dot(&log_pi))
+            .collect();
+        let max_density = log_densities.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut sum = 0.0;
+        let mut weighted_alpha = SVector::<f64, 20>::zeros();
+        for (log_density, alpha) in log_densities.iter().zip(&self.alphas) {
+            let r = (log_density - max_density).exp();
+            sum += r;
+            weighted_alpha += alpha * r;
+        }
+        weighted_alpha /= sum;
+        // d log pi_i / dx = components[:, i] - components * pi
+        let grad = components * (weighted_alpha - pi * weighted_alpha.sum());
+        (max_density + sum.ln(), grad)
+    }
+}
+
+/// Gaussian mixture prior on the pca coordinates, read from an npz file with
+/// weights [K], means [K, 19] and covs [K, 19, 19]
+pub struct GmmPrior {
+    /// log weight - log det(cov) / 2 - 19 log(2 pi) / 2
+    log_norm: Vec<f64>,
+    means: Vec<SVector<f64, NUM_COMPONENTS>>,
+    precisions: Vec<SMatrix<f64, NUM_COMPONENTS, NUM_COMPONENTS>>,
+}
+
+impl GmmPrior {
+    pub fn read(path: &Path) -> Result<GmmPrior, candle_core::Error> {
+        let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
+        let get = |name: &str| {
+            arrays
+                .get(name)
+                .ok_or_else(|| candle_core::Error::Msg(format!("{} not found in {}", name, path.display())))
+        };
+        let weights = get("weights")?.to_dtype(candle_core::DType::F64)?.to_vec1::<f64>()?;
+        let means = get("means")?.to_dtype(candle_core::DType::F64)?.to_vec2::<f64>()?;
+        let covs = get("covs")?.to_dtype(candle_core::DType::F64)?.to_vec3::<f64>()?;
+        let mut prior = GmmPrior { log_norm: vec![], means: vec![], precisions: vec![] };
+        for k in 0..weights.len() {
+            let cov = SMatrix::<f64, NUM_COMPONENTS, NUM_COMPONENTS>::from_row_iterator(covs[k].iter().flatten().copied());
+            let chol = cov
+                .cholesky()
+                .ok_or_else(|| candle_core::Error::Msg(format!("Covariance {} of the GMM prior is not positive definite", k)))?;
+            let log_det = 2.0 * chol.l().diagonal().map(f64::ln).sum();
+            prior.log_norm.push(
+                weights[k].ln() - 0.5 * log_det - 0.5 * NUM_COMPONENTS as f64 * (2.0 * std::f64::consts::PI).ln(),
+            );
+            prior.means.push(SVector::<f64, NUM_COMPONENTS>::from_column_slice(&means[k]));
+            prior.precisions.push(chol.inverse());
+        }
+        Ok(prior)
+    }
+
+    /// Log density and its gradient
+    fn evaluate(&self, x: &SVector<f64, NUM_COMPONENTS>) -> (f64, SVector<f64, NUM_COMPONENTS>) {
+        let mut log_densities = Vec::with_capacity(self.means.len());
+        let mut grads = Vec::with_capacity(self.means.len());
+        for k in 0..self.means.len() {
+            let grad = -(self.precisions[k] * (x - self.means[k]));
+            log_densities.push(self.log_norm[k] + 0.5 * (x - self.means[k]).dot(&grad));
+            grads.push(grad);
+        }
+        let max = log_densities.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut sum = 0.0;
+        let mut grad = SVector::<f64, NUM_COMPONENTS>::zeros();
+        for (log_density, g) in log_densities.iter().zip(&grads) {
+            let r = (log_density - max).exp();
+            sum += r;
+            grad += g * r;
+        }
+        (max + sum.ln(), grad / sum)
+    }
 }
 
 impl SharedModel {
@@ -122,11 +316,16 @@ impl SharedModel {
             prior_mean: to_vec(&pca.mean),
             prior_scale: to_vec(&pca.alpha) / pi_reg,
             prior_beta: to_vec(&pca.beta),
+            mixture_prior: None,
         }
     }
 }
 
 impl SharedModel {
+    fn with_mixture_prior(self, mixture_prior: Option<Arc<MixturePrior>>) -> SharedModel {
+        SharedModel { mixture_prior, ..self }
+    }
+
     /// Site frequencies for the given pca coordinates
     fn pi(&self, x: &SVector<f64, NUM_COMPONENTS>) -> (SVector<f64, 20>, SVector<f64, 20>) {
         let log_pi = self.components.transpose() * x;
@@ -140,12 +339,16 @@ impl SharedModel {
         // Generalized normal prior on the pca coordinates (negative of PCA::penalty_on_pca_coordinates)
         let mut log_prior = 0.0;
         let mut grad_log_prior = SVector::<f64, NUM_COMPONENTS>::zeros();
-        for k in 0..NUM_COMPONENTS {
-            let z = (x[k] - self.prior_mean[k]) / self.prior_scale[k];
-            let beta = self.prior_beta[k];
-            let abs_z_pow = z.abs().powf(beta - 1.0);
-            log_prior -= abs_z_pow * z.abs();
-            grad_log_prior[k] = -beta * abs_z_pow * z.signum() / self.prior_scale[k];
+        if let Some(mixture_prior) = &self.mixture_prior {
+            (log_prior, grad_log_prior) = mixture_prior.evaluate(x, &self.components);
+        } else {
+            for k in 0..NUM_COMPONENTS {
+                let z = (x[k] - self.prior_mean[k]) / self.prior_scale[k];
+                let beta = self.prior_beta[k];
+                let abs_z_pow = z.abs().powf(beta - 1.0);
+                log_prior -= abs_z_pow * z.abs();
+                grad_log_prior[k] = -beta * abs_z_pow * z.signum() / self.prior_scale[k];
+            }
         }
 
         // log_pi up to an additive constant, pi = softmax(log_pi)
@@ -304,6 +507,12 @@ struct SiteSamples {
     num_divergences: usize,
     step_size: f64,
     mean_num_steps: f64,
+    /// Mean and covariance of the draws in the first half of the chain, if settings.marginal
+    proposal: Option<(SVector<f64, NUM_COMPONENTS>, SMatrix<f64, NUM_COMPONENTS, NUM_COMPONENTS>)>,
+    /// Thinned draws from the second half of the chain, which are independent of the proposal
+    bridge_draws: Vec<SVector<f64, NUM_COMPONENTS>>,
+    /// Log marginal likelihood (log likelihood and log prior integrated over the pca coordinates), NaN if not estimated
+    log_marginal: f64,
 }
 
 /// Effective sample size of a single chain with Geyer's initial monotone sequence estimator.
@@ -416,6 +625,28 @@ fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index:
         thinned_draws.extend_from_slice(&draws[draw * NUM_COMPONENTS..(draw + 1) * NUM_COMPONENTS]);
     }
 
+    let mut proposal = None;
+    let mut bridge_draws = vec![];
+    if settings.marginal {
+        let first_half: Vec<_> = draws[..(num_draws / 2) * NUM_COMPONENTS]
+            .chunks_exact(NUM_COMPONENTS)
+            .map(SVector::<f64, NUM_COMPONENTS>::from_column_slice)
+            .collect();
+        let mean = first_half.iter().sum::<SVector<f64, NUM_COMPONENTS>>() / first_half.len() as f64;
+        let mut cov = SMatrix::<f64, NUM_COMPONENTS, NUM_COMPONENTS>::zeros();
+        for x in &first_half {
+            cov += (x - mean) * (x - mean).transpose();
+        }
+        cov /= (first_half.len() - 1) as f64;
+        proposal = Some((mean, cov));
+        for i in 0..settings.num_output_samples {
+            let draw = ((i + 1) * num_draws) / settings.num_output_samples - 1;
+            if draw >= num_draws / 2 {
+                bridge_draws.push(SVector::from_column_slice(&draws[draw * NUM_COMPONENTS..(draw + 1) * NUM_COMPONENTS]));
+            }
+        }
+    }
+
     let mut mean_pi = SVector::<f64, 20>::zeros();
     for draw in draws.chunks_exact(NUM_COMPONENTS) {
         mean_pi += shared.pi(&SVector::<f64, NUM_COMPONENTS>::from_column_slice(draw)).1;
@@ -430,7 +661,106 @@ fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index:
         num_divergences,
         step_size,
         mean_num_steps: num_steps as f64 / num_draws.max(1) as f64,
+        proposal,
+        bridge_draws,
+        log_marginal: f64::NAN,
     }
+}
+
+/// Number of draws from the Gaussian proposal of the marginal likelihood estimate
+const NUM_PROPOSAL_DRAWS: usize = 200;
+
+/// Log marginal likelihood of a site with bridge sampling (Meng & Wong 1996, as in the bridgesampling R package):
+/// a Gaussian fitted to the first half of the chain is bridged with the thinned draws of the second half.
+/// The proposal only has to overlap with this site's own posterior, so this works for any prior.
+fn site_log_marginal(logp: &mut SiteLogp, samples: &SiteSamples, seed: u64) -> f64 {
+    let (mean, cov) = samples.proposal.as_ref().unwrap();
+    // A small jitter keeps the proposal proper if a coordinate barely moved
+    let jitter = 1e-10 * cov.trace().max(1e-300) / NUM_COMPONENTS as f64;
+    let chol = match (cov + SMatrix::<f64, NUM_COMPONENTS, NUM_COMPONENTS>::identity() * jitter).cholesky() {
+        Some(chol) => chol,
+        None => return f64::NAN,
+    };
+    let l = chol.l();
+    let log_norm = -l.diagonal().map(f64::ln).sum() - 0.5 * NUM_COMPONENTS as f64 * (2.0 * std::f64::consts::PI).ln();
+    let log_proposal = |x: &SVector<f64, NUM_COMPONENTS>| {
+        let z = l.solve_lower_triangular(&(x - mean)).unwrap();
+        log_norm - 0.5 * z.norm_squared()
+    };
+    let mut gradient = vec![0.0; NUM_COMPONENTS];
+    let mut log_posterior = |x: &SVector<f64, NUM_COMPONENTS>| {
+        logp.logp(x.as_slice(), &mut gradient).unwrap_or(f64::NEG_INFINITY)
+    };
+
+    // Standard normal draws with Box-Muller
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut uniform = || ((nuts_rs::rand::Rng::next_u64(&mut rng) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+    let mut normal = SVector::<f64, NUM_COMPONENTS>::zeros();
+    let mut log_ratio_proposal = Vec::with_capacity(NUM_PROPOSAL_DRAWS);
+    for _ in 0..NUM_PROPOSAL_DRAWS {
+        for k in (0..NUM_COMPONENTS).step_by(2) {
+            let r = (-2.0 * uniform().ln()).sqrt();
+            let phi = 2.0 * std::f64::consts::PI * uniform();
+            normal[k] = r * phi.cos();
+            if k + 1 < NUM_COMPONENTS {
+                normal[k + 1] = r * phi.sin();
+            }
+        }
+        let x = mean + l * normal;
+        log_ratio_proposal.push(log_posterior(&x) - log_proposal(&x));
+    }
+    let log_ratio_posterior: Vec<f64> = samples
+        .bridge_draws
+        .iter()
+        .map(|x| log_posterior(x) - log_proposal(x))
+        .collect();
+    bridge_fixed_point(&log_ratio_posterior, &log_ratio_proposal)
+}
+
+fn log_sum_exp(values: impl Iterator<Item = f64> + Clone) -> f64 {
+    let max = values.clone().fold(f64::NEG_INFINITY, f64::max);
+    if max == f64::NEG_INFINITY {
+        return max;
+    }
+    max + values.map(|v| (v - max).exp()).sum::<f64>().ln()
+}
+
+/// log(a + b) for log a, log b
+fn log_add_exp(a: f64, b: f64) -> f64 {
+    let max = a.max(b);
+    if max == f64::NEG_INFINITY {
+        return max;
+    }
+    max + ((a - max).exp() + (b - max).exp()).ln()
+}
+
+/// Iterative optimal bridge estimate of log Z, given log(q / g) at the posterior draws (target q / Z)
+/// and at the proposal draws (normalized proposal g)
+fn bridge_fixed_point(log_ratio_posterior: &[f64], log_ratio_proposal: &[f64]) -> f64 {
+    let n1 = log_ratio_posterior.len() as f64;
+    let n2 = log_ratio_proposal.len() as f64;
+    if n1 == 0.0 {
+        return f64::NAN;
+    }
+    let log_s1 = (n1 / (n1 + n2)).ln();
+    let log_s2 = (n2 / (n1 + n2)).ln();
+    let mut sorted = log_ratio_posterior.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mut log_z = sorted[sorted.len() / 2];
+    for _ in 0..1000 {
+        let numerator = log_sum_exp(log_ratio_proposal.iter().map(|&l| l - log_add_exp(log_s1 + l, log_s2 + log_z))) - n2.ln();
+        let denominator = log_sum_exp(log_ratio_posterior.iter().map(|&l| -log_add_exp(log_s1 + l, log_s2 + log_z))) - n1.ln();
+        let next = numerator - denominator;
+        if !next.is_finite() {
+            return f64::NAN;
+        }
+        let converged = (next - log_z).abs() < 1e-10;
+        log_z = next;
+        if converged {
+            break;
+        }
+    }
+    log_z
 }
 
 fn leaf_partial_likelihoods(alignment: &[u8], site: usize, num_leaves: usize) -> Vec<SVector<f64, 20>> {
@@ -451,8 +781,15 @@ fn leaf_partial_likelihoods(alignment: &[u8], site: usize, num_leaves: usize) ->
 /// Settings of the Monte Carlo EM for Mu and the branch lengths
 #[derive(Debug, Clone, Copy)]
 pub struct EmSettings {
-    /// EM iterations (E-step and M-step) before the final sampling, 0 keeps the MAP Mu and branch lengths
+    /// Maximum number of EM iterations (E-step and M-step) before the final sampling, 0 keeps the MAP Mu and
+    /// branch lengths
     pub iterations: usize,
+    /// EM stops once the tree length changed by less than this fraction over the last `window` iterations,
+    /// 0 always runs all iterations
+    pub tree_length_tolerance: f64,
+    /// Number of iterations the tree length change is measured over. The tree length is noisy from iteration to
+    /// iteration because of the Monte Carlo E-step, but drifts slowly and steadily until EM has converged.
+    pub window: usize,
     /// Posterior samples per site the M-step averages the log likelihood over
     pub num_samples: usize,
     /// NUTS tuning draws per site in the first E-step
@@ -468,12 +805,14 @@ pub struct EmSettings {
 }
 
 impl EmSettings {
-    /// Reads MUTSEL_EM_ITERATIONS, MUTSEL_EM_SAMPLES, MUTSEL_EM_TUNE, MUTSEL_EM_RETUNE, MUTSEL_EM_MSTEP_ITERATIONS,
+    /// Reads MUTSEL_EM_ITERATIONS, MUTSEL_EM_TOL, MUTSEL_EM_WINDOW, MUTSEL_EM_SAMPLES, MUTSEL_EM_TUNE, MUTSEL_EM_RETUNE, MUTSEL_EM_MSTEP_ITERATIONS,
     /// MUTSEL_MAP_MIN_ITERATIONS, MUTSEL_MAP_MAX_ITERATIONS, MUTSEL_MAP_REL_IMPROVEMENT and MUTSEL_MAP_PI_REG
     /// from the environment.
     pub fn from_env() -> EmSettings {
         EmSettings {
-            iterations: env_or("MUTSEL_EM_ITERATIONS", 5),
+            iterations: env_or("MUTSEL_EM_ITERATIONS", 30),
+            tree_length_tolerance: env_or("MUTSEL_EM_TOL", 0.01),
+            window: env_or("MUTSEL_EM_WINDOW", 3),
             num_samples: env_or("MUTSEL_EM_SAMPLES", 8),
             num_tune: env_or("MUTSEL_EM_TUNE", 200),
             num_retune: env_or("MUTSEL_EM_RETUNE", 50),
@@ -494,6 +833,15 @@ impl EmSettings {
         }
     }
 
+    /// Relative change of the tree length over the last `window` iterations, None if there are not enough iterations
+    fn tree_length_change(&self, tree_lengths: &[f64]) -> Option<f64> {
+        let n = tree_lengths.len();
+        if self.window == 0 || n <= self.window {
+            return None;
+        }
+        Some((tree_lengths[n - 1] - tree_lengths[n - 1 - self.window]).abs() / tree_lengths[n - 1])
+    }
+
     /// NUTS settings of the E-step: about num_samples independent samples per site
     fn hmc_settings(&self, settings: &HmcSettings, iteration: usize) -> HmcSettings {
         HmcSettings {
@@ -503,6 +851,7 @@ impl EmSettings {
             max_draws: settings.max_draws,
             num_output_samples: self.num_samples,
             seed: settings.seed.wrapping_add(iteration as u64 + 1),
+            marginal: false,
         }
     }
 }
@@ -533,7 +882,16 @@ fn sample_sites(
                 leaf_pl: leaf_partial_likelihoods(alignment, site, num_leaves),
                 pl_buffer: vec![SVector::<f64, 20>::zeros(); num_nodes],
             };
-            let samples = sample_site(logp, &init[site], settings, site);
+            let mut samples = sample_site(logp, &init[site], settings, site);
+            if settings.marginal {
+                let mut logp = SiteLogp {
+                    shared: Arc::clone(shared),
+                    tree: Arc::clone(tree),
+                    leaf_pl: leaf_partial_likelihoods(alignment, site, num_leaves),
+                    pl_buffer: vec![SVector::<f64, 20>::zeros(); num_nodes],
+                };
+                samples.log_marginal = site_log_marginal(&mut logp, &samples, settings.seed ^ (site as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+            }
 
             let done = num_done.fetch_add(1, Ordering::Relaxed) + 1;
             if verbosity.should_print(Verbosity::Min) && (done % report_every == 0 || done == num_sites) {
@@ -709,17 +1067,55 @@ fn m_step(
     Ok(best_log_likelihood)
 }
 
-/// Samples the PCA coordinates of every site from its posterior and returns (S, sqrt_pi)
-/// evaluated at the posterior mean of the site frequencies.
-///
-/// Mu and the branch lengths start at the joint MAP estimate (optimization::map_estimate, which also
-/// gives the initial site positions) and are then refined with Monte Carlo EM: the E-step samples the sites
-/// given Mu and the branch lengths, the M-step maximizes the log likelihood averaged over these
-/// samples plus the log prior of Mu and the branch lengths. This converges to their MAP estimate with
-/// the site frequencies integrated out. The rate normalization is kept fixed within each iteration and
-/// afterwards reset to an average substitution rate of 1 over the posterior samples, rescaling the
-/// branch lengths so that the likelihood stays the same.
-pub fn sample_internal(
+/// Mu, the global rate normalization and the branch lengths the final sampling is conditioned on
+struct FittedModel {
+    Mu: Tensor,
+    rate_scaling: f64,
+    branch_lengths: Tensor,
+    /// Initial position of the final chain of every site
+    positions: Vec<Vec<f64>>,
+    init_pca_tensor: Tensor,
+    em_log_likelihood: Vec<f64>,
+    em_tree_length: Vec<f64>,
+}
+
+impl FittedModel {
+    /// Reads Mu, rate_scaling and branch_lengths of an earlier run (its .hmc.npz file), so its posterior can be
+    /// sampled again under a different prior. The chains start at the last sample of every site.
+    fn read(path: &Path, num_nodes: usize, num_sites: usize) -> Result<FittedModel, candle_core::Error> {
+        let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
+        let get = |name: &str| {
+            arrays
+                .get(name)
+                .cloned()
+                .ok_or_else(|| candle_core::Error::Msg(format!("{} not found in {}", name, path.display())))
+        };
+        let branch_lengths = get("branch_lengths")?;
+        let pca_samples = get("pca_samples")?;
+        if branch_lengths.dims() != [num_nodes] || pca_samples.dim(0)? != num_sites {
+            return Err(candle_core::Error::Msg(format!(
+                "{} does not match the tree ({} nodes) and alignment ({} sites)",
+                path.display(),
+                num_nodes,
+                num_sites
+            )));
+        }
+        let last = pca_samples.dim(1)? - 1;
+        println!("MUTSEL HMC: Mu, rate normalization and branch lengths fixed to the ones in {}, no MAP estimate and EM", path.display());
+        Ok(FittedModel {
+            Mu: get("Mu")?,
+            rate_scaling: get("rate_scaling")?.to_scalar::<f64>()?,
+            branch_lengths,
+            positions: pca_samples.narrow(1, last, 1)?.squeeze(1)?.to_vec2::<f64>()?,
+            init_pca_tensor: get("init_pca_coordinates")?,
+            em_log_likelihood: vec![],
+            em_tree_length: vec![],
+        })
+    }
+}
+
+/// Mu and the branch lengths from the MAP estimate refined with Monte Carlo EM, see sample_internal
+fn fit_with_em(
     parents: &[i32],
     branch_lengths: &[f64],
     alignment: &[u8],
@@ -729,31 +1125,11 @@ pub fn sample_internal(
     prior_R_file: Option<&Path>,
     verbosity: Verbosity,
     out_prefix: &str,
-) -> Result<(Tensor, Tensor), candle_core::Error> {
-    let settings = HmcSettings::from_env();
-    let em = EmSettings::from_env();
-    println!(
-        "MUTSEL HMC: sampling pca coordinates per site with NUTS ({} tuning, at least {} draws, until ESS >= {} or {} draws, {} thinned samples per site, seed {}), site rates 1",
-        settings.num_tune,
-        settings.num_draws,
-        settings.target_ess,
-        settings.max_draws,
-        settings.num_output_samples,
-        settings.seed
-    );
-    println!(
-        "MUTSEL HMC: Mu and branch lengths from the MAP estimate ({}-{} iterations, relative improvement {:.0e}) refined by {} Monte Carlo EM iterations ({} samples per site, {} tuning draws in the first and {} in later iterations, at most {} M-step iterations)",
-        em.map_convergence.min_iterations,
-        em.map_convergence.max_iterations,
-        em.map_convergence.min_rel_improvement,
-        em.iterations,
-        em.num_samples,
-        em.num_tune,
-        em.num_retune,
-        em.max_mstep_iterations
-    );
-    assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
-
+    settings: &HmcSettings,
+    em: &EmSettings,
+    pca: &Arc<PCA>,
+    mixture_prior: &Option<Arc<MixturePrior>>,
+) -> Result<FittedModel, candle_core::Error> {
     // Start at the joint MAP estimate of Mu, the site frequencies and the branch lengths,
     // the same estimate as optimization::optimize_internal with the default settings
     let felsenstein = crate::create_felsenstein_tree(parents, branch_lengths, alignment, num_sites, num_leaves);
@@ -780,7 +1156,6 @@ pub fn sample_internal(
     let log_branch_lengths = Var::from_tensor(map.log_branch_lengths.as_tensor())?;
     let edge_op = map.felsenstein_op.clone();
 
-    let pca = Arc::new(PCA::new(NUM_COMPONENTS));
     let init_pca_tensor = map.pca_coordinates.as_tensor().copy()?;
     let init_log_pi = pca.pca_coordinates_to_log_freq(&init_pca_tensor);
 
@@ -800,9 +1175,9 @@ pub fn sample_internal(
     let mut em_log_likelihood = Vec::with_capacity(em.iterations);
     let mut em_tree_length = Vec::with_capacity(em.iterations);
     for iteration in 0..em.iterations {
-        let label = format!("EM iteration {}/{}", iteration + 1, em.iterations);
+        let label = format!("EM iteration {}", iteration + 1);
         let old_Mu = Mu(log_R.as_tensor()).detach();
-        let shared = Arc::new(SharedModel::new(&old_Mu, rate_scaling, &pca, mutsel_params.pi_reg));
+        let shared = Arc::new(SharedModel::new(&old_Mu, rate_scaling, pca, mutsel_params.pi_reg).with_mixture_prior(mixture_prior.clone()));
         let tree = Arc::new(FelsensteinTree::<20>::new(
             parents,
             &log_branch_lengths.exp()?.to_vec1::<f64>()?,
@@ -817,7 +1192,7 @@ pub fn sample_internal(
             .map(|s| s.thinned_draws[last..last + NUM_COMPONENTS].to_vec())
             .collect();
 
-        let log_pi_samples = thinned_log_pi(&site_samples, em.num_samples, &pca)?;
+        let log_pi_samples = thinned_log_pi(&site_samples, em.num_samples, pca)?;
         drop(site_samples);
         let log_likelihood = m_step(
             &edge_op,
@@ -853,11 +1228,110 @@ pub fn sample_internal(
                 max_rel_Mu_change
             );
         }
+        if let Some(change) = em.tree_length_change(&em_tree_length) {
+            if change < em.tree_length_tolerance {
+                println!(
+                    "MUTSEL HMC: EM converged after {} iterations, tree length changed by {:.2}% over the last {} iterations",
+                    iteration + 1,
+                    100.0 * change,
+                    em.window
+                );
+                break;
+            }
+        }
+        if iteration + 1 == em.iterations && em.tree_length_tolerance > 0.0 {
+            println!("MUTSEL HMC: WARNING: EM stopped after the maximum of {} iterations without converging", em.iterations);
+        }
     }
 
-    let Mu = Mu(log_R.as_tensor()).detach();
-    let shared = Arc::new(SharedModel::new(&Mu, rate_scaling, &pca, mutsel_params.pi_reg));
-    let branch_lengths = log_branch_lengths.exp()?;
+    Ok(FittedModel {
+        Mu: Mu(log_R.as_tensor()).detach(),
+        rate_scaling,
+        branch_lengths: log_branch_lengths.exp()?,
+        positions,
+        init_pca_tensor,
+        em_log_likelihood,
+        em_tree_length,
+    })
+}
+
+/// Samples the PCA coordinates of every site from its posterior and returns (S, sqrt_pi)
+/// evaluated at the posterior mean of the site frequencies.
+///
+/// Mu and the branch lengths start at the joint MAP estimate (optimization::map_estimate, which also
+/// gives the initial site positions) and are then refined with Monte Carlo EM: the E-step samples the sites
+/// given Mu and the branch lengths, the M-step maximizes the log likelihood averaged over these
+/// samples plus the log prior of Mu and the branch lengths. This converges to their MAP estimate with
+/// the site frequencies integrated out. The rate normalization is kept fixed within each iteration and
+/// afterwards reset to an average substitution rate of 1 over the posterior samples, rescaling the
+/// branch lengths so that the likelihood stays the same.
+pub fn sample_internal(
+    parents: &[i32],
+    branch_lengths: &[f64],
+    alignment: &[u8],
+    num_sites: usize,
+    num_leaves: usize,
+    mutsel_params: MutselParams,
+    prior_R_file: Option<&Path>,
+    verbosity: Verbosity,
+    out_prefix: &str,
+) -> Result<(Tensor, Tensor), candle_core::Error> {
+    let settings = HmcSettings::from_env();
+    let em = EmSettings::from_env();
+    println!(
+        "MUTSEL HMC: sampling pca coordinates per site with NUTS ({} tuning, at least {} draws, until ESS >= {} or {} draws, {} thinned samples per site, seed {}), site rates 1",
+        settings.num_tune,
+        settings.num_draws,
+        settings.target_ess,
+        settings.max_draws,
+        settings.num_output_samples,
+        settings.seed
+    );
+    println!(
+        "MUTSEL HMC: Mu and branch lengths from the MAP estimate ({}-{} iterations, relative improvement {:.0e}) refined by Monte Carlo EM until the tree length changes by less than {:.1}% over {} iterations, at most {} iterations ({} samples per site, {} tuning draws in the first and {} in later iterations, at most {} M-step iterations)",
+        em.map_convergence.min_iterations,
+        em.map_convergence.max_iterations,
+        em.map_convergence.min_rel_improvement,
+        100.0 * em.tree_length_tolerance,
+        em.window,
+        em.iterations,
+        em.num_samples,
+        em.num_tune,
+        em.num_retune,
+        em.max_mstep_iterations
+    );
+    assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
+
+    let pca = Arc::new(PCA::new(NUM_COMPONENTS));
+    let mixture_prior = MixturePrior::from_env();
+    let fitted = match std::env::var("MUTSEL_FIXED_MODEL") {
+        Ok(path) => FittedModel::read(Path::new(path.trim()), parents.len(), num_sites)?,
+        Err(_) => fit_with_em(
+            parents,
+            branch_lengths,
+            alignment,
+            num_sites,
+            num_leaves,
+            mutsel_params,
+            prior_R_file,
+            verbosity,
+            out_prefix,
+            &settings,
+            &em,
+            &pca,
+            &mixture_prior,
+        )?,
+    };
+    let FittedModel {
+        Mu,
+        rate_scaling,
+        branch_lengths,
+        positions,
+        init_pca_tensor,
+        em_log_likelihood,
+        em_tree_length,
+    } = fitted;
+    let shared = Arc::new(SharedModel::new(&Mu, rate_scaling, &pca, mutsel_params.pi_reg).with_mixture_prior(mixture_prior));
     let tree = Arc::new(FelsensteinTree::<20>::new(parents, &branch_lengths.to_vec1::<f64>()?));
     let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &settings, verbosity, "final");
     let rate_scaling = tensor_full(rate_scaling, &[]);
@@ -949,6 +1423,11 @@ pub fn sample_internal(
                 "mean_num_steps",
                 &Tensor::from_iter(site_samples.iter().map(|s| s.mean_num_steps), &candle_core::Device::Cpu)?,
             ),
+            (
+                "log_marginal",
+                &Tensor::from_iter(site_samples.iter().map(|s| s.log_marginal), &candle_core::Device::Cpu)?,
+            ),
+            ("parents", &Tensor::from_iter(parents.iter().map(|&p| p as f64), &candle_core::Device::Cpu)?),
         ],
         Path::new(&npz_path),
     )?;
@@ -1237,6 +1716,142 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gmm_prior_gradient_matches_finite_differences() {
+        let mut prior = GmmPrior { log_norm: vec![], means: vec![], precisions: vec![] };
+        for k in 0..3 {
+            let a = SMatrix::<f64, NUM_COMPONENTS, NUM_COMPONENTS>::from_fn(|i, j| ((i * 7 + j * 3 + k) % 5) as f64 * 0.1);
+            prior.precisions.push(a * a.transpose() + SMatrix::identity());
+            prior.means.push(SVector::from_fn(|i, _| (i + k) as f64 * 0.1));
+            prior.log_norm.push(-(k as f64));
+        }
+        let x = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
+        let (_, grad) = prior.evaluate(&x);
+        let h = 1e-5;
+        for k in 0..NUM_COMPONENTS {
+            let mut e = SVector::<f64, NUM_COMPONENTS>::zeros();
+            e[k] = h;
+            let fd = (prior.evaluate(&(x + e)).0 - prior.evaluate(&(x - e)).0) / (2.0 * h);
+            assert!((fd - grad[k]).abs() < 1e-6 * (1.0 + grad[k].abs()), "{} {} {}", k, fd, grad[k]);
+        }
+    }
+
+    #[test]
+    fn ln_gamma_matches_known_values() {
+        for (x, expected) in [
+            (0.1, 2.252712651734206),
+            (0.5, 0.5723649429247001),
+            (1.0, 0.0),
+            (3.7, 1.428072326665388),
+            (50.0, 144.56574394634487),
+        ] {
+            assert!((ln_gamma(x) - expected).abs() < 1e-12 * (1.0 + expected.abs()), "{} {}", x, ln_gamma(x));
+        }
+    }
+
+    #[test]
+    fn dirichlet_prior_gradient_matches_finite_differences() {
+        let mut prior = DirichletMixturePrior { log_norm: vec![], alphas: vec![] };
+        for k in 0..3 {
+            prior.alphas.push(SVector::from_fn(|i, _| 0.05 + ((i * 7 + k * 3) % 11) as f64 * 0.3));
+            prior.log_norm.push(-(k as f64));
+        }
+        let model = SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG);
+        let x = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
+        let (_, grad) = prior.evaluate(&x, &model.components);
+        let h = 1e-5;
+        for k in 0..NUM_COMPONENTS {
+            let mut e = SVector::<f64, NUM_COMPONENTS>::zeros();
+            e[k] = h;
+            let fd = (prior.evaluate(&(x + e), &model.components).0 - prior.evaluate(&(x - e), &model.components).0)
+                / (2.0 * h);
+            assert!((fd - grad[k]).abs() < 1e-6 * (1.0 + grad[k].abs()), "{} {} {}", k, fd, grad[k]);
+        }
+    }
+
+    /// The bridge estimate of the marginal likelihood of a site against brute force Monte Carlo from a Gaussian prior
+    #[test]
+    fn site_log_marginal_matches_prior_monte_carlo() {
+        let mean = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
+        let std = 0.7;
+        let prior = GmmPrior {
+            log_norm: vec![-(NUM_COMPONENTS as f64) * (std as f64).ln() - 0.5 * NUM_COMPONENTS as f64 * (2.0 * std::f64::consts::PI).ln()],
+            means: vec![mean],
+            precisions: vec![SMatrix::identity() / (std * std)],
+        };
+        let shared = Arc::new(
+            SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)
+                .with_mixture_prior(Some(Arc::new(MixturePrior::Gaussian(prior)))),
+        );
+        let logp = || {
+            let mut logp = test_logp();
+            logp.shared = Arc::clone(&shared);
+            logp
+        };
+        let settings = HmcSettings {
+            num_tune: 400,
+            num_draws: 500,
+            target_ess: 200,
+            max_draws: 20000,
+            num_output_samples: 100,
+            seed: 3,
+            marginal: true,
+        };
+        // A single estimate has a standard deviation of about 0.1, so the bias is checked with the average of several chains
+        let num_chains = 8;
+        let estimate = (0..num_chains)
+            .map(|seed| {
+                let samples = sample_site(logp(), mean.as_slice(), &HmcSettings { seed, ..settings }, 0);
+                site_log_marginal(&mut logp(), &samples, seed)
+            })
+            .sum::<f64>()
+            / num_chains as f64;
+
+        // log E_prior[likelihood]
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let mut uniform = || ((nuts_rs::rand::Rng::next_u64(&mut rng) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+        let mut tree_logp = logp();
+        let mut log_likelihoods = vec![];
+        let mut gradient = vec![0.0; NUM_COMPONENTS];
+        for _ in 0..1 << 17 {
+            let x = SVector::<f64, NUM_COMPONENTS>::from_fn(|_, _| {
+                (-2.0 * uniform().ln()).sqrt() * (2.0 * std::f64::consts::PI * uniform()).cos() * std
+            }) + mean;
+            let eval = shared.evaluate(&x);
+            log_likelihoods.push(tree_logp.logp(x.as_slice(), &mut gradient).unwrap() - eval.log_prior);
+        }
+        let reference = log_sum_exp(log_likelihoods.iter().copied()) - (log_likelihoods.len() as f64).ln();
+        println!("bridge {:.4}, prior Monte Carlo {:.4}", estimate, reference);
+        assert!((estimate - reference).abs() < 0.06, "bridge {} vs Monte Carlo {}", estimate, reference);
+    }
+
+    #[test]
+    fn bridge_fixed_point_recovers_normalization_of_a_gaussian() {
+        // Target q = exp(c) * N(0, 1) in one dimension, proposal g = N(0.3, 1.2^2)
+        let c = 2.5;
+        let log_n = |x: f64, m: f64, s: f64| -0.5 * ((x - m) / s).powi(2) - s.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln();
+        let quantiles = |n: usize, m: f64, s: f64| -> Vec<f64> {
+            // Deterministic stratified "draws" through the inverse CDF of a logistic approximation
+            (0..n).map(|i| m + s * 0.5513 * (((i as f64 + 0.5) / n as f64) / (1.0 - (i as f64 + 0.5) / n as f64)).ln()).collect()
+        };
+        let posterior = quantiles(2000, 0.0, 1.0);
+        let proposal = quantiles(2000, 0.3, 1.2);
+        let lr = |x: &f64| c + log_n(*x, 0.0, 1.0) - log_n(*x, 0.3, 1.2);
+        let log_z = bridge_fixed_point(&posterior.iter().map(lr).collect::<Vec<_>>(), &proposal.iter().map(lr).collect::<Vec<_>>());
+        assert!((log_z - c).abs() < 0.02, "{}", log_z);
+    }
+
+    #[test]
+    fn em_stops_on_the_tree_length_change_over_the_window() {
+        let em = EmSettings { tree_length_tolerance: 0.01, window: 3, ..EmSettings::from_env() };
+        // Tree lengths of the 32066 convergence test, iterations 10 to 16: stops at the last one
+        let tree_lengths = [6.8612, 6.9200, 6.8612, 6.7914, 6.7559, 6.7526, 6.7588];
+        let first_stop = (1..=tree_lengths.len())
+            .find(|&n| em.tree_length_change(&tree_lengths[..n]).is_some_and(|c| c < em.tree_length_tolerance));
+        assert_eq!(first_stop, Some(7));
+        assert_eq!(em.tree_length_change(&tree_lengths[..3]), None);
+    }
+
     /// Full gradient including phylo_grad against a fourth order central difference
     #[test]
     fn full_gradient_matches_fourth_order_finite_differences() {
@@ -1273,6 +1888,73 @@ mod tests {
             logp.logp(&x, &mut grad).unwrap();
         }
         println!("logp+grad: {:.1} us", start.elapsed().as_secs_f64() * 1e6 / n as f64);
+    }
+
+    /// Timing of the parts of logp on a random binary tree with 100 leaves
+    #[test]
+    #[ignore]
+    fn logp_timing_100_leaves() {
+        let num_leaves = 100;
+        let mut state = 1u64;
+        let mut uniform = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        // Random topology by joining random pairs of the remaining subtrees
+        let mut parents = vec![-1i32; 2 * num_leaves - 1];
+        let mut open: Vec<usize> = (0..num_leaves).collect();
+        let mut next = num_leaves;
+        while open.len() > 1 {
+            let a = open.swap_remove((uniform() * open.len() as f64) as usize);
+            let b = open.swap_remove((uniform() * open.len() as f64) as usize);
+            parents[a] = next as i32;
+            parents[b] = next as i32;
+            open.push(next);
+            next += 1;
+        }
+        let branch_lengths: Vec<f64> = (0..parents.len()).map(|_| 0.01 + 0.29 * uniform()).collect();
+        let alignment: Vec<u8> = (0..num_leaves).map(|i| [0u8, 3, 3, 7, 20][i % 5]).collect();
+        let mut logp = SiteLogp {
+            shared: Arc::new(SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)),
+            tree: Arc::new(FelsensteinTree::<20>::new(&parents, &branch_lengths)),
+            leaf_pl: leaf_partial_likelihoods(&alignment, 0, num_leaves),
+            pl_buffer: vec![SVector::<f64, 20>::zeros(); parents.len()],
+        };
+        let x = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
+        let mut grad = vec![0.0; NUM_COMPONENTS];
+        let n = 5000;
+        let time = |f: &mut dyn FnMut()| {
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            start.elapsed().as_secs_f64() * 1e6 / n as f64
+        };
+        let total = time(&mut || {
+            logp.logp(x.as_slice(), &mut grad).unwrap();
+        });
+        let model = Arc::clone(&logp.shared);
+        let eval = model.evaluate(&x);
+        let evaluate = time(&mut || {
+            std::hint::black_box(model.evaluate(&x));
+        });
+        let tree = Arc::clone(&logp.tree);
+        let mut pl = logp.pl_buffer.clone();
+        pl[..num_leaves].copy_from_slice(&logp.leaf_pl);
+        let felsenstein = time(&mut || {
+            std::hint::black_box(tree.calculate_gradients_single_side(eval.S.as_view(), eval.sqrt_pi.as_view(), &mut pl));
+        });
+        let likelihood_only = time(&mut || {
+            std::hint::black_box(tree.calculate_likelihood_single_side(eval.S.as_view(), eval.sqrt_pi.as_view(), &mut pl));
+        });
+        let result = tree.calculate_gradients_single_side(eval.S.as_view(), eval.sqrt_pi.as_view(), &mut pl);
+        let backpropagate = time(&mut || {
+            std::hint::black_box(model.backpropagate(&eval, &result.grad_s, &result.grad_sqrt_pi));
+        });
+        println!(
+            "100 leaves: logp+grad {:.1} us = evaluate {:.1} + phylo_grad {:.1} (likelihood only {:.1}) + backpropagate {:.1}",
+            total, evaluate, felsenstein, likelihood_only, backpropagate
+        );
     }
 }
 
