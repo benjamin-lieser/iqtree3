@@ -313,6 +313,7 @@ if (USE_MUTSEL STREQUAL "ON")
         BUILD_BYPRODUCTS "${MUTSEL_RUST_LIB_PATH}"
         INSTALL_COMMAND ""  # No install step for Rust
         BUILD_IN_SOURCE 1  # Build in source directory
+        BUILD_ALWAYS 1  # Let cargo decide whether the Rust sources changed
         LOG_BUILD ON
         LOG_OUTPUT_ON_FAILURE ON
     )
