@@ -145,8 +145,9 @@ fn parse_mutsel_str(model_str: &str) -> MutselParams {
     let model_upper = model_str.to_ascii_uppercase();
 
     // site_rate_reg is still parsed for compatibility, but site rates are fixed to 1.
+    // The branch lengths are not penalized by default, the penalty shrank long branches.
     let (pi_reg, Mu_reg, _site_rate_reg, branch_length_reg) = if model_upper == "MUTSEL" {
-        (0.32, 9.67, 2.0, 10.0)
+        (0.32, 9.67, 2.0, 0.0)
     } else if model_upper.starts_with("MUTSEL{") && model_str.ends_with('}') {
         let params_str = &model_str[7..model_str.len() - 1];
         let values = params_str

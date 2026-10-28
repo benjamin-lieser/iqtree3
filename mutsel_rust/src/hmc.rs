@@ -334,6 +334,23 @@ impl SharedModel {
         (log_pi, unnormalized_pi / unnormalized_pi.sum())
     }
 
+    /// S (upper triangle) and sqrt_pi for log frequencies up to a constant
+    fn rate_matrix(&self, log_pi: &SVector<f64, 20>) -> (SMatrix<f64, 20, 20>, SVector<f64, 20>) {
+        let max_log_pi = log_pi.max();
+        let unnormalized_pi = log_pi.map(|l| (l - max_log_pi).exp());
+        let sqrt_pi = (unnormalized_pi / unnormalized_pi.sum()).map(f64::sqrt);
+        let fitness = log_pi - self.log_mutation_equilibrium;
+        let mut S = SMatrix::<f64, 20, 20>::zeros();
+        for i in 0..20 {
+            for j in (i + 1)..20 {
+                S[(i, j)] = self.scaled_Mu[(i, j)]
+                    * (0.5 * (log_pi[i] - log_pi[j])).exp()
+                    * fixation(fitness[j] - fitness[i]);
+            }
+        }
+        (S, sqrt_pi)
+    }
+
     /// Log prior, S and sqrt_pi for the pca coordinates x
     fn evaluate(&self, x: &SVector<f64, NUM_COMPONENTS>) -> SiteModelEval {
         // Generalized normal prior on the pca coordinates (negative of PCA::penalty_on_pca_coordinates)
@@ -1081,6 +1098,97 @@ fn m_step(
     Ok(best_log_likelihood)
 }
 
+/// Writes the log likelihood of every draw ([num_sites, num_draws] as draw_log_likelihood) and of the given
+/// frequencies (mean_pi_log_likelihood [num_sites]) on this tree and alignment to path
+fn write_draw_log_likelihoods(
+    path: &str,
+    shared: &Arc<SharedModel>,
+    tree: &Arc<FelsensteinTree<20>>,
+    alignment: &[u8],
+    num_leaves: usize,
+    draws: &[Vec<f64>],
+    mean_pi: &[SVector<f64, 20>],
+) -> Result<(), candle_core::Error> {
+    let num_sites = draws.len();
+    let num_draws = draws[0].len() / NUM_COMPONENTS;
+    let num_nodes = tree.num_nodes();
+    let (draw_ll, mean_ll): (Vec<Vec<f64>>, Vec<f64>) = (0..num_sites)
+        .into_par_iter()
+        .map(|site| {
+            let leaf_pl = leaf_partial_likelihoods(alignment, site, num_leaves);
+            let mut pl = vec![SVector::<f64, 20>::zeros(); num_nodes];
+            let mut log_likelihood = |S: &SMatrix<f64, 20, 20>, sqrt_pi: &SVector<f64, 20>| {
+                pl[..num_leaves].copy_from_slice(&leaf_pl);
+                tree.calculate_likelihood_single_side(S.as_view(), sqrt_pi.as_view(), &mut pl)
+            };
+            let draw_ll = draws[site]
+                .chunks_exact(NUM_COMPONENTS)
+                .map(|x| {
+                    let eval = shared.evaluate(&SVector::<f64, NUM_COMPONENTS>::from_column_slice(x));
+                    log_likelihood(&eval.S, &eval.sqrt_pi)
+                })
+                .collect();
+            let (S, sqrt_pi) = shared.rate_matrix(&mean_pi[site].map(f64::ln));
+            (draw_ll, log_likelihood(&S, &sqrt_pi))
+        })
+        .unzip();
+    Tensor::write_npz(
+        &[
+            (
+                "draw_log_likelihood",
+                &Tensor::from_vec(draw_ll.concat(), &[num_sites, num_draws], &candle_core::Device::Cpu)?,
+            ),
+            ("mean_pi_log_likelihood", &Tensor::from_vec(mean_ll, &[num_sites], &candle_core::Device::Cpu)?),
+        ],
+        Path::new(path),
+    )?;
+    println!("MUTSEL HMC: log likelihoods of the draws written to {}", path);
+    Ok(())
+}
+
+/// MUTSEL_EVAL_SAMPLES: no sampling, the draws (pca_samples) and posterior mean frequencies (mean_pi) of an
+/// earlier run, e.g. on a subset of the taxa, are evaluated on this tree and alignment (written to
+/// <out_prefix>.draw_ll.npz). Returns the model at those posterior mean frequencies.
+fn evaluate_samples(
+    path: &Path,
+    shared: &Arc<SharedModel>,
+    tree: &Arc<FelsensteinTree<20>>,
+    alignment: &[u8],
+    num_sites: usize,
+    num_leaves: usize,
+    Mu: &Tensor,
+    rate_scaling: f64,
+    out_prefix: &str,
+) -> Result<(Tensor, Tensor), candle_core::Error> {
+    let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
+    let get = |name: &str| {
+        arrays
+            .get(name)
+            .cloned()
+            .ok_or_else(|| candle_core::Error::Msg(format!("{} not found in {}", name, path.display())))
+    };
+    let pca_samples = get("pca_samples")?;
+    let mean_pi = get("mean_pi")?;
+    if pca_samples.dim(0)? != num_sites {
+        return Err(candle_core::Error::Msg(format!("{} does not have {} sites", path.display(), num_sites)));
+    }
+    println!("MUTSEL HMC: evaluating the draws in {} on this tree and alignment, no sampling", path.display());
+    let draws: Vec<Vec<f64>> = (0..num_sites)
+        .map(|site| pca_samples.get(site)?.flatten_all()?.to_vec1::<f64>())
+        .collect::<Result<_, _>>()?;
+    let mean_pi_rows = batch::rows_from_tensor(&mean_pi)?;
+    write_draw_log_likelihoods(
+        &format!("{}.draw_ll.npz", out_prefix),
+        shared,
+        tree,
+        alignment,
+        num_leaves,
+        &draws,
+        &mean_pi_rows,
+    )?;
+    Ok(calc_rate_matrix(Mu, &mean_pi.log()?, &tensor_full(rate_scaling, &[])))
+}
+
 /// Mu, the global rate normalization and the branch lengths the final sampling is conditioned on
 struct FittedModel {
     Mu: Tensor,
@@ -1096,7 +1204,13 @@ struct FittedModel {
 impl FittedModel {
     /// Reads Mu, rate_scaling and branch_lengths of an earlier run (its .hmc.npz file), so its posterior can be
     /// sampled again under a different prior. The chains start at the last sample of every site.
-    fn read(path: &Path, num_nodes: usize, num_sites: usize) -> Result<FittedModel, candle_core::Error> {
+    /// With tree_branch_lengths the branch lengths are these instead, e.g. those of a tree with fewer taxa.
+    fn read(
+        path: &Path,
+        num_nodes: usize,
+        num_sites: usize,
+        tree_branch_lengths: Option<&[f64]>,
+    ) -> Result<FittedModel, candle_core::Error> {
         let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
         let get = |name: &str| {
             arrays
@@ -1104,7 +1218,10 @@ impl FittedModel {
                 .cloned()
                 .ok_or_else(|| candle_core::Error::Msg(format!("{} not found in {}", name, path.display())))
         };
-        let branch_lengths = get("branch_lengths")?;
+        let branch_lengths = match tree_branch_lengths {
+            Some(lengths) => Tensor::from_slice(lengths, &[lengths.len()], &candle_core::Device::Cpu)?,
+            None => get("branch_lengths")?,
+        };
         let pca_samples = get("pca_samples")?;
         if branch_lengths.dims() != [num_nodes] || pca_samples.dim(0)? != num_sites {
             return Err(candle_core::Error::Msg(format!(
@@ -1115,7 +1232,11 @@ impl FittedModel {
             )));
         }
         let last = pca_samples.dim(1)? - 1;
-        println!("MUTSEL HMC: Mu, rate normalization and branch lengths fixed to the ones in {}, no MAP estimate and EM", path.display());
+        if tree_branch_lengths.is_some() {
+            println!("MUTSEL HMC: Mu and rate normalization fixed to the ones in {}, branch lengths of the input tree, no MAP estimate and EM", path.display());
+        } else {
+            println!("MUTSEL HMC: Mu, rate normalization and branch lengths fixed to the ones in {}, no MAP estimate and EM", path.display());
+        }
         Ok(FittedModel {
             Mu: get("Mu")?,
             rate_scaling: get("rate_scaling")?.to_scalar::<f64>()?,
@@ -1330,7 +1451,11 @@ pub fn sample_internal(
     let pca = Arc::new(PCA::new(NUM_COMPONENTS));
     let mixture_prior = MixturePrior::from_env();
     let fitted = match std::env::var("MUTSEL_FIXED_MODEL") {
-        Ok(path) => FittedModel::read(Path::new(path.trim()), parents.len(), num_sites)?,
+        Ok(path) => {
+            // MUTSEL_FIXED_BRANCH_LENGTHS=tree keeps the branch lengths of the input tree
+            let tree_lengths = std::env::var("MUTSEL_FIXED_BRANCH_LENGTHS").map_or(false, |v| v.trim() == "tree");
+            FittedModel::read(Path::new(path.trim()), parents.len(), num_sites, tree_lengths.then_some(branch_lengths))?
+        }
         Err(_) => fit_with_em(
             parents,
             branch_lengths,
@@ -1358,6 +1483,9 @@ pub fn sample_internal(
     } = fitted;
     let shared = Arc::new(SharedModel::new(&Mu, rate_scaling, &pca, mutsel_params.pi_reg).with_mixture_prior(mixture_prior));
     let tree = Arc::new(FelsensteinTree::<20>::new(parents, &branch_lengths.to_vec1::<f64>()?));
+    if let Ok(path) = std::env::var("MUTSEL_EVAL_SAMPLES") {
+        return evaluate_samples(Path::new(path.trim()), &shared, &tree, alignment, num_sites, num_leaves, &Mu, rate_scaling, out_prefix);
+    }
     let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &settings, verbosity, "final");
     let rate_scaling = tensor_full(rate_scaling, &[]);
 
@@ -1458,6 +1586,23 @@ pub fn sample_internal(
     )?;
     println!("MUTSEL HMC: samples written to {}", npz_path);
 
+    // MUTSEL_HMC_DRAW_LL=1: log likelihood of every written draw and of the posterior mean frequencies
+    if env_or("MUTSEL_HMC_DRAW_LL", 0u8) != 0 {
+        let draws: Vec<Vec<f64>> = (0..num_sites)
+            .map(|site| pca_samples.get(site)?.flatten_all()?.to_vec1::<f64>())
+            .collect::<Result<_, _>>()?;
+        let mean_pi_rows = batch::rows_from_tensor(&mean_pi)?;
+        write_draw_log_likelihoods(
+            &format!("{}.draw_ll.npz", out_prefix),
+            &shared,
+            &tree,
+            alignment,
+            num_leaves,
+            &draws,
+            &mean_pi_rows,
+        )?;
+    }
+
     if num_tree_draws == 1 {
         return Ok((S, sqrt_pi));
     }
@@ -1548,6 +1693,17 @@ mod tests {
                 ref_grad[i]
             );
         }
+    }
+
+    #[test]
+    fn rate_matrix_matches_evaluate() {
+        let logp = test_logp();
+        let x = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
+        let eval = logp.shared.evaluate(&x);
+        // log_pi up to a constant
+        let (S, sqrt_pi) = logp.shared.rate_matrix(&(logp.shared.components.transpose() * x).add_scalar(0.7));
+        assert!((S - eval.S).abs().max() < 1e-13 * eval.S.abs().max());
+        assert!((sqrt_pi - eval.sqrt_pi).abs().max() < 1e-14);
     }
 
     #[test]
