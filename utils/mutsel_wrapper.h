@@ -35,6 +35,7 @@ extern "C" void rust_mutsel(int32_t *parents,
                             const char *priorMuFile,
                             const char *priorPiFile,
                             uint8_t verbose,
+                            uint32_t num_tree_draws,
                             double *out_site_freq,
                             double *out_R_matrices,
                             const char *output_prefix);
@@ -51,6 +52,7 @@ void rust_mutsel(int32_t *parents,
                  const char *priorMuFile,
                  const char *priorPiFile,
                  uint8_t verbose,
+                 uint32_t num_tree_draws,
                  double *out_site_freq,
                  double *out_R_matrices,
                  const char *output_prefix);
@@ -67,8 +69,9 @@ std::string read_binary_site_model_file_internal(std::string &filename, std::vec
 /**
  * Takes the data from the file (or the rust_mutsel function) and updates the alignment object.
  * This deals with duplicated pattern and stuff.
+ * With num_draws > 1 every site has num_draws consecutive models (posterior draws), which form an equally weighted mixture.
  */
-void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len);
+void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len, int num_draws = 1);
 
 /**
  * Read a site model file and update the alignment object.

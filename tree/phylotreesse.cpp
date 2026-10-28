@@ -255,7 +255,9 @@ void PhyloTree::computeTipPartialLikelihood() {
     if (getModel()->isSiteSpecificModel()) {
         // TODO: THIS NEEDS TO BE CHANGED TO USE ModelSubst::computeTipLikelihood()
 //        ModelSet *models = (ModelSet*)model;
-        size_t nptn = aln->getNPattern(), max_nptn = ((nptn+vector_size-1)/vector_size)*vector_size, tip_block_size = max_nptn * aln->num_states;
+        // with posterior draws per pattern (MUTSEL) the tip vectors are stored per draw, like the eigenvectors
+        size_t num_draws = model->getNSiteDraws();
+        size_t nptn = aln->getNPattern(), max_nptn = ((nptn+vector_size-1)/vector_size)*vector_size, tip_block_size = max_nptn * aln->num_states * num_draws;
         int nstates = aln->num_states;
         size_t nseq = aln->getNSeq();
         ASSERT(vector_size > 0);
@@ -267,8 +269,9 @@ void PhyloTree::computeTipPartialLikelihood() {
         for (int nodeid = 0; nodeid < nseq; nodeid++) {
             auto stateRow = getConvertedSequenceByNumber(nodeid);
             double *partial_lh = tip_partial_lh + (tip_block_size*nodeid);
-            for (size_t ptn = 0; ptn < nptn; ptn+=vector_size, partial_lh += nstates*vector_size) {
-                const double *inv_evec = &model->getInverseEigenvectors()[ptn*nstates*nstates];
+            for (size_t ptn_draw = 0; ptn_draw < max_nptn*num_draws; ptn_draw+=vector_size, partial_lh += nstates*vector_size) {
+                size_t ptn = (ptn_draw / (vector_size*num_draws)) * vector_size;
+                const double *inv_evec = &model->getInverseEigenvectors()[ptn_draw*nstates*nstates];
                 for (int v = 0; v < vector_size; v++) {
                     int state = 0;
                     if (ptn+v < nptn) {

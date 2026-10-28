@@ -91,6 +91,12 @@ public:
 	virtual bool isSiteSpecificModel() { return false; }
 
 	/**
+	 * @return number of models per pattern of a site-specific model, one per rate category, 1 if
+	 * all categories of a pattern share one model
+	 */
+	virtual int getNSiteDraws() { return 1; }
+
+	/**
 	 * @return TRUE if this is a mixture model, FALSE otherwise
 	 */
 	virtual bool isMixture() { return false; }

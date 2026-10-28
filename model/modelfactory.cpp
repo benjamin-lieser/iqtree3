@@ -35,6 +35,7 @@
 #include "ratemeyerhaeseler.h"
 #include "ratemeyerdiscrete.h"
 #include "ratekategory.h"
+#include "ratesitedraws.h"
 #include "ratefree.h"
 #include "ratefreeinvar.h"
 #include "rateheterotachy.h"
@@ -676,10 +677,22 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
         ModelSet *models = (ModelSet*)model; // assign pointer for convenience
         models->init((params.freq_type != FREQ_UNKNOWN) ? params.freq_type : FREQ_EMPIRICAL);
         models->fixParameters(true);
-        for (size_t i = 0; i < tree->aln->ptn_state_freq.size(); ++i) {
+        // With posterior draws (MUTSEL_TREE_DRAWS) every pattern has num_draws models, which the kernel uses as
+        // rate categories. They are ordered by blocks of vector_size patterns, then draw, then pattern, so that
+        // ModelSet::decomposeRateMatrix interleaves the patterns of one draw.
+        int num_draws = tree->aln->site_model_draws;
+        size_t nptn = tree->aln->ptn_state_freq.size();
+        size_t vsize = num_draws > 1 ? tree->vector_size : 1;
+        ASSERT(vsize > 0);
+        size_t num_models = (num_draws > 1) ? roundUpToMultiple(nptn, vsize) * num_draws : nptn;
+        models->num_draws = num_draws;
+        for (size_t m = 0; m < num_models; ++m) {
+            size_t lane = m % vsize;
+            size_t draw = (m / vsize) % num_draws;
+            size_t i = min((m / (vsize * num_draws)) * vsize + lane, nptn - 1); // padding repeats the last pattern
             ModelMarkov *modeli = new ModelMarkov(tree, true, true); // dummy model for getting num_states and num_rate_entries
-            modeli->setStateFrequency(tree->aln->ptn_state_freq[i]);
-            modeli->setRateMatrix(tree->aln->ptn_rate_mat[i]);
+            modeli->setStateFrequency(tree->aln->ptn_state_freq[i] + draw * tree->aln->num_states);
+            modeli->setRateMatrix(tree->aln->ptn_rate_mat[i] + draw * tree->aln->getNumRates());
             // Minh/Thomas: Important to note: site Q matrices are not normalised
             // But make sure to normalise across all sites, i.e.
             // (1/nsites) * sum_i mu_i = 1.0, where mu_i = -sum_j pi^i_j * Q^i_{jj}
@@ -1019,9 +1032,16 @@ ModelFactory::ModelFactory(Params &params, string &model_name, PhyloTree *tree, 
 //            model_str = model_str.substr(0, model_str.find('+'));
 //        else
 //            model_str = model_str.substr(0, model_str.find('*'));
+    } else if (tree->aln->isSSM() && tree->aln->site_model_draws > 1) {
+        // the posterior draws of a MUTSEL site model as equally weighted categories with rate 1
+        site_rate = new RateSiteDraws(tree->aln->site_model_draws);
+        site_rate->setTree(tree);
     } else {
         site_rate = new RateHeterogeneity();
         site_rate->setTree(tree);
+    }
+    if (model->getNSiteDraws() > 1 && site_rate->getNRate() != model->getNSiteDraws()) {
+        outError("Rate heterogeneity cannot be combined with posterior draws of the MUTSEL site model");
     }
 
     if (fused_mix_rate) {

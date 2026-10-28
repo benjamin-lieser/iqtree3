@@ -959,6 +959,10 @@ public:
     /** pattern ID to state frequency vector map */
     vector<double*> ptn_state_freq;
 
+    /** number of posterior draws per pattern in ptn_rate_mat and ptn_state_freq (MUTSEL), stored consecutively
+        and used as an equally weighted mixture */
+    int site_model_draws = 1;
+
     /**
      * @return true if data type is SEQ_CODON and state is a stop codon
      */

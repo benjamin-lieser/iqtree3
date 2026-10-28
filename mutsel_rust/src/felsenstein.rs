@@ -145,6 +145,10 @@ impl FelsensteinWithEdgeOp {
             result_storage: Mutex::new(None),
         }
     }
+    pub fn tree(&self) -> &Arc<Mutex<phylo_grad::FelsensteinTree<20>>> {
+        &self.felsenstein
+    }
+
     pub fn into_fwd_op(&self) -> FelsensteinWithEdgeFwdOp {
         FelsensteinWithEdgeFwdOp {
             felsenstein: Arc::clone(&self.felsenstein),

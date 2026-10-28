@@ -50,6 +50,11 @@ void ModelSet::computeTransDerv(double time, double* trans_matrix, double* trans
 
 int ModelSet::getPtnModelID(int ptn)
 {
+    if (num_draws > 1) {
+        // first posterior draw of the pattern
+        int vsize = max((int)phylo_tree->vector_size, 1);
+        ptn = (ptn - ptn % vsize) * num_draws + ptn % vsize;
+    }
     ASSERT(ptn >= 0 && ptn < size());
     return ptn;
 }

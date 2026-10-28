@@ -7,8 +7,11 @@ use candle_core::{Tensor, Var};
 use candle_nn::{Optimizer, ops::softmax};
 use phylo_grad::FelsensteinTree;
 
+use phylo_grad::nalgebra::{SMatrix, SVector};
+use rayon::prelude::*;
+
 use crate::{
-    MutselParams, Verbosity, felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp}, model::{self, calc_rate_matrix}, pca::PCA, utils::tensor_full,
+    batch, MutselParams, Verbosity, felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp}, model::{self, calc_rate_matrix}, pca::PCA, utils::tensor_full,
 };
 
 pub trait Optimizable {
@@ -105,6 +108,52 @@ impl ModelParameters {
         (S, sqrt_pi)
     }
 
+    /// Same as likelihood_candle, with the per-site computations parallelized over the sites
+    pub fn likelihood_parallel(&self) -> Result<Tensor, candle_core::Error> {
+        let Mu = Mu(&self.log_R);
+        let pca_coordinates = self.pca_coordinates.as_tensor();
+        let branch_lengths = self.log_branch_lengths.exp()?;
+        let components = batch_components(&self.pca_data)?;
+        let coordinates = pca_coordinates.flatten_all()?.to_vec1::<f64>()?;
+        let num_components = self.pca_data.num_components;
+        let log_pi: Vec<SVector<f64, 20>> = coordinates
+            .par_chunks_exact(num_components)
+            .map(|x| components.transpose() * SVector::<f64, 19>::from_column_slice(x))
+            .collect();
+
+        let result = batch::log_likelihood_and_gradients(
+            self.felsenstein_op.tree(),
+            &batch::smatrix_from_tensor(&Mu)?,
+            &log_pi,
+            &branch_lengths.to_vec1::<f64>()?,
+            batch::RateScaling::MeanRate,
+        );
+        let grad_coordinates: Vec<f64> = result
+            .grad_log_pi
+            .par_iter()
+            .flat_map_iter(|g| (components * g).iter().copied().collect::<Vec<_>>())
+            .collect();
+        let num_branches = result.grad_branch_lengths.len();
+        batch::linear_surrogate(
+            result.log_likelihood,
+            &[
+                (&Mu, batch::smatrix_to_tensor(&result.grad_Mu)?),
+                (pca_coordinates, Tensor::from_vec(grad_coordinates, pca_coordinates.shape(), &candle_core::Device::Cpu)?),
+                (&branch_lengths, Tensor::from_vec(result.grad_branch_lengths, &[num_branches], &candle_core::Device::Cpu)?),
+            ],
+        )
+    }
+
+    /// Log likelihood as a candle graph, single threaded outside of phylo_grad
+    pub fn likelihood_candle(&self) -> Tensor {
+        let (S, sqrt_pi) = self.calc_rate_matrix();
+        let branch_lengths = self.log_branch_lengths.exp().unwrap();
+        S.apply_op3(&sqrt_pi, &branch_lengths, self.felsenstein_op.clone())
+            .unwrap()
+            .sum_all()
+            .unwrap()
+    }
+
     pub fn save_npz(&self, path: &Path) {
         let Mu = Mu(&self.log_R.as_detached_tensor());
         let pi = softmax(&self.log_pi().detach(), 1).unwrap();
@@ -143,13 +192,9 @@ impl Optimizable for ModelParameters {
         "ModelParameters".to_string()
     }
 
+    /// Evaluated with batch::log_likelihood_and_gradients, parallel over the sites
     fn likelihood(&self) -> Tensor {
-        let (S, sqrt_pi) = self.calc_rate_matrix();
-        let branch_lengths = self.log_branch_lengths.exp().unwrap();
-        S.apply_op3(&sqrt_pi, &branch_lengths, self.felsenstein_op.clone())
-            .unwrap()
-            .sum_all()
-            .unwrap()
+        self.likelihood_parallel().unwrap()
     }
 
     fn penalty(&self) -> Tensor {
@@ -167,6 +212,12 @@ impl Optimizable for ModelParameters {
 
     fn print_state(&self) {
     }
+}
+
+/// PCA components [19, 20] (all 19 coordinates are optimized in the MAP estimate)
+fn batch_components(pca: &PCA) -> Result<SMatrix<f64, 19, 20>, candle_core::Error> {
+    assert_eq!(pca.num_components, 19);
+    Ok(SMatrix::<f64, 19, 20>::from_row_slice(&pca.components.flatten_all()?.to_vec1::<f64>()?))
 }
 
 /// Squared difference of the log off-diagonal Mu entries to the initial ones, times Mu_reg

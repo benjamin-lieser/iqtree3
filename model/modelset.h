@@ -37,6 +37,17 @@ public:
 	virtual bool isSiteSpecificModel() { return true; }
 
 	/**
+	 * @return number of models per pattern (posterior draws of MUTSEL), one per rate category
+	 */
+	virtual int getNSiteDraws() { return num_draws; }
+
+	/**
+	 * number of models per pattern. With num_draws > 1 the models of a block of vector_size patterns are
+	 * stored draw by draw: model (ptn - ptn % vector_size) * num_draws + draw * vector_size + ptn % vector_size
+	 */
+	int num_draws = 1;
+
+	/**
 	 * get the size of transition matrix, default is num_states*num_states.
 	 * can be changed for e.g. site-specific model
 	 */

@@ -29,7 +29,7 @@ use phylo_grad::{
 use rayon::prelude::*;
 
 use crate::{
-    MutselParams, Verbosity,
+    MutselParams, Verbosity, batch,
     felsenstein::{FelsensteinOp, FelsensteinWithEdgeOp},
     model::{self, calc_rate_matrix},
     optimization::{Convergence, Mu, Mu_penalty, map_estimate},
@@ -412,7 +412,7 @@ struct SiteModelEval {
 }
 
 /// Fixation factor g(x) = x / (1 - exp(-x)), see model::GOp
-fn fixation(x: f64) -> f64 {
+pub(crate) fn fixation(x: f64) -> f64 {
     if x.abs() < 1e-6 {
         1.0 + x / 2.0 + x * x / 12.0
     } else {
@@ -421,7 +421,7 @@ fn fixation(x: f64) -> f64 {
 }
 
 /// d/dx log g(x) = 1/x - 1/(exp(x) - 1)
-fn dx_log_fixation(x: f64) -> f64 {
+pub(crate) fn dx_log_fixation(x: f64) -> f64 {
     // The closed form loses about eps / |x| to cancellation, so small arguments use the
     // Bernoulli series 1/2 - sum_k B_2k x^(2k-1) / (2k)!, whose truncation error is below 1e-20 for |x| < 0.1.
     if x.abs() < 0.1 {
@@ -988,8 +988,11 @@ fn m_step(
             ..Default::default()
         },
     )?;
-    let rate_scaling = tensor_full(rate_scaling, &[]);
     let num_samples = log_pi_samples.len() as f64;
+    let log_pi_samples = log_pi_samples
+        .iter()
+        .map(batch::rows_from_tensor)
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut best_objective = f64::INFINITY;
     let mut best_log_likelihood = f64::NAN;
@@ -998,32 +1001,42 @@ fn m_step(
         .map(|v| v.as_tensor().copy())
         .collect::<Result<Vec<_>, _>>()?;
     let mut no_improve_count = 0;
+    let start = std::time::Instant::now();
     for iteration in 0..max_iterations {
+        let branch_lengths = log_branch_lengths.exp()?;
         let penalty = (Mu_penalty(log_R, init_log_R, mutsel_params.Mu_reg)
-            + (log_branch_lengths.exp()?.sum_all()? * mutsel_params.branch_length_reg)?)?;
-        // The penalty's GradStore receives the gradient of the whole objective
-        let mut grads = penalty.backward()?;
-        let mut summed_grads = variables
-            .iter()
-            .map(|v| match grads.get(v.as_tensor()) {
-                Some(g) => Ok(g.clone()),
-                None => v.zeros_like(),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            + (branch_lengths.sum_all()? * mutsel_params.branch_length_reg)?)?;
 
-        // One backward pass per sample, so only one graph over all sites is alive at a time
+        // Log likelihood averaged over the samples, parallel over the sites
+        let Mu_tensor = Mu(log_R);
+        let Mu_matrix = batch::smatrix_from_tensor(&Mu_tensor)?;
+        let branch_length_values = branch_lengths.to_vec1::<f64>()?;
         let mut log_likelihood = 0.0;
-        for log_pi in log_pi_samples {
-            let (S, sqrt_pi) = calc_rate_matrix(&Mu(log_R), log_pi, &rate_scaling);
-            let sample_log_likelihood = S.apply_op3(&sqrt_pi, &log_branch_lengths.exp()?, op.clone())?;
-            log_likelihood += sample_log_likelihood.to_scalar::<f64>()? / num_samples;
-            let sample_grads = sample_log_likelihood.affine(-1.0 / num_samples, 0.0)?.backward()?;
-            for (sum, v) in summed_grads.iter_mut().zip(&variables) {
-                if let Some(g) = sample_grads.get(v.as_tensor()) {
-                    *sum = (&*sum + g)?;
-                }
+        let mut grad_Mu = SMatrix::<f64, 20, 20>::zeros();
+        let mut grad_branch_lengths = vec![0.0; branch_length_values.len()];
+        for log_pi in &log_pi_samples {
+            let result = batch::log_likelihood_and_gradients(
+                op.tree(),
+                &Mu_matrix,
+                log_pi,
+                &branch_length_values,
+                batch::RateScaling::Fixed(rate_scaling),
+            );
+            log_likelihood += result.log_likelihood / num_samples;
+            grad_Mu += result.grad_Mu / num_samples;
+            for (sum, g) in grad_branch_lengths.iter_mut().zip(&result.grad_branch_lengths) {
+                *sum += g / num_samples;
             }
         }
+        let num_branches = grad_branch_lengths.len();
+        let likelihood = batch::linear_surrogate(
+            log_likelihood,
+            &[
+                (&Mu_tensor, batch::smatrix_to_tensor(&grad_Mu)?),
+                (&branch_lengths, Tensor::from_vec(grad_branch_lengths, &[num_branches], &candle_core::Device::Cpu)?),
+            ],
+        )?;
+        let grads = (&penalty - likelihood)?.backward()?;
 
         let objective = penalty.to_scalar::<f64>()? - log_likelihood;
         if verbosity.should_print(Verbosity::Med) {
@@ -1049,15 +1062,16 @@ fn m_step(
             }
             if no_improve_count >= NO_IMPROVE_PATIENCE {
                 if verbosity.should_print(Verbosity::Med) {
-                    println!("MUTSEL HMC M-step: converged after {} iterations", iteration);
+                    println!(
+                        "MUTSEL HMC M-step: converged after {} iterations ({:.1}s)",
+                        iteration,
+                        start.elapsed().as_secs_f64()
+                    );
                 }
                 break;
             }
         }
 
-        for (sum, v) in summed_grads.into_iter().zip(&variables) {
-            grads.insert(v.as_tensor(), sum);
-        }
         opt.step(&grads)?;
     }
 
@@ -1141,6 +1155,7 @@ fn fit_with_em(
     if verbosity.should_print(Verbosity::Min) {
         println!("MUTSEL HMC: MAP estimate with pi_reg {}", map_params.pi_reg);
     }
+    let map_start = std::time::Instant::now();
     let map = map_estimate(
         op,
         branch_lengths,
@@ -1150,6 +1165,9 @@ fn fit_with_em(
         verbosity,
         out_prefix,
     )?;
+    if verbosity.should_print(Verbosity::Min) {
+        println!("MUTSEL HMC: MAP estimate done in {:.1}s", map_start.elapsed().as_secs_f64());
+    }
     // The Mu penalty stays relative to the prior Mu
     let init_log_R = map.init_log_R.clone();
     let log_R = Var::from_tensor(map.log_R.as_tensor())?;
@@ -1256,7 +1274,9 @@ fn fit_with_em(
 }
 
 /// Samples the PCA coordinates of every site from its posterior and returns (S, sqrt_pi)
-/// evaluated at the posterior mean of the site frequencies.
+/// evaluated at the posterior mean of the site frequencies, or with num_tree_draws > 1 at that many
+/// evenly spaced posterior draws per site ([num_sites * num_tree_draws], ordered by site), which
+/// IQ-TREE uses as an equally weighted mixture per site.
 ///
 /// Mu and the branch lengths start at the joint MAP estimate (optimization::map_estimate, which also
 /// gives the initial site positions) and are then refined with Monte Carlo EM: the E-step samples the sites
@@ -1275,6 +1295,7 @@ pub fn sample_internal(
     prior_R_file: Option<&Path>,
     verbosity: Verbosity,
     out_prefix: &str,
+    num_tree_draws: usize,
 ) -> Result<(Tensor, Tensor), candle_core::Error> {
     let settings = HmcSettings::from_env();
     let em = EmSettings::from_env();
@@ -1301,6 +1322,10 @@ pub fn sample_internal(
         em.max_mstep_iterations
     );
     assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
+    assert!(
+        num_tree_draws >= 1 && num_tree_draws <= settings.num_output_samples,
+        "MUTSEL_TREE_DRAWS must be between 1 and MUTSEL_HMC_SAMPLES"
+    );
 
     let pca = Arc::new(PCA::new(NUM_COMPONENTS));
     let mixture_prior = MixturePrior::from_env();
@@ -1433,7 +1458,22 @@ pub fn sample_internal(
     )?;
     println!("MUTSEL HMC: samples written to {}", npz_path);
 
-    Ok((S, sqrt_pi))
+    if num_tree_draws == 1 {
+        return Ok((S, sqrt_pi));
+    }
+    println!("MUTSEL HMC: {} posterior draws per site for the tree search", num_tree_draws);
+    let draws: Vec<f64> = site_samples
+        .iter()
+        .flat_map(|s| {
+            (0..num_tree_draws).flat_map(move |k| {
+                let draw = k * settings.num_output_samples / num_tree_draws;
+                s.thinned_draws[draw * NUM_COMPONENTS..(draw + 1) * NUM_COMPONENTS].iter().copied()
+            })
+        })
+        .collect();
+    let draws = Tensor::from_vec(draws, &[num_sites * num_tree_draws, NUM_COMPONENTS], &candle_core::Device::Cpu)?;
+    // calc_rate_matrix only needs log_pi up to a constant per site
+    Ok(calc_rate_matrix(&Mu, &pca.pca_coordinates_to_log_freq(&draws), &rate_scaling))
 }
 
 #[cfg(test)]

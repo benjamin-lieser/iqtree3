@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+pub mod batch;
 pub mod data;
 pub mod felsenstein;
 pub mod hmc;
@@ -30,8 +31,9 @@ pub extern "C" fn rust_set_rayon_threads(num_threads: u32) {
 /// parents: [num_nodes]
 /// branch_lengths: [num_nodes]
 /// alignment: [num_sites * num_leaves] (row-major)
-/// out_site_freq: [num_sites * 20] (row-major)
-/// out_rate_matrix: [num_sites * 190] (row-major)
+/// num_tree_draws: 1 returns the model at the posterior mean frequencies, more returns that many posterior draws per site
+/// out_site_freq: [num_sites * num_tree_draws * 20] (row-major)
+/// out_rate_matrix: [num_sites * num_tree_draws * 190] (row-major)
 /// out_rate_para: [num_para] from the rate model 1 for gamma, 2 * num_cat for free rate
 /// out variables do not need to be initialized
 /// prior_R_file and prior_pi_file can be null pointers
@@ -47,6 +49,7 @@ pub unsafe extern "C" fn rust_mutsel(
     prior_R_file: *const std::os::raw::c_char,
     _prior_pi_file: *const std::os::raw::c_char,
     verbose: u8,
+    num_tree_draws: u32,
     out_site_freq: *mut f64,
     out_rate_matrix: *mut f64,
     output_prefix: *const std::os::raw::c_char,
@@ -60,18 +63,19 @@ pub unsafe extern "C" fn rust_mutsel(
     let branch_lengths = unsafe { std::slice::from_raw_parts(branch_lengths, num_nodes as usize) };
     let alignment =
         unsafe { std::slice::from_raw_parts(alignment, (num_sites * num_leaves) as usize) };
+    let num_models = (num_sites * num_tree_draws) as usize;
 
     let out_site_freq = unsafe {
         std::slice::from_raw_parts_mut(
             out_site_freq as *mut MaybeUninit<f64>,
-            (num_sites * 20) as usize,
+            num_models * 20,
         )
     };
 
     let out_rate_matrix = unsafe {
         std::slice::from_raw_parts_mut(
             out_rate_matrix as *mut MaybeUninit<f64>,
-            (num_sites * 190) as usize,
+            num_models * 190,
         )
     };
 
@@ -100,20 +104,21 @@ pub unsafe extern "C" fn rust_mutsel(
         prior_R_file,
         crate::Verbosity::from_u8(verbose),
         out_prefix,
+        num_tree_draws as usize,
     )
     .unwrap();
 
     let (R, pi) = model::phylograd2iqtree_parametrization(&S, &sqrt_pi).unwrap();
     let site_freq = pi.to_vec2().unwrap();
 
-    for site_index in 0..num_sites as usize {
+    for site_index in 0..num_models {
         for aa_index in 0..20 {
             let value = site_freq[site_index][aa_index];
             out_site_freq[site_index * 20 + aa_index].write(value);
         }
     }
 
-    for site_index in 0..num_sites as usize {
+    for site_index in 0..num_models {
         let mut idx = 0;
         // Upper diagonal
         for i in 0..20 {
