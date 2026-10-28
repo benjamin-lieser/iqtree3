@@ -22,8 +22,11 @@ use candle_core::IndexOp;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_set_rayon_threads(num_threads: u32) {
+    // Workers run stolen jobs on top of their own stack while waiting in a join, so phylo_grad's per-site
+    // frames can nest deeply over all sites; the default 2 MB overflowed on 70k sites with 64 threads.
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads as usize)
+        .stack_size(256 << 20)
         .build_global()
         .unwrap_or_else(|_| println!("Rust Threadnumber has already been set. Ignoring."));
 }
