@@ -17,14 +17,13 @@ use std::{
 };
 
 use candle_core::{Tensor, Var};
-use candle_nn::Optimizer;
 use nuts_rs::{
     Chain, CpuLogpFunc, CpuMath, CpuMathError, DiagNutsSettings, HasDims, LogpError, Settings,
     rand::{SeedableRng, rngs::ChaCha8Rng},
 };
 use phylo_grad::{
     FelsensteinTree,
-    nalgebra::{SMatrix, SVector},
+    nalgebra::{DVector, SMatrix, SVector},
 };
 use rayon::prelude::*;
 
@@ -813,7 +812,7 @@ pub struct EmSettings {
     pub num_tune: u64,
     /// NUTS tuning draws per site in the later E-steps, whose chains start at the previous draws
     pub num_retune: u64,
-    /// Maximum number of optimizer steps per M-step
+    /// Maximum number of L-BFGS iterations per M-step
     pub max_mstep_iterations: usize,
     /// Convergence of the MAP estimate EM starts from
     pub map_convergence: Convergence,
@@ -871,6 +870,121 @@ impl EmSettings {
             marginal: false,
         }
     }
+}
+
+/// Posterior mode of the pca coordinates of every site given the shared model, by L-BFGS from init[site]
+fn site_modes(
+    shared: &Arc<SharedModel>,
+    tree: &Arc<FelsensteinTree<20>>,
+    alignment: &[u8],
+    num_leaves: usize,
+    init: &[Vec<f64>],
+) -> Vec<Vec<f64>> {
+    let num_nodes = tree.num_nodes();
+    (0..init.len())
+        .into_par_iter()
+        .map(|site| {
+            let mut logp = SiteLogp {
+                shared: Arc::clone(shared),
+                tree: Arc::clone(tree),
+                leaf_pl: leaf_partial_likelihoods(alignment, site, num_leaves),
+                pl_buffer: vec![SVector::<f64, 20>::zeros(); num_nodes],
+            };
+            maximize_lbfgs(&mut logp, &init[site], 100, 1e-3)
+        })
+        .collect()
+}
+
+/// Maximizes logp with L-BFGS (memory 6) and a backtracking line search, starting at init. Returns init if
+/// logp is not finite there.
+fn maximize_lbfgs(logp: &mut SiteLogp, init: &[f64], max_iterations: usize, gradient_tolerance: f64) -> Vec<f64> {
+    let eval = |x: &DVector<f64>| -> Option<(f64, DVector<f64>)> {
+        let mut gradient = [0.0; NUM_COMPONENTS];
+        let value = logp.logp(x.as_slice(), &mut gradient).ok()?;
+        Some((value, DVector::from_column_slice(&gradient)))
+    };
+    lbfgs(eval, DVector::from_column_slice(init), max_iterations, gradient_tolerance, 0.0)
+        .as_slice()
+        .to_vec()
+}
+
+/// Maximizes f with L-BFGS (memory 6) and a backtracking line search, starting at init, until the gradient norm
+/// is below gradient_tolerance or an iteration improves f by less than value_tolerance relative to |f|. eval
+/// returns f and its gradient, None where f is not finite. Returns init if f is not finite there; the result is
+/// never worse than init.
+fn lbfgs<F: FnMut(&DVector<f64>) -> Option<(f64, DVector<f64>)>>(
+    mut eval: F,
+    init: DVector<f64>,
+    max_iterations: usize,
+    gradient_tolerance: f64,
+    value_tolerance: f64,
+) -> DVector<f64> {
+    let mut x = init;
+    let Some((mut value, mut gradient)) = eval(&x) else {
+        return x;
+    };
+    // (s, y) pairs of the minimization of -f
+    let mut history: std::collections::VecDeque<(DVector<f64>, DVector<f64>)> = std::collections::VecDeque::new();
+    for _ in 0..max_iterations {
+        if gradient.norm() < gradient_tolerance {
+            break;
+        }
+        // Two-loop recursion for the ascent direction
+        let mut q = gradient.clone();
+        let mut coefficients = Vec::with_capacity(history.len());
+        for (s, y) in history.iter().rev() {
+            let rho = 1.0 / y.dot(s);
+            let alpha = rho * s.dot(&q);
+            q -= y * alpha;
+            coefficients.push((alpha, rho));
+        }
+        let gamma = match history.back() {
+            Some((s, y)) => s.dot(y) / y.dot(y),
+            None => 1.0f64.min(1.0 / gradient.norm()),
+        };
+        let mut direction = q * gamma;
+        for ((s, y), (alpha, rho)) in history.iter().zip(coefficients.iter().rev()) {
+            let beta = rho * y.dot(&direction);
+            direction += s * (alpha - beta);
+        }
+        if gradient.dot(&direction) <= 0.0 {
+            history.clear();
+            direction = &gradient * 1.0f64.min(1.0 / gradient.norm());
+        }
+
+        let slope = gradient.dot(&direction);
+        let mut step = 1.0;
+        let mut accepted = None;
+        for _ in 0..30 {
+            let candidate = &x + &direction * step;
+            if let Some((candidate_value, candidate_gradient)) = eval(&candidate) {
+                if candidate_value >= value + 1e-4 * step * slope {
+                    accepted = Some((candidate, candidate_value, candidate_gradient));
+                    break;
+                }
+            }
+            step *= 0.5;
+        }
+        let Some((next, next_value, next_gradient)) = accepted else {
+            break;
+        };
+        let improvement = next_value - value;
+        let s = &next - &x;
+        let y = &gradient - &next_gradient;
+        if s.dot(&y) > 1e-12 {
+            history.push_back((s, y));
+            if history.len() > 6 {
+                history.pop_front();
+            }
+        }
+        x = next;
+        value = next_value;
+        gradient = next_gradient;
+        if improvement <= value_tolerance * value.abs() {
+            break;
+        }
+    }
+    x
 }
 
 /// Runs an independent NUTS chain for every site, starting at init[site]
@@ -992,34 +1106,25 @@ fn m_step(
     max_iterations: usize,
     verbosity: Verbosity,
 ) -> Result<f64, candle_core::Error> {
-    const MIN_ITERATIONS: usize = 10;
-    const MIN_REL_IMPROVEMENT: f64 = 1e-6;
-    const NO_IMPROVE_PATIENCE: usize = 5;
+    // L-BFGS on the deterministic objective (given the samples), stopped once an iteration improves it by less
+    // than this relative to its value. It starts at the previous Mu and branch lengths and never ends worse.
+    const REL_IMPROVEMENT: f64 = 1e-9;
 
-    let variables = vec![log_R.clone(), log_branch_lengths.clone()];
-    let mut opt = candle_nn::optim::AdamW::new(
-        variables.clone(),
-        candle_nn::optim::ParamsAdamW {
-            lr: 0.03,
-            weight_decay: 0.0,
-            ..Default::default()
-        },
-    )?;
     let num_samples = log_pi_samples.len() as f64;
     let log_pi_samples = log_pi_samples
         .iter()
         .map(batch::rows_from_tensor)
         .collect::<Result<Vec<_>, _>>()?;
+    let R_shape = log_R.as_tensor().dims().to_vec();
+    let num_R = log_R.as_tensor().elem_count();
+    let num_branches = log_branch_lengths.as_tensor().elem_count();
 
-    let mut best_objective = f64::INFINITY;
-    let mut best_log_likelihood = f64::NAN;
-    let mut best_values = variables
-        .iter()
-        .map(|v| v.as_tensor().copy())
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut no_improve_count = 0;
-    let start = std::time::Instant::now();
-    for iteration in 0..max_iterations {
+    // Sets the variables to x and returns the expected log likelihood, the objective
+    // (expected log likelihood minus penalty) and its gradient with respect to x
+    let evaluate = |x: &DVector<f64>| -> Result<(f64, f64, DVector<f64>), candle_core::Error> {
+        let device = candle_core::Device::Cpu;
+        log_R.set(&Tensor::from_slice(&x.as_slice()[..num_R], R_shape.as_slice(), &device)?)?;
+        log_branch_lengths.set(&Tensor::from_slice(&x.as_slice()[num_R..], &[num_branches], &device)?)?;
         let branch_lengths = log_branch_lengths.exp()?;
         let penalty = (Mu_penalty(log_R, init_log_R, mutsel_params.Mu_reg)
             + (branch_lengths.sum_all()? * mutsel_params.branch_length_reg)?)?;
@@ -1045,57 +1150,51 @@ fn m_step(
                 *sum += g / num_samples;
             }
         }
-        let num_branches = grad_branch_lengths.len();
         let likelihood = batch::linear_surrogate(
             log_likelihood,
             &[
                 (&Mu_tensor, batch::smatrix_to_tensor(&grad_Mu)?),
-                (&branch_lengths, Tensor::from_vec(grad_branch_lengths, &[num_branches], &candle_core::Device::Cpu)?),
+                (&branch_lengths, Tensor::from_vec(grad_branch_lengths, &[num_branches], &device)?),
             ],
         )?;
-        let grads = (&penalty - likelihood)?.backward()?;
-
-        let objective = penalty.to_scalar::<f64>()? - log_likelihood;
-        if verbosity.should_print(Verbosity::Med) {
-            println!(
-                "MUTSEL HMC M-step iteration {}: expected log likelihood {:.3}, objective {:.3}",
-                iteration, log_likelihood, objective
-            );
-        }
-        let rel_improvement = (best_objective - objective) / best_objective.abs().max(1e-12);
-        if objective < best_objective {
-            best_objective = objective;
-            best_log_likelihood = log_likelihood;
-            best_values = variables
-                .iter()
-                .map(|v| v.as_tensor().copy())
-                .collect::<Result<Vec<_>, _>>()?;
-        }
-        if iteration >= MIN_ITERATIONS {
-            if rel_improvement > MIN_REL_IMPROVEMENT {
-                no_improve_count = 0;
-            } else {
-                no_improve_count += 1;
-            }
-            if no_improve_count >= NO_IMPROVE_PATIENCE {
-                if verbosity.should_print(Verbosity::Med) {
-                    println!(
-                        "MUTSEL HMC M-step: converged after {} iterations ({:.1}s)",
-                        iteration,
-                        start.elapsed().as_secs_f64()
-                    );
-                }
-                break;
+        let grads = (likelihood - &penalty)?.backward()?;
+        let mut gradient = Vec::with_capacity(num_R + num_branches);
+        for var in [log_R, log_branch_lengths] {
+            match grads.get(var.as_tensor()) {
+                Some(g) => gradient.extend(g.flatten_all()?.to_vec1::<f64>()?),
+                None => gradient.extend(std::iter::repeat_n(0.0, var.as_tensor().elem_count())),
             }
         }
+        let objective = log_likelihood - penalty.to_scalar::<f64>()?;
+        Ok((log_likelihood, objective, DVector::from_vec(gradient)))
+    };
 
-        opt.step(&grads)?;
+    let mut init = log_R.as_tensor().flatten_all()?.to_vec1::<f64>()?;
+    init.extend(log_branch_lengths.as_tensor().to_vec1::<f64>()?);
+    let start = std::time::Instant::now();
+    let mut num_evaluations = 0;
+    let optimum = lbfgs(
+        |x| {
+            num_evaluations += 1;
+            let (_, objective, gradient) = evaluate(x).ok()?;
+            objective.is_finite().then_some((objective, gradient))
+        },
+        DVector::from_vec(init),
+        max_iterations,
+        0.0,
+        REL_IMPROVEMENT,
+    );
+    let (log_likelihood, objective, _) = evaluate(&optimum)?;
+    if verbosity.should_print(Verbosity::Med) {
+        println!(
+            "MUTSEL HMC M-step: expected log likelihood {:.3}, objective {:.3} after {} evaluations ({:.1}s)",
+            log_likelihood,
+            objective,
+            num_evaluations,
+            start.elapsed().as_secs_f64()
+        );
     }
-
-    for (variable, value) in variables.iter().zip(best_values.iter()) {
-        variable.set(value)?;
-    }
-    Ok(best_log_likelihood)
+    Ok(log_likelihood)
 }
 
 /// Writes the log likelihood of every draw ([num_sites, num_draws] as draw_log_likelihood) and of the given
@@ -1265,50 +1364,140 @@ fn fit_with_em(
     pca: &Arc<PCA>,
     mixture_prior: &Option<Arc<MixturePrior>>,
 ) -> Result<FittedModel, candle_core::Error> {
-    // Start at the joint MAP estimate of Mu, the site frequencies and the branch lengths,
-    // the same estimate as optimization::optimize_internal with the default settings
     let felsenstein = crate::create_felsenstein_tree(parents, branch_lengths, alignment, num_sites, num_leaves);
     let op = FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
-    let map_params = MutselParams {
-        pi_reg: em.map_pi_reg.unwrap_or(mutsel_params.pi_reg),
-        ..mutsel_params
-    };
-    if verbosity.should_print(Verbosity::Min) {
-        println!("MUTSEL HMC: MAP estimate with pi_reg {}", map_params.pi_reg);
-    }
-    let map_start = std::time::Instant::now();
-    let map = map_estimate(
-        op,
-        branch_lengths,
-        map_params,
-        prior_R_file,
-        em.map_convergence,
-        verbosity,
-        out_prefix,
-    )?;
-    if verbosity.should_print(Verbosity::Min) {
-        println!("MUTSEL HMC: MAP estimate done in {:.1}s", map_start.elapsed().as_secs_f64());
-    }
     // The Mu penalty stays relative to the prior Mu
-    let init_log_R = map.init_log_R.clone();
-    let log_R = Var::from_tensor(map.log_R.as_tensor())?;
-    let log_branch_lengths = Var::from_tensor(map.log_branch_lengths.as_tensor())?;
-    let edge_op = map.felsenstein_op.clone();
-
-    let init_pca_tensor = map.pca_coordinates.as_tensor().copy()?;
+    let (init_log_R, log_R, log_branch_lengths, edge_op, init_pca_tensor, start) = match std::env::var("MUTSEL_INIT_MU") {
+        Ok(path) => {
+            // Mu from a file (e.g. the average over training alignments), the branch lengths of the input tree times
+            // MUTSEL_INIT_TREE_SCALE and the light PMSF site frequencies, which are moved to the site posterior modes below
+            let path = Path::new(path.trim());
+            let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
+            let init_Mu = arrays
+                .get("Mu")
+                .ok_or_else(|| candle_core::Error::Msg(format!("Mu not found in {}", path.display())))?;
+            let scale: f64 = env_or("MUTSEL_INIT_TREE_SCALE", 1.0);
+            let init_log_R = crate::optimization::initial_log_R(prior_R_file)?;
+            let log_R = Var::from_tensor(&crate::optimization::log_R_from_Mu(init_Mu, &init_log_R)?)?;
+            let scaled: Vec<f64> = branch_lengths.iter().map(|b| b * scale).collect();
+            let log_branch_lengths = Var::from_tensor(&Tensor::from_slice(&scaled, &[scaled.len()], &candle_core::Device::Cpu)?.log()?)?;
+            let site_freq = crate::optimization::light_pmsf(
+                op.into_with_edge_op(),
+                crate::data::UDM256,
+                crate::data::UDM256_WEIGHTS,
+                log_branch_lengths.as_tensor(),
+            );
+            let init_pca_tensor = pca.log_freq_to_pca_coordinates(&site_freq.log()?);
+            let start = format!("Mu from {}, input tree branch lengths x {}", path.display(), scale);
+            (init_log_R, log_R, log_branch_lengths, op.into_with_edge_op(), init_pca_tensor, start)
+        }
+        Err(_) => {
+            // The joint MAP estimate of Mu, the site frequencies and the branch lengths,
+            // the same estimate as optimization::optimize_internal with the default settings
+            let map_params = MutselParams {
+                pi_reg: em.map_pi_reg.unwrap_or(mutsel_params.pi_reg),
+                ..mutsel_params
+            };
+            if verbosity.should_print(Verbosity::Min) {
+                println!("MUTSEL HMC: MAP estimate with pi_reg {}", map_params.pi_reg);
+            }
+            let map_start = std::time::Instant::now();
+            let map = map_estimate(
+                op,
+                branch_lengths,
+                map_params,
+                prior_R_file,
+                em.map_convergence,
+                verbosity,
+                out_prefix,
+            )?;
+            if verbosity.should_print(Verbosity::Min) {
+                println!("MUTSEL HMC: MAP estimate done in {:.1}s", map_start.elapsed().as_secs_f64());
+            }
+            (
+                map.init_log_R.clone(),
+                Var::from_tensor(map.log_R.as_tensor())?,
+                Var::from_tensor(map.log_branch_lengths.as_tensor())?,
+                map.felsenstein_op.clone(),
+                map.pca_coordinates.as_tensor().copy()?,
+                "the MAP estimate".to_string(),
+            )
+        }
+    };
     let init_log_pi = pca.pca_coordinates_to_log_freq(&init_pca_tensor);
 
-    // Initial normalization: average substitution rate 1 at the MAP frequencies, the same as in the
+    // Initial normalization: average substitution rate 1 at the initial frequencies, the same as in the
     // MAP estimate, so the branch lengths stay valid.
     let mut rate_scaling = 1.0 / mean_substitution_rate(&Mu(log_R.as_tensor()).detach(), &[init_log_pi])?;
     if verbosity.should_print(Verbosity::Min) {
         println!(
-            "MUTSEL HMC: starting from the MAP estimate, tree length {:.4}, rate normalization 1/{:.5}",
+            "MUTSEL HMC: starting from {}, tree length {:.4}, rate normalization 1/{:.5}",
+            start,
             log_branch_lengths.exp()?.sum_all()?.to_scalar::<f64>()?,
             1.0 / rate_scaling
         );
     }
-    drop(map);
+
+    let init_pca_tensor = if std::env::var("MUTSEL_INIT_MU").is_ok() {
+        // The light PMSF frequencies are much flatter than the site posteriors and so have a higher average
+        // substitution rate, and so do the site modes. The normalization is therefore taken from posterior draws
+        // of a subset of the sites (MUTSEL_INIT_PILOT_SITES, evenly spaced), iterated twice because the draws
+        // depend on it, so that the branch lengths keep the meaning of the input tree's.
+        let pilot_start = std::time::Instant::now();
+        let init_Mu = Mu(log_R.as_tensor()).detach();
+        let tree = Arc::new(FelsensteinTree::<20>::new(parents, &log_branch_lengths.exp()?.to_vec1::<f64>()?));
+        let init_positions = init_pca_tensor.to_vec2::<f64>()?;
+        let num_pilot: usize = env_or("MUTSEL_INIT_PILOT_SITES", 2000).clamp(1, num_sites);
+        let pilot_sites: Vec<usize> = (0..num_pilot).map(|i| i * num_sites / num_pilot).collect();
+        let pilot_alignment: Vec<u8> = pilot_sites
+            .iter()
+            .flat_map(|&site| alignment[site * num_leaves..(site + 1) * num_leaves].iter().copied())
+            .collect();
+        let mut pilot_positions: Vec<Vec<f64>> = pilot_sites.iter().map(|&site| init_positions[site].clone()).collect();
+        for pass in 0..2 {
+            let shared = Arc::new(
+                SharedModel::new(&init_Mu, rate_scaling, pca, mutsel_params.pi_reg).with_mixture_prior(mixture_prior.clone()),
+            );
+            let pilot_settings = em.hmc_settings(&settings, pass);
+            let site_samples = sample_sites(
+                &shared,
+                &tree,
+                &pilot_alignment,
+                num_leaves,
+                &pilot_positions,
+                &pilot_settings,
+                Verbosity::Quiet,
+                "pilot sampling",
+            );
+            let last = (em.num_samples - 1) * NUM_COMPONENTS;
+            pilot_positions = site_samples
+                .iter()
+                .map(|s| s.thinned_draws[last..last + NUM_COMPONENTS].to_vec())
+                .collect();
+            rate_scaling = 1.0 / mean_substitution_rate(&init_Mu, &thinned_log_pi(&site_samples, em.num_samples, pca)?)?;
+            if verbosity.should_print(Verbosity::Min) {
+                println!(
+                    "MUTSEL HMC: pilot sampling pass {} of {} sites, rate normalization 1/{:.5}",
+                    pass + 1,
+                    num_pilot,
+                    1.0 / rate_scaling
+                );
+            }
+        }
+        let shared = Arc::new(
+            SharedModel::new(&init_Mu, rate_scaling, pca, mutsel_params.pi_reg).with_mixture_prior(mixture_prior.clone()),
+        );
+        let modes = site_modes(&shared, &tree, alignment, num_leaves, &init_positions);
+        if verbosity.should_print(Verbosity::Min) {
+            println!(
+                "MUTSEL HMC: pilot normalization and site posterior modes done in {:.1}s",
+                pilot_start.elapsed().as_secs_f64()
+            );
+        }
+        Tensor::from_vec(modes.concat(), &[num_sites, NUM_COMPONENTS], &candle_core::Device::Cpu)?
+    } else {
+        init_pca_tensor
+    };
 
     let mut positions = init_pca_tensor.to_vec2::<f64>()?;
     let mut em_log_likelihood = Vec::with_capacity(em.iterations);
@@ -2152,6 +2341,47 @@ mod tests {
             total, evaluate, felsenstein, likelihood_only, backpropagate
         );
     }
+
+    #[test]
+    fn log_R_from_Mu_inverts_Mu() {
+        let init_log_R = crate::optimization::initial_log_R(None).unwrap();
+        let mut values = init_log_R.to_vec2::<f64>().unwrap();
+        for i in 0..20 {
+            for j in 0..i {
+                values[i][j] += 0.5 * ((i * 20 + j) as f64 * 0.73).sin();
+            }
+        }
+        let log_R = Tensor::from_vec(values.concat(), &[20, 20], &candle_core::Device::Cpu).unwrap();
+        let expected = Mu(&log_R).to_vec2::<f64>().unwrap();
+        let inverted = crate::optimization::log_R_from_Mu(&Mu(&log_R), &init_log_R).unwrap();
+        let actual = Mu(&inverted).to_vec2::<f64>().unwrap();
+        for i in 0..20 {
+            for j in 0..20 {
+                assert!((expected[i][j] - actual[i][j]).abs() < 1e-12, "Mu[{}][{}]: {} vs {}", i, j, expected[i][j], actual[i][j]);
+            }
+        }
+    }
+
+    #[test]
+    fn lbfgs_finds_the_site_posterior_mode() {
+        // Two component Gaussian mixture prior (the generalized normal one is not twice differentiable at its mean)
+        let prior = GmmPrior {
+            log_norm: vec![(0.3f64).ln(), (0.7f64).ln()],
+            means: vec![SVector::from_fn(|i, _| 0.2 * (i as f64).cos()), SVector::from_fn(|i, _| -0.1 * (i as f64).sin())],
+            precisions: vec![SMatrix::identity() * 4.0, SMatrix::from_fn(|i, j| if i == j { 2.0 } else { 0.3 / (1.0 + (i + j) as f64) })],
+        };
+        let mut logp = test_logp();
+        logp.shared = Arc::new(
+            SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)
+                .with_mixture_prior(Some(Arc::new(MixturePrior::Gaussian(prior)))),
+        );
+        let start = test_point();
+        let mut gradient = vec![0.0; NUM_COMPONENTS];
+        let start_value = logp.logp(&start, &mut gradient).unwrap();
+        let mode = maximize_lbfgs(&mut logp, &start, 200, 1e-6);
+        let mode_value = logp.logp(&mode, &mut gradient).unwrap();
+        let norm = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+        assert!(mode_value > start_value, "{} <= {}", mode_value, start_value);
+        assert!(norm < 1e-4, "gradient norm {} at the mode", norm);
+    }
 }
-
-

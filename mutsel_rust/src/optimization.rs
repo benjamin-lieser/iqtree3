@@ -530,6 +530,34 @@ impl Convergence {
     };
 }
 
+/// log of the lower triangular R with the equilibrium in the diagonal (-inf above it), from prior_R_file or
+/// the default M_TXT. Mu is penalized relative to it.
+pub fn initial_log_R(prior_R_file: Option<&Path>) -> Result<Tensor, candle_core::Error> {
+    let init_R = if let Some(prior_R_file) = prior_R_file {
+        let file_content = std::fs::read_to_string(prior_R_file)?;
+        crate::data::load_lower_R_with_equi(&file_content)
+    } else {
+        crate::data::load_lower_R_with_equi(crate::data::M_TXT)
+    };
+    init_R.log()
+}
+
+/// log_R with Mu(log_R) = Mu up to the normalization, the inverse of Mu. The upper triangle is taken
+/// from template (an output of initial_log_R).
+pub fn log_R_from_Mu(Mu: &Tensor, template: &Tensor) -> Result<Tensor, candle_core::Error> {
+    let Mu = Mu.to_vec2::<f64>()?;
+    let mut log_R = template.to_vec2::<f64>()?;
+    let pi: Vec<f64> = (0..20).map(|i| Mu[i][i]).collect();
+    for i in 0..20 {
+        log_R[i][i] = pi[i].ln();
+        // Q_ij = S_ij sqrt(pi_j / pi_i) / normalization, R holds S_ij in the lower triangle
+        for j in 0..i {
+            log_R[i][j] = (Mu[i][j] * (pi[i] / pi[j]).sqrt()).ln();
+        }
+    }
+    Tensor::from_vec(log_R.concat(), &[20, 20], &candle_core::Device::Cpu)
+}
+
 /// Joint MAP estimate of Mu, the pca coordinates of every site and the branch lengths,
 /// initialized with the two step light PMSF procedure.
 pub fn map_estimate(
@@ -541,13 +569,7 @@ pub fn map_estimate(
     verbosity: Verbosity,
     out_prefix: &str,
 ) -> Result<ModelParameters, candle_core::Error> {
-    // Lower triangular matrix with zeros everywhere else
-    let init_R = if let Some(prior_R_file) = prior_R_file {
-        let file_content = std::fs::read_to_string(prior_R_file)?;
-        crate::data::load_lower_R_with_equi(&file_content)
-    } else {
-        crate::data::load_lower_R_with_equi(crate::data::M_TXT)
-    };
+    let init_log_R = initial_log_R(prior_R_file)?;
 
     let log_branch_lengths =
         Tensor::from_slice(distances, &[distances.len()], &candle_core::Device::Cpu)?.log()?;
@@ -564,10 +586,8 @@ pub fn map_estimate(
     );
 
     // Variable which gets optimized
-    let log_R = Var::from_tensor(&init_R.log()?)?;
+    let log_R = Var::from_tensor(&init_log_R)?;
     let init_log_pi = site_freq.log()?;
-
-    let init_log_R = log_R.detach().copy().unwrap();
 
     let pca = PCA::new(19);
 
