@@ -832,7 +832,7 @@ impl EmSettings {
             num_samples: env_or("MUTSEL_EM_SAMPLES", 8),
             num_tune: env_or("MUTSEL_EM_TUNE", 200),
             num_retune: env_or("MUTSEL_EM_RETUNE", 50),
-            max_mstep_iterations: env_or("MUTSEL_EM_MSTEP_ITERATIONS", 200),
+            max_mstep_iterations: env_or("MUTSEL_EM_MSTEP_ITERATIONS", 50),
             // Same as optimize_internal by default
             map_convergence: Convergence {
                 min_iterations: env_or("MUTSEL_MAP_MIN_ITERATIONS", Convergence::MAP.min_iterations),
@@ -1108,7 +1108,7 @@ fn m_step(
 ) -> Result<f64, candle_core::Error> {
     // L-BFGS on the deterministic objective (given the samples), stopped once an iteration improves it by less
     // than this relative to its value. It starts at the previous Mu and branch lengths and never ends worse.
-    const REL_IMPROVEMENT: f64 = 1e-9;
+    const REL_IMPROVEMENT: f64 = 1e-7;
 
     let num_samples = log_pi_samples.len() as f64;
     let log_pi_samples = log_pi_samples
