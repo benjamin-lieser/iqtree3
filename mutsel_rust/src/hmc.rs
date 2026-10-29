@@ -826,9 +826,9 @@ impl EmSettings {
     /// from the environment.
     pub fn from_env() -> EmSettings {
         EmSettings {
-            iterations: env_or("MUTSEL_EM_ITERATIONS", 30),
-            tree_length_tolerance: env_or("MUTSEL_EM_TOL", 0.01),
-            window: env_or("MUTSEL_EM_WINDOW", 3),
+            iterations: env_or("MUTSEL_EM_ITERATIONS", 50),
+            tree_length_tolerance: env_or("MUTSEL_EM_TOL", 0.005),
+            window: env_or("MUTSEL_EM_WINDOW", 5),
             num_samples: env_or("MUTSEL_EM_SAMPLES", 8),
             num_tune: env_or("MUTSEL_EM_TUNE", 200),
             num_retune: env_or("MUTSEL_EM_RETUNE", 50),
