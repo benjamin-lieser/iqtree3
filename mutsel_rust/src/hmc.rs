@@ -814,6 +814,8 @@ pub struct EmSettings {
     pub num_retune: u64,
     /// Maximum number of L-BFGS iterations per M-step
     pub max_mstep_iterations: usize,
+    /// Number of first EM iterations whose M-step uses fewer samples and L-BFGS iterations (see mstep_schedule)
+    pub mstep_ramp: usize,
     /// Convergence of the MAP estimate EM starts from
     pub map_convergence: Convergence,
     /// pi_reg of the MAP estimate, None uses the model's pi_reg
@@ -833,6 +835,7 @@ impl EmSettings {
             num_tune: env_or("MUTSEL_EM_TUNE", 200),
             num_retune: env_or("MUTSEL_EM_RETUNE", 50),
             max_mstep_iterations: env_or("MUTSEL_EM_MSTEP_ITERATIONS", 50),
+            mstep_ramp: env_or("MUTSEL_EM_MSTEP_RAMP", 3),
             // Same as optimize_internal by default
             map_convergence: Convergence {
                 min_iterations: env_or("MUTSEL_MAP_MIN_ITERATIONS", Convergence::MAP.min_iterations),
@@ -856,6 +859,17 @@ impl EmSettings {
             return None;
         }
         Some((tree_lengths[n - 1] - tree_lengths[n - 1 - self.window]).abs() / tree_lengths[n - 1])
+    }
+
+    /// Number of samples per site and maximum number of L-BFGS iterations of the M-step. In the first
+    /// mstep_ramp iterations Mu and the branch lengths are still far from the optimum and the next E-step
+    /// resamples the sites anyway, so both rise linearly from 1/(mstep_ramp+1) of the full values.
+    fn mstep_schedule(&self, iteration: usize) -> (usize, usize) {
+        if iteration >= self.mstep_ramp {
+            return (self.num_samples, self.max_mstep_iterations);
+        }
+        let fraction = |full: usize| (full * (iteration + 1) / (self.mstep_ramp + 1)).max(1);
+        (fraction(self.num_samples).max(2.min(self.num_samples)), fraction(self.max_mstep_iterations))
     }
 
     /// NUTS settings of the E-step: about num_samples independent samples per site
@@ -1185,12 +1199,13 @@ fn m_step(
         REL_IMPROVEMENT,
     );
     let (log_likelihood, objective, _) = evaluate(&optimum)?;
-    if verbosity.should_print(Verbosity::Med) {
+    if verbosity.should_print(Verbosity::Min) {
         println!(
-            "MUTSEL HMC M-step: expected log likelihood {:.3}, objective {:.3} after {} evaluations ({:.1}s)",
+            "MUTSEL HMC M-step: expected log likelihood {:.3}, objective {:.3} after {} evaluations with {} samples per site ({:.1}s)",
             log_likelihood,
             objective,
             num_evaluations,
+            log_pi_samples.len(),
             start.elapsed().as_secs_f64()
         );
     }
@@ -1522,15 +1537,17 @@ fn fit_with_em(
 
         let log_pi_samples = thinned_log_pi(&site_samples, em.num_samples, pca)?;
         drop(site_samples);
+        // The last thinned draws are the furthest from the chain starts
+        let (mstep_samples, mstep_iterations) = em.mstep_schedule(iteration);
         let log_likelihood = m_step(
             &edge_op,
             &log_R,
             &init_log_R,
             &log_branch_lengths,
-            &log_pi_samples,
+            &log_pi_samples[em.num_samples - mstep_samples..],
             rate_scaling,
             mutsel_params,
-            em.max_mstep_iterations,
+            mstep_iterations,
             verbosity,
         )?;
 
@@ -1619,7 +1636,7 @@ pub fn sample_internal(
         settings.seed
     );
     println!(
-        "MUTSEL HMC: Mu and branch lengths from the MAP estimate ({}-{} iterations, relative improvement {:.0e}) refined by Monte Carlo EM until the tree length changes by less than {:.1}% over {} iterations, at most {} iterations ({} samples per site, {} tuning draws in the first and {} in later iterations, at most {} M-step iterations)",
+        "MUTSEL HMC: Mu and branch lengths from the MAP estimate ({}-{} iterations, relative improvement {:.0e}) refined by Monte Carlo EM until the tree length changes by less than {:.1}% over {} iterations, at most {} iterations ({} samples per site, {} tuning draws in the first and {} in later iterations, at most {} M-step iterations, fewer samples and M-step iterations in the first {})",
         em.map_convergence.min_iterations,
         em.map_convergence.max_iterations,
         em.map_convergence.min_rel_improvement,
@@ -1629,7 +1646,8 @@ pub fn sample_internal(
         em.num_samples,
         em.num_tune,
         em.num_retune,
-        em.max_mstep_iterations
+        em.max_mstep_iterations,
+        em.mstep_ramp
     );
     assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
     assert!(
@@ -2235,6 +2253,17 @@ mod tests {
             .find(|&n| em.tree_length_change(&tree_lengths[..n]).is_some_and(|c| c < em.tree_length_tolerance));
         assert_eq!(first_stop, Some(7));
         assert_eq!(em.tree_length_change(&tree_lengths[..3]), None);
+    }
+
+    #[test]
+    fn mstep_schedule_ramps_up_to_the_full_settings() {
+        let em = EmSettings { num_samples: 8, max_mstep_iterations: 50, mstep_ramp: 3, ..EmSettings::from_env() };
+        let schedule: Vec<_> = (0..5).map(|i| em.mstep_schedule(i)).collect();
+        assert_eq!(schedule, vec![(2, 12), (4, 25), (6, 37), (8, 50), (8, 50)]);
+        let em = EmSettings { mstep_ramp: 0, ..em };
+        assert_eq!(em.mstep_schedule(0), (8, 50));
+        let em = EmSettings { num_samples: 1, mstep_ramp: 3, ..em };
+        assert_eq!(em.mstep_schedule(0).0, 1);
     }
 
     /// Full gradient including phylo_grad against a fourth order central difference
