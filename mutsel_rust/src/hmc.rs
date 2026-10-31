@@ -579,9 +579,9 @@ fn min_effective_sample_size(draws: &[f64], dim: usize) -> f64 {
     min_ess
 }
 
-fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index: usize) -> SiteSamples {
-    let shared = Arc::clone(&logp.shared);
+type SiteChain = <DiagNutsSettings as Settings>::Chain<CpuMath<SiteLogp>>;
 
+fn new_site_chain(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index: usize) -> SiteChain {
     let mut nuts_settings = DiagNutsSettings::default();
     nuts_settings.num_tune = settings.num_tune;
     nuts_settings.num_draws = settings.max_draws;
@@ -597,7 +597,18 @@ fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index:
     chain
         .set_position(init)
         .unwrap_or_else(|e| panic!("Site {}: could not initialize HMC chain: {:?}", site_index, e));
+    chain
+}
 
+fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index: usize) -> SiteSamples {
+    let mut chain = new_site_chain(logp, init, settings, site_index);
+    draw_site(&mut chain, settings, 0, site_index)
+}
+
+/// Draws from a chain until the ESS target is reached, after its tuning draws and then burn_in further draws
+fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site_index: usize) -> SiteSamples {
+    let shared = Arc::clone(&chain.math().logp_func().shared);
+    let mut num_burn_in = 0;
     let mut draws = Vec::with_capacity(settings.num_draws as usize * NUM_COMPONENTS);
     let mut num_divergences = 0;
     let mut num_steps = 0u64;
@@ -611,6 +622,10 @@ fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index:
             .draw()
             .unwrap_or_else(|e| panic!("Site {}: HMC sampling failed: {:?}", site_index, e));
         if progress.tuning {
+            continue;
+        }
+        if num_burn_in < burn_in {
+            num_burn_in += 1;
             continue;
         }
         draws.extend_from_slice(&draw);
@@ -810,8 +825,9 @@ pub struct EmSettings {
     pub num_samples: usize,
     /// NUTS tuning draws per site in the first E-step
     pub num_tune: u64,
-    /// NUTS tuning draws per site in the later E-steps, whose chains start at the previous draws
-    pub num_retune: u64,
+    /// Draws per site discarded in the later E-steps, whose chains continue from the previous E-step with the new
+    /// Mu and branch lengths and keep their step size and mass matrix
+    pub num_burn_in: usize,
     /// Maximum number of L-BFGS iterations per M-step
     pub max_mstep_iterations: usize,
     /// Number of first EM iterations whose M-step uses fewer samples and L-BFGS iterations (see mstep_schedule)
@@ -823,7 +839,7 @@ pub struct EmSettings {
 }
 
 impl EmSettings {
-    /// Reads MUTSEL_EM_ITERATIONS, MUTSEL_EM_TOL, MUTSEL_EM_WINDOW, MUTSEL_EM_SAMPLES, MUTSEL_EM_TUNE, MUTSEL_EM_RETUNE, MUTSEL_EM_MSTEP_ITERATIONS,
+    /// Reads MUTSEL_EM_ITERATIONS, MUTSEL_EM_TOL, MUTSEL_EM_WINDOW, MUTSEL_EM_SAMPLES, MUTSEL_EM_TUNE, MUTSEL_EM_BURNIN, MUTSEL_EM_MSTEP_ITERATIONS,
     /// MUTSEL_MAP_MIN_ITERATIONS, MUTSEL_MAP_MAX_ITERATIONS, MUTSEL_MAP_REL_IMPROVEMENT and MUTSEL_MAP_PI_REG
     /// from the environment.
     pub fn from_env() -> EmSettings {
@@ -833,7 +849,7 @@ impl EmSettings {
             window: env_or("MUTSEL_EM_WINDOW", 5),
             num_samples: env_or("MUTSEL_EM_SAMPLES", 8),
             num_tune: env_or("MUTSEL_EM_TUNE", 200),
-            num_retune: env_or("MUTSEL_EM_RETUNE", 50),
+            num_burn_in: env_or("MUTSEL_EM_BURNIN", 20),
             max_mstep_iterations: env_or("MUTSEL_EM_MSTEP_ITERATIONS", 50),
             mstep_ramp: env_or("MUTSEL_EM_MSTEP_RAMP", 3),
             // Same as optimize_internal by default
@@ -875,7 +891,7 @@ impl EmSettings {
     /// NUTS settings of the E-step: about num_samples independent samples per site
     fn hmc_settings(&self, settings: &HmcSettings, iteration: usize) -> HmcSettings {
         HmcSettings {
-            num_tune: if iteration == 0 { self.num_tune } else { self.num_retune },
+            num_tune: self.num_tune,
             num_draws: (10 * self.num_samples).max(50) as u64,
             target_ess: self.num_samples,
             max_draws: settings.max_draws,
@@ -1001,6 +1017,80 @@ fn lbfgs<F: FnMut(&DVector<f64>) -> Option<(f64, DVector<f64>)>>(
     x
 }
 
+fn new_site_logp(
+    shared: &Arc<SharedModel>,
+    tree: &Arc<FelsensteinTree<20>>,
+    alignment: &[u8],
+    num_leaves: usize,
+    site: usize,
+) -> SiteLogp {
+    SiteLogp {
+        shared: Arc::clone(shared),
+        tree: Arc::clone(tree),
+        leaf_pl: leaf_partial_likelihoods(alignment, site, num_leaves),
+        pl_buffer: vec![SVector::<f64, 20>::zeros(); tree.num_nodes()],
+    }
+}
+
+/// Prints the number of sampled sites every 10% of the sites
+struct SamplingProgress<'a> {
+    label: &'a str,
+    num_sites: usize,
+    verbosity: Verbosity,
+    start: std::time::Instant,
+    num_done: AtomicUsize,
+}
+
+impl<'a> SamplingProgress<'a> {
+    fn new(label: &'a str, num_sites: usize, verbosity: Verbosity) -> Self {
+        SamplingProgress { label, num_sites, verbosity, start: std::time::Instant::now(), num_done: AtomicUsize::new(0) }
+    }
+
+    fn site_done(&self) {
+        let done = self.num_done.fetch_add(1, Ordering::Relaxed) + 1;
+        let report_every = (self.num_sites / 10).max(1);
+        if self.verbosity.should_print(Verbosity::Min) && (done % report_every == 0 || done == self.num_sites) {
+            println!(
+                "MUTSEL HMC {}: {}/{} sites sampled ({:.1}s)",
+                self.label,
+                done,
+                self.num_sites,
+                self.start.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    fn summary(&self, site_samples: &[SiteSamples], settings: &HmcSettings) {
+        let num_sites = site_samples.len();
+        let total_divergences: usize = site_samples.iter().map(|s| s.num_divergences).sum();
+        let sites_with_divergences = site_samples.iter().filter(|s| s.num_divergences > 0).count();
+        let total_draws: usize = site_samples.iter().map(|s| s.num_draws).sum();
+        let mean_steps = site_samples
+            .iter()
+            .map(|s| s.mean_num_steps * s.num_draws as f64)
+            .sum::<f64>()
+            / total_draws.max(1) as f64;
+        let min_ess = site_samples.iter().map(|s| s.ess).fold(f64::INFINITY, f64::min);
+        let sites_below_target = site_samples
+            .iter()
+            .filter(|s| s.ess < settings.target_ess as f64)
+            .count();
+        println!(
+            "MUTSEL HMC {}: done in {:.1}s, {} draws per site on average, {} divergent transitions in {} sites, mean {:.1} leapfrog steps per draw",
+            self.label,
+            self.start.elapsed().as_secs_f64(),
+            total_draws / num_sites.max(1),
+            total_divergences,
+            sites_with_divergences,
+            mean_steps
+        );
+        println!(
+            "MUTSEL HMC {}: minimum ESS over sites {:.0}, {} sites below the target ESS {} after {} draws",
+            self.label, min_ess, sites_below_target, settings.target_ess, settings.max_draws
+        );
+    }
+}
+
 /// Runs an independent NUTS chain for every site, starting at init[site]
 fn sample_sites(
     shared: &Arc<SharedModel>,
@@ -1013,71 +1103,83 @@ fn sample_sites(
     label: &str,
 ) -> Vec<SiteSamples> {
     let num_sites = init.len();
-    let num_nodes = tree.num_nodes();
-    let start = std::time::Instant::now();
-    let num_done = AtomicUsize::new(0);
-    let report_every = (num_sites / 10).max(1);
+    let progress = SamplingProgress::new(label, num_sites, verbosity);
 
     let site_samples: Vec<SiteSamples> = (0..num_sites)
         .into_par_iter()
         .map(|site| {
-            let logp = SiteLogp {
-                shared: Arc::clone(shared),
-                tree: Arc::clone(tree),
-                leaf_pl: leaf_partial_likelihoods(alignment, site, num_leaves),
-                pl_buffer: vec![SVector::<f64, 20>::zeros(); num_nodes],
-            };
+            let logp = new_site_logp(shared, tree, alignment, num_leaves, site);
             let mut samples = sample_site(logp, &init[site], settings, site);
             if settings.marginal {
-                let mut logp = SiteLogp {
-                    shared: Arc::clone(shared),
-                    tree: Arc::clone(tree),
-                    leaf_pl: leaf_partial_likelihoods(alignment, site, num_leaves),
-                    pl_buffer: vec![SVector::<f64, 20>::zeros(); num_nodes],
-                };
+                let mut logp = new_site_logp(shared, tree, alignment, num_leaves, site);
                 samples.log_marginal = site_log_marginal(&mut logp, &samples, settings.seed ^ (site as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
             }
-
-            let done = num_done.fetch_add(1, Ordering::Relaxed) + 1;
-            if verbosity.should_print(Verbosity::Min) && (done % report_every == 0 || done == num_sites) {
-                println!(
-                    "MUTSEL HMC {}: {}/{} sites sampled ({:.1}s)",
-                    label,
-                    done,
-                    num_sites,
-                    start.elapsed().as_secs_f64()
-                );
-            }
+            progress.site_done();
             samples
         })
         .collect();
 
-    let total_divergences: usize = site_samples.iter().map(|s| s.num_divergences).sum();
-    let sites_with_divergences = site_samples.iter().filter(|s| s.num_divergences > 0).count();
-    let total_draws: usize = site_samples.iter().map(|s| s.num_draws).sum();
-    let mean_steps = site_samples
-        .iter()
-        .map(|s| s.mean_num_steps * s.num_draws as f64)
-        .sum::<f64>()
-        / total_draws.max(1) as f64;
-    let min_ess = site_samples.iter().map(|s| s.ess).fold(f64::INFINITY, f64::min);
-    let sites_below_target = site_samples
-        .iter()
-        .filter(|s| s.ess < settings.target_ess as f64)
-        .count();
-    println!(
-        "MUTSEL HMC {}: done in {:.1}s, {} draws per site on average, {} divergent transitions in {} sites, mean {:.1} leapfrog steps per draw",
-        label,
-        start.elapsed().as_secs_f64(),
-        total_draws / num_sites.max(1),
-        total_divergences,
-        sites_with_divergences,
-        mean_steps
-    );
-    println!(
-        "MUTSEL HMC {}: minimum ESS over sites {:.0}, {} sites below the target ESS {} after {} draws",
-        label, min_ess, sites_below_target, settings.target_ess, settings.max_draws
-    );
+    progress.summary(&site_samples, settings);
+    site_samples
+}
+
+/// Samples every site with a NUTS chain that is kept between calls (the E-steps of EM). If chains is empty, the
+/// chains start at init[site] and are tuned. Otherwise each chain continues from its last draw under the new shared
+/// model and tree, with the step size and mass matrix of its tuning, after burn_in draws. Any fixed step size and
+/// mass matrix leave the new posterior invariant, and the posterior moves little between EM iterations.
+fn sample_sites_persistent(
+    chains: &mut Vec<SiteChain>,
+    shared: &Arc<SharedModel>,
+    tree: &Arc<FelsensteinTree<20>>,
+    alignment: &[u8],
+    num_leaves: usize,
+    init: &[Vec<f64>],
+    settings: &HmcSettings,
+    burn_in: usize,
+    verbosity: Verbosity,
+    label: &str,
+) -> Vec<SiteSamples> {
+    let num_sites = init.len();
+    let progress = SamplingProgress::new(label, num_sites, verbosity);
+    // The partial likelihood buffers are only allocated while a site is sampled, so that the kept chains are small
+    let free_buffers = |chain: &mut SiteChain| {
+        let mut math = chain.math_mut();
+        let logp = math.logp_func_mut();
+        logp.leaf_pl = Vec::new();
+        logp.pl_buffer = Vec::new();
+    };
+    let burn_in = if chains.is_empty() {
+        *chains = (0..num_sites)
+            .into_par_iter()
+            .map(|site| {
+                let mut chain = new_site_chain(new_site_logp(shared, tree, alignment, num_leaves, site), &init[site], settings, site);
+                free_buffers(&mut chain);
+                chain
+            })
+            .collect();
+        // The tuning draws already move the chains into the posterior
+        0
+    } else {
+        burn_in
+    };
+    assert_eq!(chains.len(), num_sites);
+
+    let site_samples: Vec<SiteSamples> = chains
+        .par_iter_mut()
+        .enumerate()
+        .map(|(site, chain)| {
+            *chain.math_mut().logp_func_mut() = new_site_logp(shared, tree, alignment, num_leaves, site);
+            chain
+                .refresh_state()
+                .unwrap_or_else(|e| panic!("Site {}: could not continue HMC chain: {:?}", site, e));
+            let samples = draw_site(chain, settings, burn_in, site);
+            free_buffers(chain);
+            progress.site_done();
+            samples
+        })
+        .collect();
+
+    progress.summary(&site_samples, settings);
     site_samples
 }
 
@@ -1515,6 +1617,7 @@ fn fit_with_em(
     };
 
     let mut positions = init_pca_tensor.to_vec2::<f64>()?;
+    let mut chains: Vec<SiteChain> = Vec::new();
     let mut em_log_likelihood = Vec::with_capacity(em.iterations);
     let mut em_tree_length = Vec::with_capacity(em.iterations);
     for iteration in 0..em.iterations {
@@ -1526,9 +1629,20 @@ fn fit_with_em(
             &log_branch_lengths.exp()?.to_vec1::<f64>()?,
         ));
         let em_settings = em.hmc_settings(&settings, iteration);
-        let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &em_settings, verbosity, &label);
+        let site_samples = sample_sites_persistent(
+            &mut chains,
+            &shared,
+            &tree,
+            alignment,
+            num_leaves,
+            &positions,
+            &em_settings,
+            em.num_burn_in,
+            verbosity,
+            &label,
+        );
 
-        // Next chains start at the last draw, which is the last thinned draw
+        // The last draw, which is the last thinned draw, for the final sampling
         let last = (em.num_samples - 1) * NUM_COMPONENTS;
         positions = site_samples
             .iter()
@@ -1636,7 +1750,7 @@ pub fn sample_internal(
         settings.seed
     );
     println!(
-        "MUTSEL HMC: Mu and branch lengths from the MAP estimate ({}-{} iterations, relative improvement {:.0e}) refined by Monte Carlo EM until the tree length changes by less than {:.1}% over {} iterations, at most {} iterations ({} samples per site, {} tuning draws in the first and {} in later iterations, at most {} M-step iterations, fewer samples and M-step iterations in the first {})",
+        "MUTSEL HMC: Mu and branch lengths from the MAP estimate ({}-{} iterations, relative improvement {:.0e}) refined by Monte Carlo EM until the tree length changes by less than {:.1}% over {} iterations, at most {} iterations ({} samples per site, {} tuning draws in the first iteration, then the chains continue with {} burn-in draws, at most {} M-step iterations, fewer samples and M-step iterations in the first {})",
         em.map_convergence.min_iterations,
         em.map_convergence.max_iterations,
         em.map_convergence.min_rel_improvement,
@@ -1645,7 +1759,7 @@ pub fn sample_internal(
         em.iterations,
         em.num_samples,
         em.num_tune,
-        em.num_retune,
+        em.num_burn_in,
         em.max_mstep_iterations,
         em.mstep_ramp
     );
@@ -2412,5 +2526,55 @@ mod tests {
         let norm = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
         assert!(mode_value > start_value, "{} <= {}", mode_value, start_value);
         assert!(norm < 1e-4, "gradient norm {} at the mode", norm);
+    }
+
+    #[test]
+    fn persistent_chains_follow_a_changed_posterior() {
+        // A narrow Gaussian prior dominates the posterior, so moving its mean moves the posterior by about as much
+        let gaussian_prior = |shift: f64| {
+            let std: f64 = 0.3;
+            let mean = SVector::<f64, NUM_COMPONENTS>::from_iterator(test_point().iter().map(|x| x + shift));
+            let prior = GmmPrior {
+                log_norm: vec![-(NUM_COMPONENTS as f64) * std.ln() - 0.5 * NUM_COMPONENTS as f64 * (2.0 * std::f64::consts::PI).ln()],
+                means: vec![mean],
+                precisions: vec![SMatrix::identity() / (std * std)],
+            };
+            Arc::new(
+                SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)
+                    .with_mixture_prior(Some(Arc::new(MixturePrior::Gaussian(prior)))),
+            )
+        };
+        let tree = Arc::new(test_tree());
+        let alignment: Vec<u8> = ALIGNMENT.iter().chain(ALIGNMENT.iter()).copied().collect();
+        let init = vec![test_point(); 2];
+        let settings = HmcSettings {
+            num_tune: 200,
+            num_draws: 400,
+            target_ess: 100,
+            max_draws: 20000,
+            num_output_samples: 100,
+            seed: 5,
+            marginal: false,
+        };
+        let mean_draw = |samples: &SiteSamples| {
+            samples
+                .thinned_draws
+                .chunks_exact(NUM_COMPONENTS)
+                .map(SVector::<f64, NUM_COMPONENTS>::from_column_slice)
+                .sum::<SVector<f64, NUM_COMPONENTS>>()
+                / settings.num_output_samples as f64
+        };
+
+        let mut chains = Vec::new();
+        let before = sample_sites_persistent(&mut chains, &gaussian_prior(0.0), &tree, &alignment, 5, &init, &settings, 20, Verbosity::Quiet, "before");
+        let after = sample_sites_persistent(&mut chains, &gaussian_prior(1.0), &tree, &alignment, 5, &init, &settings, 20, Verbosity::Quiet, "after");
+        let fresh = sample_sites(&gaussian_prior(1.0), &tree, &alignment, 5, &init, &settings, Verbosity::Quiet, "fresh");
+        for site in 0..2 {
+            let shift = (mean_draw(&after[site]) - mean_draw(&before[site])).mean();
+            assert!((shift - 1.0).abs() < 0.2, "site {}: the posterior mean moved by {} instead of about 1", site, shift);
+            // Each coordinate of a mean has a Monte Carlo error of about 0.03
+            let difference = (mean_draw(&after[site]) - mean_draw(&fresh[site])).abs().max();
+            assert!(difference < 0.15, "site {}: continued and fresh chains differ by {}", site, difference);
+        }
     }
 }

@@ -871,8 +871,7 @@ dependencies = [
 [[package]]
 name = "nuts-derive"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8cce587b5f36bc6bfa54cbf2eaf31fe5a5e0d73e96d31fde5de87a701689363"
+source = "git+https://github.com/benjamin-lieser/nuts-rs?branch=persistent-chain#ed4b0f32c5666265a47eef2ace98bda530737136"
 dependencies = [
  "nuts-storable",
  "proc-macro2",
@@ -883,8 +882,7 @@ dependencies = [
 [[package]]
 name = "nuts-rs"
 version = "0.18.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a6183b511b6610fc023da2634179d6df0f10873017d03df7221fb36dcd71a4f"
+source = "git+https://github.com/benjamin-lieser/nuts-rs?branch=persistent-chain#ed4b0f32c5666265a47eef2ace98bda530737136"
 dependencies = [
  "anyhow",
  "faer",
@@ -904,8 +902,7 @@ dependencies = [
 [[package]]
 name = "nuts-storable"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9257959045c9682c06b3f993215f1b2896bf276a1fcf39f83ac0755a904dc0d"
+source = "git+https://github.com/benjamin-lieser/nuts-rs?branch=persistent-chain#ed4b0f32c5666265a47eef2ace98bda530737136"
 
 [[package]]
 name = "once_cell"
