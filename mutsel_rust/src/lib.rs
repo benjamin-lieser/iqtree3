@@ -2,21 +2,18 @@
 
 pub mod batch;
 pub mod data;
-pub mod felsenstein;
+mod helmert;
 pub mod hmc;
 mod io;
+mod lbfgs;
 pub mod model;
-mod pca;
+pub mod npz;
 pub mod optimization;
-mod utils;
+mod prior;
 
-use std::{
-    io::Write,
-    mem::MaybeUninit,
-    path::Path,
-};
+use std::{io::Write, mem::MaybeUninit};
 
-use candle_core::IndexOp;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 // These two functions are exported, nothing else.
 
@@ -39,7 +36,6 @@ pub extern "C" fn rust_set_rayon_threads(num_threads: u32) {
 /// out_rate_matrix: [num_sites * num_tree_draws * 190] (row-major)
 /// out_rate_para: [num_para] from the rate model 1 for gamma, 2 * num_cat for free rate
 /// out variables do not need to be initialized
-/// prior_R_file and prior_pi_file can be null pointers
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_mutsel(
     parents: *const i32,
@@ -49,8 +45,6 @@ pub unsafe extern "C" fn rust_mutsel(
     num_leaves: u32,
     num_nodes: u32,
     model_str: *const std::os::raw::c_char,
-    prior_R_file: *const std::os::raw::c_char,
-    _prior_pi_file: *const std::os::raw::c_char,
     verbose: u8,
     num_tree_draws: u32,
     out_site_freq: *mut f64,
@@ -63,6 +57,15 @@ pub unsafe extern "C" fn rust_mutsel(
     let (saved_stdout, saved_stderr, tee_handle) = io::tee_to_file(&format!("{}.log", out_prefix));
 
     let parents = unsafe { std::slice::from_raw_parts(parents, num_nodes as usize) };
+    // phylo_grad only checks this in debug builds
+    assert!(
+        parents.last() == Some(&-1)
+            && parents[..parents.len() - 1]
+                .iter()
+                .enumerate()
+                .all(|(child, &parent)| parent as usize > child && parent as u32 >= num_leaves && (parent as u32) < num_nodes),
+        "parents are not topologically sorted with the leaves first"
+    );
     let branch_lengths = unsafe { std::slice::from_raw_parts(branch_lengths, num_nodes as usize) };
     let alignment =
         unsafe { std::slice::from_raw_parts(alignment, (num_sites * num_leaves) as usize) };
@@ -85,124 +88,44 @@ pub unsafe extern "C" fn rust_mutsel(
     let model_cstr = unsafe { std::ffi::CStr::from_ptr(model_str) };
     let model_str = model_cstr.to_str().unwrap();
 
-    println!("Starting mutsel optimization with {}", model_str);
+    // All settings of the model are in the prior file (MUTSEL_PRIOR, see prior.rs)
+    assert!(
+        model_str.trim().eq_ignore_ascii_case("MUTSEL"),
+        "Invalid model {}: the MUTSEL model has no parameters, its prior is set with MUTSEL_PRIOR",
+        model_str
+    );
+    println!("Starting mutsel optimization");
 
-    let mutsel_params = parse_mutsel_str(model_str);
-
-    let prior_R_file = if prior_R_file.is_null() {
-        None
-    } else {
-        let cstr = unsafe { std::ffi::CStr::from_ptr(prior_R_file) };
-        Some(Path::new(cstr.to_str().unwrap()))
-    };
-
-    // Posterior sampling of the per-site pca coordinates instead of the maximum likelihood estimate.
+    // Posterior sampling of the site frequencies (their Helmert coordinates) with Mu and the branch lengths from EM
     let (S, sqrt_pi) = hmc::sample_internal(
         parents,
         branch_lengths,
         alignment,
         num_sites as usize,
         num_leaves as usize,
-        mutsel_params,
-        prior_R_file,
         crate::Verbosity::from_u8(verbose),
         out_prefix,
         num_tree_draws as usize,
     )
     .unwrap();
 
-    let (R, pi) = model::phylograd2iqtree_parametrization(&S, &sqrt_pi).unwrap();
-    let site_freq = pi.to_vec2().unwrap();
-
-    for site_index in 0..num_models {
+    assert_eq!(S.len(), num_models);
+    for (site_index, (S, sqrt_pi)) in S.iter().zip(&sqrt_pi).enumerate() {
+        let (R, pi) = model::phylograd2iqtree_parametrization(S, sqrt_pi);
         for aa_index in 0..20 {
-            let value = site_freq[site_index][aa_index];
-            out_site_freq[site_index * 20 + aa_index].write(value);
+            out_site_freq[site_index * 20 + aa_index].write(pi[aa_index]);
         }
-    }
-
-    for site_index in 0..num_models {
         let mut idx = 0;
         // Upper diagonal
         for i in 0..20 {
             for j in (i + 1)..20 {
-                out_rate_matrix[site_index * 190 + idx]
-                    .write(R.i((site_index, i, j)).unwrap().to_scalar().unwrap());
+                out_rate_matrix[site_index * 190 + idx].write(R[(i, j)]);
                 idx += 1;
             }
         }
     }
     std::io::stdout().flush().unwrap();
     io::restore_stdout_stderr(saved_stdout, saved_stderr, tee_handle);
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct MutselParams {
-    pi_reg: f64,
-    Mu_reg: f64,
-    branch_length_reg: f64,
-}
-
-fn parse_mutsel_str(model_str: &str) -> MutselParams {
-    let model_str = model_str.trim();
-    let model_upper = model_str.to_ascii_uppercase();
-
-    // site_rate_reg is still parsed for compatibility, but site rates are fixed to 1.
-    // The branch lengths are not penalized by default, the penalty shrank long branches.
-    let (pi_reg, Mu_reg, _site_rate_reg, branch_length_reg) = if model_upper == "MUTSEL" {
-        (0.32, 9.67, 2.0, 0.0)
-    } else if model_upper.starts_with("MUTSEL{") && model_str.ends_with('}') {
-        let params_str = &model_str[7..model_str.len() - 1];
-        let values = params_str
-            .split('/')
-            .map(|value| value.trim().parse::<f64>().unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            values.len() == 4,
-            "Invalid MUTSEL format: expected MUTSEL{{pi_reg/Mu_reg/site_rate_reg/branch_length_reg}}, got {}",
-            model_str
-        );
-        (values[0], values[1], values[2], values[3])
-    } else {
-        panic!(
-            "Invalid MUTSEL format: expected MUTSEL or MUTSEL{{pi_reg/Mu_reg/site_rate_reg/branch_length_reg}}, got {}",
-            model_str
-        );
-    };
-
-    MutselParams {
-        pi_reg,
-        Mu_reg,
-        branch_length_reg,
-    }
-}
-
-fn create_felsenstein_tree(
-    parents: &[i32],
-    distances: &[f64],
-    alignment: &[u8],
-    L : usize,
-    N : usize,
-) -> phylo_grad::FelsensteinTree<20> {
-    let mut felsenstein = phylo_grad::FelsensteinTree::<20>::new(parents, distances);
-
-    let mut sites = vec![];
-    sites.resize(L, vec![]);
-    for site_idx in 0..L {
-        sites[site_idx].resize(N, phylo_grad::nalgebra::SVector::<f64, 20>::zeros());
-        for seq_idx in 0..N {
-            let residue = alignment[site_idx * N + seq_idx];
-            if residue < 20 {
-                sites[site_idx][seq_idx][residue as usize] = 1.0;
-            } else {
-                for i in 0..20 {
-                    sites[site_idx][seq_idx][i] = 1.0;
-                }
-            }
-        }
-    }
-    felsenstein.bind_leaf_pl(sites);
-    felsenstein
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

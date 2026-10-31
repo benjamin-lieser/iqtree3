@@ -1,7 +1,7 @@
-//! Per-site posterior sampling of the PCA coordinates with NUTS (nuts-rs).
+//! Per-site posterior sampling of the Helmert coordinates of the site frequencies with NUTS (nuts-rs).
 //!
 //! Mu, the branch lengths and the global rate normalization are shared and kept
-//! constant while sampling. Site rates are fixed to 1, or with MUTSEL_SITE_RATE_SD sampled as a
+//! constant while sampling. Site rates are fixed to 1, or with site_rate_sd > 0 in the prior sampled as a
 //! log-normal correction of the MutSel rate (see SiteRatePrior). With everything shared fixed, the
 //! posterior factorizes over alignment columns, so every column gets its own
 //! independent 19-dimensional (20 with site rates) NUTS chain.
@@ -12,32 +12,52 @@
 use std::{
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
-use candle_core::{Tensor, Var};
 use nuts_rs::{
     Chain, CpuLogpFunc, CpuMath, CpuMathError, DiagNutsSettings, HasDims, LogpError, Settings,
     rand::{SeedableRng, rngs::ChaCha8Rng},
 };
 use phylo_grad::{
-    FelsensteinTree,
-    nalgebra::{DVector, SMatrix, SVector},
+    Workspace,
+    nalgebra::{SMatrix, SVector},
 };
 use rayon::prelude::*;
 
 use crate::{
-    MutselParams, Verbosity, batch,
-    felsenstein::{FelsensteinOp, FelsensteinWithEdgeOp},
-    model::{self, calc_rate_matrix},
-    optimization::{Convergence, Mu, Mu_penalty, map_estimate},
-    pca::PCA,
-    utils::tensor_full,
+    Result, Verbosity, batch,
+    helmert::{self, NUM_COORDINATES},
+    lbfgs::maximize_finite,
+    model,
+    npz::{Array, write_npz},
+    optimization::{self, Convergence, MapEstimate, Mu, map_estimate},
+    prior::{Prior, SiteRatePrior},
 };
 
-const NUM_COMPONENTS: usize = 19;
+/// Topologically sorted tree (see lib.rs) with its branch lengths in the same order
+pub struct Tree {
+    parents: Vec<i32>,
+    branch_lengths: Vec<f64>,
+}
+
+impl Tree {
+    pub fn new(parents: &[i32], branch_lengths: &[f64]) -> Tree {
+        assert_eq!(parents.len(), branch_lengths.len());
+        Tree { parents: parents.to_vec(), branch_lengths: branch_lengths.to_vec() }
+    }
+
+    fn num_nodes(&self) -> usize {
+        self.parents.len()
+    }
+}
+
+/// The leaf states of every site, columns of the alignment [num_sites * num_leaves]
+fn alignment_columns(alignment: &[u8], num_leaves: usize) -> Vec<&[u8]> {
+    alignment.chunks_exact(num_leaves).collect()
+}
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     match std::env::var(name) {
@@ -54,7 +74,7 @@ pub struct HmcSettings {
     pub num_tune: u64,
     /// Draws after tuning before the effective sample size is checked for the first time
     pub num_draws: u64,
-    /// Sampling continues until every pca coordinate of a site reaches this effective sample size
+    /// Sampling continues until every Helmert coordinate of a site reaches this effective sample size
     pub target_ess: usize,
     /// Upper limit of draws per site, even if target_ess is not reached
     pub max_draws: u64,
@@ -94,47 +114,10 @@ impl LogpError for SiteLogpError {
     }
 }
 
-/// Log-normal prior of a site rate r that multiplies the site's MutSel rate matrix: log r ~ N(-sd^2/2, sd^2),
-/// so that the prior mean of r is 1 and the rates only correct the rates given by the site frequencies.
-#[derive(Debug, Clone, Copy)]
-pub struct SiteRatePrior {
-    pub sd: f64,
-}
-
-impl SiteRatePrior {
-    /// Reads MUTSEL_SITE_RATE_SD, unset or 0 keeps all site rates 1
-    pub fn from_env() -> Option<SiteRatePrior> {
-        let sd: f64 = env_or("MUTSEL_SITE_RATE_SD", 0.0);
-        assert!(sd >= 0.0, "MUTSEL_SITE_RATE_SD must not be negative");
-        (sd > 0.0).then_some(SiteRatePrior { sd })
-    }
-
-    /// M-step of the sd given draws of the log site rates: maximizes the mean of log N(l; -sd^2/2, sd^2)
-    /// = -l^2 / (2 sd^2) - l / 2 - sd^2 / 8 - log sd + const, which is at sd^4 / 4 + sd^2 = mean(l^2)
-    fn fit(log_rates: impl Iterator<Item = f64>) -> SiteRatePrior {
-        let (sum, count) = log_rates.fold((0.0, 0usize), |(sum, count), l| (sum + l * l, count + 1));
-        let mean_square = sum / count as f64;
-        SiteRatePrior { sd: (2.0 * ((1.0 + mean_square).sqrt() - 1.0)).sqrt() }
-    }
-
-    fn mean(&self) -> f64 {
-        -0.5 * self.sd * self.sd
-    }
-
-    /// Log density of the log rate and its derivative
-    fn evaluate(&self, log_rate: f64) -> (f64, f64) {
-        let z = (log_rate - self.mean()) / self.sd;
-        (
-            -0.5 * z * z - self.sd.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln(),
-            -z / self.sd,
-        )
-    }
-}
-
-/// Appends the prior mean of the log site rate to a position of only pca coordinates, if site rates are sampled
+/// Appends the prior mean of the log site rate to a position of only Helmert coordinates, if site rates are sampled
 fn with_initial_log_rate(mut position: Vec<f64>, site_rate_prior: Option<SiteRatePrior>) -> Vec<f64> {
     if let Some(prior) = site_rate_prior {
-        if position.len() == NUM_COMPONENTS {
+        if position.len() == NUM_COORDINATES {
             position.push(prior.mean());
         }
     }
@@ -143,260 +126,47 @@ fn with_initial_log_rate(mut position: Vec<f64>, site_rate_prior: Option<SiteRat
 
 /// Constants of the per-site posterior which are shared by all sites.
 struct SharedModel {
-    /// PCA components [19, 20], log_pi = components^T * x (up to a constant)
-    components: SMatrix<f64, NUM_COMPONENTS, 20>,
-    /// Log of the mutation equilibrium (diagonal of Mu)
-    log_mutation_equilibrium: SVector<f64, 20>,
+    /// Helmert basis [19, 20], log_pi = basis^T * x (up to a constant)
+    basis: SMatrix<f64, NUM_COORDINATES, 20>,
     /// Mu with the fixed global rate normalization already applied
     scaled_Mu: SMatrix<f64, 20, 20>,
-    prior_mean: SVector<f64, NUM_COMPONENTS>,
-    /// alpha / pi_reg
-    prior_scale: SVector<f64, NUM_COMPONENTS>,
-    prior_beta: SVector<f64, NUM_COMPONENTS>,
-    /// Replaces the generalized normal prior if set
-    mixture_prior: Option<Arc<MixturePrior>>,
+    /// The prior of the site frequencies is read from it
+    prior: Arc<Prior>,
     /// If set, the position has the log site rate as an additional last coordinate
     site_rate_prior: Option<SiteRatePrior>,
 }
 
-/// Alternative priors on the pca coordinates, see MixturePrior::from_env
-pub enum MixturePrior {
-    Gaussian(GmmPrior),
-    Dirichlet(DirichletMixturePrior),
-}
-
-impl MixturePrior {
-    /// Reads MUTSEL_PRIOR_GMM (Gaussian mixture on the pca coordinates) or MUTSEL_PRIOR_DM
-    /// (Dirichlet mixture on the site frequencies), at most one of them may be set
-    pub fn from_env() -> Option<Arc<MixturePrior>> {
-        let gmm = std::env::var("MUTSEL_PRIOR_GMM").ok();
-        let dm = std::env::var("MUTSEL_PRIOR_DM").ok();
-        let prior = match (gmm, dm) {
-            (None, None) => return None,
-            (Some(path), None) => {
-                let prior = GmmPrior::read(Path::new(path.trim()))
-                    .unwrap_or_else(|e| panic!("Could not read MUTSEL_PRIOR_GMM={}: {}", path, e));
-                println!("MUTSEL HMC: Gaussian mixture prior with {} components from {}", prior.means.len(), path);
-                MixturePrior::Gaussian(prior)
-            }
-            (None, Some(path)) => {
-                let prior = DirichletMixturePrior::read(Path::new(path.trim()))
-                    .unwrap_or_else(|e| panic!("Could not read MUTSEL_PRIOR_DM={}: {}", path, e));
-                println!("MUTSEL HMC: Dirichlet mixture prior with {} components from {}", prior.alphas.len(), path);
-                MixturePrior::Dirichlet(prior)
-            }
-            (Some(_), Some(_)) => panic!("Only one of MUTSEL_PRIOR_GMM and MUTSEL_PRIOR_DM can be set"),
-        };
-        Some(Arc::new(prior))
-    }
-
-    /// Log density on the pca coordinates and its gradient
-    fn evaluate(
-        &self,
-        x: &SVector<f64, NUM_COMPONENTS>,
-        components: &SMatrix<f64, NUM_COMPONENTS, 20>,
-    ) -> (f64, SVector<f64, NUM_COMPONENTS>) {
-        match self {
-            MixturePrior::Gaussian(prior) => prior.evaluate(x),
-            MixturePrior::Dirichlet(prior) => prior.evaluate(x, components),
-        }
-    }
-}
-
-/// log Gamma(x) for x > 0 (Lanczos approximation, g = 7, relative error ~1e-15)
-fn ln_gamma(x: f64) -> f64 {
-    const COEFFICIENTS: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    if x < 0.5 {
-        // Reflection formula
-        return (std::f64::consts::PI / (std::f64::consts::PI * x).sin()).ln() - ln_gamma(1.0 - x);
-    }
-    let x = x - 1.0;
-    let mut sum = COEFFICIENTS[0];
-    for (i, c) in COEFFICIENTS.iter().enumerate().skip(1) {
-        sum += c / (x + i as f64);
-    }
-    let t = x + 7.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + sum.ln()
-}
-
-/// Dirichlet mixture prior on the site frequencies, read from an npz file with weights [K] and alphas [K, 20].
-/// As a density on the pca coordinates (an orthonormal basis of the sum-zero log frequencies) it is
-/// sum_k w_k Dir(pi(x); alpha_k) * prod_i pi_i * sqrt(20).
-pub struct DirichletMixturePrior {
-    /// log weight + log Gamma(sum alpha) - sum log Gamma(alpha_i) + log(sqrt(20))
-    log_norm: Vec<f64>,
-    alphas: Vec<SVector<f64, 20>>,
-}
-
-impl DirichletMixturePrior {
-    pub fn read(path: &Path) -> Result<DirichletMixturePrior, candle_core::Error> {
-        let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
-        let get = |name: &str| {
-            arrays
-                .get(name)
-                .ok_or_else(|| candle_core::Error::Msg(format!("{} not found in {}", name, path.display())))
-        };
-        let weights = get("weights")?.to_dtype(candle_core::DType::F64)?.to_vec1::<f64>()?;
-        let alphas = get("alphas")?.to_dtype(candle_core::DType::F64)?.to_vec2::<f64>()?;
-        let mut prior = DirichletMixturePrior { log_norm: vec![], alphas: vec![] };
-        for (weight, alpha) in weights.iter().zip(&alphas) {
-            let alpha = SVector::<f64, 20>::from_column_slice(alpha);
-            prior.log_norm.push(
-                weight.ln() + ln_gamma(alpha.sum()) - alpha.iter().map(|&a| ln_gamma(a)).sum::<f64>() + 0.5 * 20f64.ln(),
-            );
-            prior.alphas.push(alpha);
-        }
-        Ok(prior)
-    }
-
-    fn evaluate(
-        &self,
-        x: &SVector<f64, NUM_COMPONENTS>,
-        components: &SMatrix<f64, NUM_COMPONENTS, 20>,
-    ) -> (f64, SVector<f64, NUM_COMPONENTS>) {
-        let unnormalized = components.transpose() * x;
-        let max = unnormalized.max();
-        let log_sum = unnormalized.map(|l| (l - max).exp()).sum().ln() + max;
-        let log_pi = unnormalized.add_scalar(-log_sum);
-        let pi = log_pi.map(f64::exp);
-        // The Jacobian prod_i pi_i adds 1 to every alpha
-        let log_densities: Vec<f64> = self
-            .log_norm
-            .iter()
-            .zip(&self.alphas)
-            .map(|(log_norm, alpha)| log_norm + alpha.dot(&log_pi))
-            .collect();
-        let max_density = log_densities.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let mut sum = 0.0;
-        let mut weighted_alpha = SVector::<f64, 20>::zeros();
-        for (log_density, alpha) in log_densities.iter().zip(&self.alphas) {
-            let r = (log_density - max_density).exp();
-            sum += r;
-            weighted_alpha += alpha * r;
-        }
-        weighted_alpha /= sum;
-        // d log pi_i / dx = components[:, i] - components * pi
-        let grad = components * (weighted_alpha - pi * weighted_alpha.sum());
-        (max_density + sum.ln(), grad)
-    }
-}
-
-/// Gaussian mixture prior on the pca coordinates, read from an npz file with
-/// weights [K], means [K, 19] and covs [K, 19, 19]
-pub struct GmmPrior {
-    /// log weight - log det(cov) / 2 - 19 log(2 pi) / 2
-    log_norm: Vec<f64>,
-    means: Vec<SVector<f64, NUM_COMPONENTS>>,
-    precisions: Vec<SMatrix<f64, NUM_COMPONENTS, NUM_COMPONENTS>>,
-}
-
-impl GmmPrior {
-    pub fn read(path: &Path) -> Result<GmmPrior, candle_core::Error> {
-        let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
-        let get = |name: &str| {
-            arrays
-                .get(name)
-                .ok_or_else(|| candle_core::Error::Msg(format!("{} not found in {}", name, path.display())))
-        };
-        let weights = get("weights")?.to_dtype(candle_core::DType::F64)?.to_vec1::<f64>()?;
-        let means = get("means")?.to_dtype(candle_core::DType::F64)?.to_vec2::<f64>()?;
-        let covs = get("covs")?.to_dtype(candle_core::DType::F64)?.to_vec3::<f64>()?;
-        let mut prior = GmmPrior { log_norm: vec![], means: vec![], precisions: vec![] };
-        for k in 0..weights.len() {
-            let cov = SMatrix::<f64, NUM_COMPONENTS, NUM_COMPONENTS>::from_row_iterator(covs[k].iter().flatten().copied());
-            let chol = cov
-                .cholesky()
-                .ok_or_else(|| candle_core::Error::Msg(format!("Covariance {} of the GMM prior is not positive definite", k)))?;
-            let log_det = 2.0 * chol.l().diagonal().map(f64::ln).sum();
-            prior.log_norm.push(
-                weights[k].ln() - 0.5 * log_det - 0.5 * NUM_COMPONENTS as f64 * (2.0 * std::f64::consts::PI).ln(),
-            );
-            prior.means.push(SVector::<f64, NUM_COMPONENTS>::from_column_slice(&means[k]));
-            prior.precisions.push(chol.inverse());
-        }
-        Ok(prior)
-    }
-
-    /// Log density and its gradient
-    fn evaluate(&self, x: &SVector<f64, NUM_COMPONENTS>) -> (f64, SVector<f64, NUM_COMPONENTS>) {
-        let mut log_densities = Vec::with_capacity(self.means.len());
-        let mut grads = Vec::with_capacity(self.means.len());
-        for k in 0..self.means.len() {
-            let grad = -(self.precisions[k] * (x - self.means[k]));
-            log_densities.push(self.log_norm[k] + 0.5 * (x - self.means[k]).dot(&grad));
-            grads.push(grad);
-        }
-        let max = log_densities.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let mut sum = 0.0;
-        let mut grad = SVector::<f64, NUM_COMPONENTS>::zeros();
-        for (log_density, g) in log_densities.iter().zip(&grads) {
-            let r = (log_density - max).exp();
-            sum += r;
-            grad += g * r;
-        }
-        (max + sum.ln(), grad / sum)
-    }
-}
-
 impl SharedModel {
-    fn new(Mu: &Tensor, rate_scaling: f64, pca: &PCA, pi_reg: f64) -> SharedModel {
-        let Mu_values = Mu.flatten_all().unwrap().to_vec1::<f64>().unwrap();
-        let Mu = SMatrix::<f64, 20, 20>::from_row_slice(&Mu_values);
-        let components = pca.components.flatten_all().unwrap().to_vec1::<f64>().unwrap();
-        let to_vec = |t: &Tensor| {
-            SVector::<f64, NUM_COMPONENTS>::from_column_slice(
-                &t.narrow(0, 0, NUM_COMPONENTS).unwrap().to_vec1::<f64>().unwrap(),
-            )
-        };
+    fn new(Mu: &SMatrix<f64, 20, 20>, rate_scaling: f64, prior: Arc<Prior>) -> SharedModel {
         SharedModel {
-            components: SMatrix::<f64, NUM_COMPONENTS, 20>::from_row_slice(&components),
-            log_mutation_equilibrium: Mu.diagonal().map(f64::ln),
+            basis: helmert::basis(),
             scaled_Mu: Mu * rate_scaling,
-            prior_mean: to_vec(&pca.mean),
-            prior_scale: to_vec(&pca.alpha) / pi_reg,
-            prior_beta: to_vec(&pca.beta),
-            mixture_prior: None,
+            prior,
             site_rate_prior: None,
         }
-    }
-}
-
-impl SharedModel {
-    fn with_mixture_prior(self, mixture_prior: Option<Arc<MixturePrior>>) -> SharedModel {
-        SharedModel { mixture_prior, ..self }
     }
 
     fn with_site_rate_prior(self, site_rate_prior: Option<SiteRatePrior>) -> SharedModel {
         SharedModel { site_rate_prior, ..self }
     }
 
-    /// Dimension of a site's position: the pca coordinates and, if sampled, the log site rate
+    /// Dimension of a site's position: the Helmert coordinates and, if sampled, the log site rate
     fn dim(&self) -> usize {
-        NUM_COMPONENTS + self.site_rate_prior.is_some() as usize
+        NUM_COORDINATES + self.site_rate_prior.is_some() as usize
     }
 
     /// Site rate of a position, 1 if site rates are not sampled
     fn site_rate(&self, position: &[f64]) -> f64 {
-        if self.site_rate_prior.is_some() { position[NUM_COMPONENTS].exp() } else { 1.0 }
+        if self.site_rate_prior.is_some() { position[NUM_COORDINATES].exp() } else { 1.0 }
     }
 
-    /// evaluate() at the pca coordinates of a position, with S multiplied by the site rate and the log prior of
+    /// evaluate() at the Helmert coordinates of a position, with S multiplied by the site rate and the log prior of
     /// the log site rate added if site rates are sampled
     fn evaluate_position(&self, position: &[f64]) -> SiteModelEval {
-        let mut eval = self.evaluate(&SVector::<f64, NUM_COMPONENTS>::from_column_slice(&position[..NUM_COMPONENTS]));
+        let mut eval = self.evaluate(&SVector::<f64, NUM_COORDINATES>::from_column_slice(&position[..NUM_COORDINATES]));
         if let Some(prior) = &self.site_rate_prior {
-            eval.S *= position[NUM_COMPONENTS].exp();
-            eval.log_prior += prior.evaluate(position[NUM_COMPONENTS]).0;
+            eval.S *= position[NUM_COORDINATES].exp();
+            eval.log_prior += prior.evaluate(position[NUM_COORDINATES]).0;
         }
         eval
     }
@@ -411,152 +181,78 @@ impl SharedModel {
         grad_sqrt_pi: &SVector<f64, 20>,
         gradient: &mut [f64],
     ) {
-        // S scales with the site rate, so backpropagate gives the gradient w.r.t. the pca coordinates
+        // S scales with the site rate, so backpropagate gives the gradient w.r.t. the Helmert coordinates
         // with the scaled S, and d S_ij / d log r = S_ij
-        gradient[..NUM_COMPONENTS].copy_from_slice(self.backpropagate(eval, grad_S, grad_sqrt_pi).as_slice());
+        gradient[..NUM_COORDINATES].copy_from_slice(self.backpropagate(eval, grad_S, grad_sqrt_pi).as_slice());
         if let Some(prior) = &self.site_rate_prior {
-            let mut grad_log_rate = prior.evaluate(position[NUM_COMPONENTS]).1;
+            let mut grad_log_rate = prior.evaluate(position[NUM_COORDINATES]).1;
             for i in 0..20 {
                 for j in (i + 1)..20 {
                     grad_log_rate += grad_S[(i, j)] * eval.S[(i, j)];
                 }
             }
-            gradient[NUM_COMPONENTS] = grad_log_rate;
+            gradient[NUM_COORDINATES] = grad_log_rate;
         }
     }
 
-    /// Site frequencies for the given pca coordinates
-    fn pi(&self, x: &SVector<f64, NUM_COMPONENTS>) -> (SVector<f64, 20>, SVector<f64, 20>) {
-        let log_pi = self.components.transpose() * x;
+    /// Site frequencies for the given Helmert coordinates
+    fn pi(&self, x: &SVector<f64, NUM_COORDINATES>) -> (SVector<f64, 20>, SVector<f64, 20>) {
+        let log_pi = self.basis.transpose() * x;
         let max_log_pi = log_pi.max();
         let unnormalized_pi = log_pi.map(|l| (l - max_log_pi).exp());
         (log_pi, unnormalized_pi / unnormalized_pi.sum())
     }
 
-    /// S (upper triangle) and sqrt_pi for log frequencies up to a constant
+    /// S and sqrt_pi for log frequencies up to a constant
     fn rate_matrix(&self, log_pi: &SVector<f64, 20>) -> (SMatrix<f64, 20, 20>, SVector<f64, 20>) {
-        let max_log_pi = log_pi.max();
-        let unnormalized_pi = log_pi.map(|l| (l - max_log_pi).exp());
-        let sqrt_pi = (unnormalized_pi / unnormalized_pi.sum()).map(f64::sqrt);
-        let fitness = log_pi - self.log_mutation_equilibrium;
-        let mut S = SMatrix::<f64, 20, 20>::zeros();
-        for i in 0..20 {
-            for j in (i + 1)..20 {
-                S[(i, j)] = self.scaled_Mu[(i, j)]
-                    * (0.5 * (log_pi[i] - log_pi[j])).exp()
-                    * fixation(fitness[j] - fitness[i]);
-            }
-        }
-        (S, sqrt_pi)
+        model::rate_matrix(&self.scaled_Mu, log_pi)
     }
 
-    /// Log prior, S and sqrt_pi for the pca coordinates x
-    fn evaluate(&self, x: &SVector<f64, NUM_COMPONENTS>) -> SiteModelEval {
-        // Generalized normal prior on the pca coordinates (negative of PCA::penalty_on_pca_coordinates)
-        let mut log_prior = 0.0;
-        let mut grad_log_prior = SVector::<f64, NUM_COMPONENTS>::zeros();
-        if let Some(mixture_prior) = &self.mixture_prior {
-            (log_prior, grad_log_prior) = mixture_prior.evaluate(x, &self.components);
-        } else {
-            for k in 0..NUM_COMPONENTS {
-                let z = (x[k] - self.prior_mean[k]) / self.prior_scale[k];
-                let beta = self.prior_beta[k];
-                let abs_z_pow = z.abs().powf(beta - 1.0);
-                log_prior -= abs_z_pow * z.abs();
-                grad_log_prior[k] = -beta * abs_z_pow * z.signum() / self.prior_scale[k];
-            }
-        }
-
-        // log_pi up to an additive constant, pi = softmax(log_pi)
-        let (log_pi, pi) = self.pi(x);
-        let sqrt_pi = pi.map(f64::sqrt);
-        let fitness = log_pi - self.log_mutation_equilibrium;
-
-        // S_ij = sqrt(pi_i / pi_j) * Mu_ij * g(f_j - f_i), only the upper triangle is read by phylo_grad
-        let mut S = SMatrix::<f64, 20, 20>::zeros();
-        for i in 0..20 {
-            for j in (i + 1)..20 {
-                S[(i, j)] = self.scaled_Mu[(i, j)]
-                    * (0.5 * (log_pi[i] - log_pi[j])).exp()
-                    * fixation(fitness[j] - fitness[i]);
-            }
-        }
-
-        SiteModelEval {
-            log_prior,
-            grad_log_prior,
-            pi,
-            sqrt_pi,
-            fitness,
-            S,
-        }
+    /// Log prior, S and sqrt_pi for the Helmert coordinates x
+    fn evaluate(&self, x: &SVector<f64, NUM_COORDINATES>) -> SiteModelEval {
+        let (log_prior, grad_log_prior) = self.prior.site_frequencies.evaluate(x);
+        // log_pi up to an additive constant
+        let log_pi = self.basis.transpose() * x;
+        let (S, sqrt_pi) = self.rate_matrix(&log_pi);
+        SiteModelEval { log_prior, grad_log_prior, log_pi, sqrt_pi, S }
     }
 
     /// Gradient of log_likelihood + log_prior w.r.t. x, given the gradients of the log likelihood
-    /// w.r.t. the upper triangle of S and w.r.t. sqrt_pi.
+    /// w.r.t. S (of which phylo_grad reads the upper triangle) and sqrt_pi
     fn backpropagate(
         &self,
         eval: &SiteModelEval,
         grad_S: &SMatrix<f64, 20, 20>,
         grad_sqrt_pi: &SVector<f64, 20>,
-    ) -> SVector<f64, NUM_COMPONENTS> {
-        let mut grad_log_pi = SVector::<f64, 20>::zeros();
-        for i in 0..20 {
-            for j in (i + 1)..20 {
-                let w = grad_S[(i, j)]
-                    * eval.S[(i, j)]
-                    * (0.5 - dx_log_fixation(eval.fitness[j] - eval.fitness[i]));
-                grad_log_pi[i] += w;
-                grad_log_pi[j] -= w;
-            }
-        }
-        // d sqrt_pi_a / d log_pi_b = sqrt_pi_a * (delta_ab - pi_b) / 2
-        let weighted = grad_sqrt_pi.component_mul(&eval.sqrt_pi);
-        grad_log_pi += (weighted - eval.pi * weighted.sum()) * 0.5;
-
-        eval.grad_log_prior + self.components * grad_log_pi
+    ) -> SVector<f64, NUM_COORDINATES> {
+        let (_, grad_log_pi) = model::rate_matrix_backward(
+            &eval.log_pi,
+            &eval.S,
+            &eval.sqrt_pi,
+            &self.scaled_Mu,
+            &grad_S.upper_triangle(),
+            grad_sqrt_pi,
+        );
+        eval.grad_log_prior + self.basis * grad_log_pi
     }
 }
 
 struct SiteModelEval {
     log_prior: f64,
-    grad_log_prior: SVector<f64, NUM_COMPONENTS>,
-    pi: SVector<f64, 20>,
+    grad_log_prior: SVector<f64, NUM_COORDINATES>,
+    log_pi: SVector<f64, 20>,
     sqrt_pi: SVector<f64, 20>,
-    fitness: SVector<f64, 20>,
     S: SMatrix<f64, 20, 20>,
 }
 
-/// Fixation factor g(x) = x / (1 - exp(-x)), see model::GOp
-pub(crate) fn fixation(x: f64) -> f64 {
-    if x.abs() < 1e-6 {
-        1.0 + x / 2.0 + x * x / 12.0
-    } else {
-        x / (-(-x).exp_m1())
-    }
-}
-
-/// d/dx log g(x) = 1/x - 1/(exp(x) - 1)
-pub(crate) fn dx_log_fixation(x: f64) -> f64 {
-    // The closed form loses about eps / |x| to cancellation, so small arguments use the
-    // Bernoulli series 1/2 - sum_k B_2k x^(2k-1) / (2k)!, whose truncation error is below 1e-20 for |x| < 0.1.
-    if x.abs() < 0.1 {
-        let x2 = x * x;
-        0.5 - x * (1.0 / 12.0
-            - x2 * (1.0 / 720.0
-                - x2 * (1.0 / 30240.0 - x2 * (1.0 / 1209600.0 - x2 / 47900160.0))))
-    } else {
-        1.0 / x - 1.0 / x.exp_m1()
-    }
-}
-
-/// Unnormalized log posterior of the PCA coordinates of a single alignment column.
-/// Same model as optimization::ModelParameters with site rate 1 and fixed Mu, branch lengths and normalization.
+/// Unnormalized log posterior of the Helmert coordinates of a single alignment column.
+/// Same model as optimization::map_estimate with fixed Mu, branch lengths and normalization.
 struct SiteLogp {
     shared: Arc<SharedModel>,
-    tree: Arc<FelsensteinTree<20>>,
-    leaf_pl: Vec<SVector<f64, 20>>,
-    pl_buffer: Vec<SVector<f64, 20>>,
+    tree: Arc<Tree>,
+    /// Leaf states of the column
+    leaves: Vec<u8>,
+    workspace: Workspace<20>,
 }
 
 impl HasDims for SiteLogp {
@@ -576,16 +272,18 @@ impl CpuLogpFunc for SiteLogp {
         self.shared.dim()
     }
 
-    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, SiteLogpError> {
+    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> std::result::Result<f64, SiteLogpError> {
         let model = &*self.shared;
         let eval = model.evaluate_position(position);
 
-        let num_leaves = self.leaf_pl.len();
-        self.pl_buffer[..num_leaves].copy_from_slice(&self.leaf_pl);
-        let result = self.tree.calculate_gradients_single_side(
+        let result = phylo_grad::calculate_gradients_single_column(
+            &self.tree.parents,
+            &self.leaves,
+            &self.tree.branch_lengths,
             eval.S.as_view(),
             eval.sqrt_pi.as_view(),
-            &mut self.pl_buffer,
+            &mut self.workspace,
+            None,
         );
 
         let logp = result.log_likelihood + eval.log_prior;
@@ -605,13 +303,13 @@ impl CpuLogpFunc for SiteLogp {
         &mut self,
         _rng: &mut R,
         array: &[f64],
-    ) -> Result<Vec<f64>, CpuMathError> {
+    ) -> std::result::Result<Vec<f64>, CpuMathError> {
         Ok(array.to_vec())
     }
 }
 
 struct SiteSamples {
-    /// Dimension of a draw, the pca coordinates and, if sampled, the log site rate
+    /// Dimension of a draw, the Helmert coordinates and, if sampled, the log site rate
     dim: usize,
     /// Evenly thinned draws [num_output_samples * dim]
     thinned_draws: Vec<f64>,
@@ -620,16 +318,16 @@ struct SiteSamples {
     /// Posterior mean of the site rate over all draws, 1 if site rates are not sampled
     mean_site_rate: f64,
     num_draws: usize,
-    /// Minimum over the pca coordinates of the effective sample size of all draws
+    /// Minimum over the Helmert coordinates of the effective sample size of all draws
     ess: f64,
     num_divergences: usize,
     step_size: f64,
     mean_num_steps: f64,
     /// Mean and covariance of the draws in the first half of the chain, if settings.marginal
-    proposal: Option<(SVector<f64, NUM_COMPONENTS>, SMatrix<f64, NUM_COMPONENTS, NUM_COMPONENTS>)>,
+    proposal: Option<(SVector<f64, NUM_COORDINATES>, SMatrix<f64, NUM_COORDINATES, NUM_COORDINATES>)>,
     /// Thinned draws from the second half of the chain, which are independent of the proposal
-    bridge_draws: Vec<SVector<f64, NUM_COMPONENTS>>,
-    /// Log marginal likelihood (log likelihood and log prior integrated over the pca coordinates), NaN if not estimated
+    bridge_draws: Vec<SVector<f64, NUM_COORDINATES>>,
+    /// Log marginal likelihood (log likelihood and log prior integrated over the Helmert coordinates), NaN if not estimated
     log_marginal: f64,
 }
 
@@ -711,7 +409,7 @@ fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index:
 fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site_index: usize) -> SiteSamples {
     let shared = Arc::clone(&chain.math().logp_func().shared);
     let dim = shared.dim();
-    assert!(!settings.marginal || dim == NUM_COMPONENTS, "marginal likelihoods are not supported with site rates");
+    assert!(!settings.marginal || dim == NUM_COORDINATES, "marginal likelihoods are not supported with site rates");
     let mut num_burn_in = 0;
     let mut draws = Vec::with_capacity(settings.num_draws as usize * dim);
     let mut num_divergences = 0;
@@ -763,12 +461,12 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
     let mut proposal = None;
     let mut bridge_draws = vec![];
     if settings.marginal {
-        let first_half: Vec<_> = draws[..(num_draws / 2) * NUM_COMPONENTS]
-            .chunks_exact(NUM_COMPONENTS)
-            .map(SVector::<f64, NUM_COMPONENTS>::from_column_slice)
+        let first_half: Vec<_> = draws[..(num_draws / 2) * NUM_COORDINATES]
+            .chunks_exact(NUM_COORDINATES)
+            .map(SVector::<f64, NUM_COORDINATES>::from_column_slice)
             .collect();
-        let mean = first_half.iter().sum::<SVector<f64, NUM_COMPONENTS>>() / first_half.len() as f64;
-        let mut cov = SMatrix::<f64, NUM_COMPONENTS, NUM_COMPONENTS>::zeros();
+        let mean = first_half.iter().sum::<SVector<f64, NUM_COORDINATES>>() / first_half.len() as f64;
+        let mut cov = SMatrix::<f64, NUM_COORDINATES, NUM_COORDINATES>::zeros();
         for x in &first_half {
             cov += (x - mean) * (x - mean).transpose();
         }
@@ -777,7 +475,7 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
         for i in 0..settings.num_output_samples {
             let draw = ((i + 1) * num_draws) / settings.num_output_samples - 1;
             if draw >= num_draws / 2 {
-                bridge_draws.push(SVector::from_column_slice(&draws[draw * NUM_COMPONENTS..(draw + 1) * NUM_COMPONENTS]));
+                bridge_draws.push(SVector::from_column_slice(&draws[draw * NUM_COORDINATES..(draw + 1) * NUM_COORDINATES]));
             }
         }
     }
@@ -785,7 +483,7 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
     let mut mean_pi = SVector::<f64, 20>::zeros();
     let mut mean_site_rate = 0.0;
     for draw in draws.chunks_exact(dim) {
-        mean_pi += shared.pi(&SVector::<f64, NUM_COMPONENTS>::from_column_slice(&draw[..NUM_COMPONENTS])).1;
+        mean_pi += shared.pi(&SVector::<f64, NUM_COORDINATES>::from_column_slice(&draw[..NUM_COORDINATES])).1;
         mean_site_rate += shared.site_rate(draw);
     }
     mean_pi /= num_draws as f64;
@@ -816,33 +514,33 @@ const NUM_PROPOSAL_DRAWS: usize = 200;
 fn site_log_marginal(logp: &mut SiteLogp, samples: &SiteSamples, seed: u64) -> f64 {
     let (mean, cov) = samples.proposal.as_ref().unwrap();
     // A small jitter keeps the proposal proper if a coordinate barely moved
-    let jitter = 1e-10 * cov.trace().max(1e-300) / NUM_COMPONENTS as f64;
-    let chol = match (cov + SMatrix::<f64, NUM_COMPONENTS, NUM_COMPONENTS>::identity() * jitter).cholesky() {
+    let jitter = 1e-10 * cov.trace().max(1e-300) / NUM_COORDINATES as f64;
+    let chol = match (cov + SMatrix::<f64, NUM_COORDINATES, NUM_COORDINATES>::identity() * jitter).cholesky() {
         Some(chol) => chol,
         None => return f64::NAN,
     };
     let l = chol.l();
-    let log_norm = -l.diagonal().map(f64::ln).sum() - 0.5 * NUM_COMPONENTS as f64 * (2.0 * std::f64::consts::PI).ln();
-    let log_proposal = |x: &SVector<f64, NUM_COMPONENTS>| {
+    let log_norm = -l.diagonal().map(f64::ln).sum() - 0.5 * NUM_COORDINATES as f64 * (2.0 * std::f64::consts::PI).ln();
+    let log_proposal = |x: &SVector<f64, NUM_COORDINATES>| {
         let z = l.solve_lower_triangular(&(x - mean)).unwrap();
         log_norm - 0.5 * z.norm_squared()
     };
-    let mut gradient = vec![0.0; NUM_COMPONENTS];
-    let mut log_posterior = |x: &SVector<f64, NUM_COMPONENTS>| {
+    let mut gradient = vec![0.0; NUM_COORDINATES];
+    let mut log_posterior = |x: &SVector<f64, NUM_COORDINATES>| {
         logp.logp(x.as_slice(), &mut gradient).unwrap_or(f64::NEG_INFINITY)
     };
 
     // Standard normal draws with Box-Muller
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut uniform = || ((nuts_rs::rand::Rng::next_u64(&mut rng) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
-    let mut normal = SVector::<f64, NUM_COMPONENTS>::zeros();
+    let mut normal = SVector::<f64, NUM_COORDINATES>::zeros();
     let mut log_ratio_proposal = Vec::with_capacity(NUM_PROPOSAL_DRAWS);
     for _ in 0..NUM_PROPOSAL_DRAWS {
-        for k in (0..NUM_COMPONENTS).step_by(2) {
+        for k in (0..NUM_COORDINATES).step_by(2) {
             let r = (-2.0 * uniform().ln()).sqrt();
             let phi = 2.0 * std::f64::consts::PI * uniform();
             normal[k] = r * phi.cos();
-            if k + 1 < NUM_COMPONENTS {
+            if k + 1 < NUM_COORDINATES {
                 normal[k + 1] = r * phi.sin();
             }
         }
@@ -903,21 +601,6 @@ fn bridge_fixed_point(log_ratio_posterior: &[f64], log_ratio_proposal: &[f64]) -
     log_z
 }
 
-fn leaf_partial_likelihoods(alignment: &[u8], site: usize, num_leaves: usize) -> Vec<SVector<f64, 20>> {
-    (0..num_leaves)
-        .map(|seq| {
-            let residue = alignment[site * num_leaves + seq];
-            if residue < 20 {
-                let mut v = SVector::<f64, 20>::zeros();
-                v[residue as usize] = 1.0;
-                v
-            } else {
-                SVector::<f64, 20>::from_element(1.0)
-            }
-        })
-        .collect()
-}
-
 /// Settings of the Monte Carlo EM for Mu and the branch lengths
 #[derive(Debug, Clone, Copy)]
 pub struct EmSettings {
@@ -943,14 +626,11 @@ pub struct EmSettings {
     pub mstep_ramp: usize,
     /// Convergence of the MAP estimate EM starts from
     pub map_convergence: Convergence,
-    /// pi_reg of the MAP estimate, None uses the model's pi_reg
-    pub map_pi_reg: Option<f64>,
 }
 
 impl EmSettings {
     /// Reads MUTSEL_EM_ITERATIONS, MUTSEL_EM_TOL, MUTSEL_EM_WINDOW, MUTSEL_EM_SAMPLES, MUTSEL_EM_TUNE, MUTSEL_EM_BURNIN, MUTSEL_EM_MSTEP_ITERATIONS,
-    /// MUTSEL_MAP_MIN_ITERATIONS, MUTSEL_MAP_MAX_ITERATIONS, MUTSEL_MAP_REL_IMPROVEMENT and MUTSEL_MAP_PI_REG
-    /// from the environment.
+    /// MUTSEL_MAP_MAX_ITERATIONS and MUTSEL_MAP_REL_IMPROVEMENT from the environment.
     pub fn from_env() -> EmSettings {
         EmSettings {
             iterations: env_or("MUTSEL_EM_ITERATIONS", 50),
@@ -961,19 +641,10 @@ impl EmSettings {
             num_burn_in: env_or("MUTSEL_EM_BURNIN", 20),
             max_mstep_iterations: env_or("MUTSEL_EM_MSTEP_ITERATIONS", 50),
             mstep_ramp: env_or("MUTSEL_EM_MSTEP_RAMP", 3),
-            // Same as optimize_internal by default
             map_convergence: Convergence {
-                min_iterations: env_or("MUTSEL_MAP_MIN_ITERATIONS", Convergence::MAP.min_iterations),
                 max_iterations: env_or("MUTSEL_MAP_MAX_ITERATIONS", Convergence::MAP.max_iterations),
                 min_rel_improvement: env_or("MUTSEL_MAP_REL_IMPROVEMENT", Convergence::MAP.min_rel_improvement),
-                no_improve_patience: Convergence::MAP.no_improve_patience,
             },
-            map_pi_reg: std::env::var("MUTSEL_MAP_PI_REG").ok().map(|value| {
-                value
-                    .trim()
-                    .parse()
-                    .unwrap_or_else(|_| panic!("Could not parse MUTSEL_MAP_PI_REG={}", value))
-            }),
         }
     }
 
@@ -1011,125 +682,9 @@ impl EmSettings {
     }
 }
 
-/// Posterior mode of the pca coordinates of every site given the shared model, by L-BFGS from init[site]
-fn site_modes(
-    shared: &Arc<SharedModel>,
-    tree: &Arc<FelsensteinTree<20>>,
-    alignment: &[u8],
-    num_leaves: usize,
-    init: &[Vec<f64>],
-) -> Vec<Vec<f64>> {
-    let num_nodes = tree.num_nodes();
-    (0..init.len())
-        .into_par_iter()
-        .map(|site| {
-            let mut logp = SiteLogp {
-                shared: Arc::clone(shared),
-                tree: Arc::clone(tree),
-                leaf_pl: leaf_partial_likelihoods(alignment, site, num_leaves),
-                pl_buffer: vec![SVector::<f64, 20>::zeros(); num_nodes],
-            };
-            maximize_lbfgs(&mut logp, &init[site], 100, 1e-3)
-        })
-        .collect()
-}
-
-/// Maximizes logp with L-BFGS (memory 6) and a backtracking line search, starting at init. Returns init if
-/// logp is not finite there.
-fn maximize_lbfgs(logp: &mut SiteLogp, init: &[f64], max_iterations: usize, gradient_tolerance: f64) -> Vec<f64> {
-    let dim = logp.shared.dim();
-    let eval = |x: &DVector<f64>| -> Option<(f64, DVector<f64>)> {
-        let mut gradient = vec![0.0; dim];
-        let value = logp.logp(x.as_slice(), &mut gradient).ok()?;
-        Some((value, DVector::from_column_slice(&gradient)))
-    };
-    lbfgs(eval, DVector::from_column_slice(init), max_iterations, gradient_tolerance, 0.0)
-        .as_slice()
-        .to_vec()
-}
-
-/// Maximizes f with L-BFGS (memory 6) and a backtracking line search, starting at init, until the gradient norm
-/// is below gradient_tolerance or an iteration improves f by less than value_tolerance relative to |f|. eval
-/// returns f and its gradient, None where f is not finite. Returns init if f is not finite there; the result is
-/// never worse than init.
-fn lbfgs<F: FnMut(&DVector<f64>) -> Option<(f64, DVector<f64>)>>(
-    mut eval: F,
-    init: DVector<f64>,
-    max_iterations: usize,
-    gradient_tolerance: f64,
-    value_tolerance: f64,
-) -> DVector<f64> {
-    let mut x = init;
-    let Some((mut value, mut gradient)) = eval(&x) else {
-        return x;
-    };
-    // (s, y) pairs of the minimization of -f
-    let mut history: std::collections::VecDeque<(DVector<f64>, DVector<f64>)> = std::collections::VecDeque::new();
-    for _ in 0..max_iterations {
-        if gradient.norm() < gradient_tolerance {
-            break;
-        }
-        // Two-loop recursion for the ascent direction
-        let mut q = gradient.clone();
-        let mut coefficients = Vec::with_capacity(history.len());
-        for (s, y) in history.iter().rev() {
-            let rho = 1.0 / y.dot(s);
-            let alpha = rho * s.dot(&q);
-            q -= y * alpha;
-            coefficients.push((alpha, rho));
-        }
-        let gamma = match history.back() {
-            Some((s, y)) => s.dot(y) / y.dot(y),
-            None => 1.0f64.min(1.0 / gradient.norm()),
-        };
-        let mut direction = q * gamma;
-        for ((s, y), (alpha, rho)) in history.iter().zip(coefficients.iter().rev()) {
-            let beta = rho * y.dot(&direction);
-            direction += s * (alpha - beta);
-        }
-        if gradient.dot(&direction) <= 0.0 {
-            history.clear();
-            direction = &gradient * 1.0f64.min(1.0 / gradient.norm());
-        }
-
-        let slope = gradient.dot(&direction);
-        let mut step = 1.0;
-        let mut accepted = None;
-        for _ in 0..30 {
-            let candidate = &x + &direction * step;
-            if let Some((candidate_value, candidate_gradient)) = eval(&candidate) {
-                if candidate_value >= value + 1e-4 * step * slope {
-                    accepted = Some((candidate, candidate_value, candidate_gradient));
-                    break;
-                }
-            }
-            step *= 0.5;
-        }
-        let Some((next, next_value, next_gradient)) = accepted else {
-            break;
-        };
-        let improvement = next_value - value;
-        let s = &next - &x;
-        let y = &gradient - &next_gradient;
-        if s.dot(&y) > 1e-12 {
-            history.push_back((s, y));
-            if history.len() > 6 {
-                history.pop_front();
-            }
-        }
-        x = next;
-        value = next_value;
-        gradient = next_gradient;
-        if improvement <= value_tolerance * value.abs() {
-            break;
-        }
-    }
-    x
-}
-
 fn new_site_logp(
     shared: &Arc<SharedModel>,
-    tree: &Arc<FelsensteinTree<20>>,
+    tree: &Arc<Tree>,
     alignment: &[u8],
     num_leaves: usize,
     site: usize,
@@ -1137,8 +692,8 @@ fn new_site_logp(
     SiteLogp {
         shared: Arc::clone(shared),
         tree: Arc::clone(tree),
-        leaf_pl: leaf_partial_likelihoods(alignment, site, num_leaves),
-        pl_buffer: vec![SVector::<f64, 20>::zeros(); tree.num_nodes()],
+        leaves: alignment[site * num_leaves..(site + 1) * num_leaves].to_vec(),
+        workspace: Workspace::new(tree.num_nodes(), num_leaves),
     }
 }
 
@@ -1204,7 +759,7 @@ impl<'a> SamplingProgress<'a> {
 /// Runs an independent NUTS chain for every site, starting at init[site]
 fn sample_sites(
     shared: &Arc<SharedModel>,
-    tree: &Arc<FelsensteinTree<20>>,
+    tree: &Arc<Tree>,
     alignment: &[u8],
     num_leaves: usize,
     init: &[Vec<f64>],
@@ -1240,7 +795,7 @@ fn sample_sites(
 fn sample_sites_persistent(
     chains: &mut Vec<SiteChain>,
     shared: &Arc<SharedModel>,
-    tree: &Arc<FelsensteinTree<20>>,
+    tree: &Arc<Tree>,
     alignment: &[u8],
     num_leaves: usize,
     init: &[Vec<f64>],
@@ -1251,12 +806,12 @@ fn sample_sites_persistent(
 ) -> Vec<SiteSamples> {
     let num_sites = init.len();
     let progress = SamplingProgress::new(label, num_sites, verbosity);
-    // The partial likelihood buffers are only allocated while a site is sampled, so that the kept chains are small
+    // The workspace is only allocated while a site is sampled, so that the kept chains are small
     let free_buffers = |chain: &mut SiteChain| {
         let mut math = chain.math_mut();
         let logp = math.logp_func_mut();
-        logp.leaf_pl = Vec::new();
-        logp.pl_buffer = Vec::new();
+        logp.leaves = Vec::new();
+        logp.workspace = Workspace::new(0, 0);
     };
     let burn_in = if chains.is_empty() {
         *chains = (0..num_sites)
@@ -1293,96 +848,79 @@ fn sample_sites_persistent(
     site_samples
 }
 
-/// log pi [num_sites, 20] (up to a constant per site) for each of the thinned draws
-fn thinned_log_pi(site_samples: &[SiteSamples], num_samples: usize, pca: &PCA) -> Result<Vec<Tensor>, candle_core::Error> {
+/// log pi [num_sites] (up to a constant per site) for each of the thinned draws
+fn thinned_log_pi(site_samples: &[SiteSamples], num_samples: usize) -> Vec<Vec<SVector<f64, 20>>> {
     (0..num_samples)
         .map(|k| {
-            let coordinates: Vec<f64> = site_samples
+            site_samples
                 .iter()
-                .flat_map(|s| s.thinned_draws[k * s.dim..k * s.dim + NUM_COMPONENTS].iter().copied())
-                .collect();
-            let coordinates =
-                Tensor::from_vec(coordinates, &[site_samples.len(), NUM_COMPONENTS], &candle_core::Device::Cpu)?;
-            Ok(pca.pca_coordinates_to_log_freq(&coordinates))
+                .map(|s| {
+                    let x = SVector::<f64, NUM_COORDINATES>::from_column_slice(&s.thinned_draws[k * s.dim..k * s.dim + NUM_COORDINATES]);
+                    helmert::coordinates_to_log_freq(&x)
+                })
+                .collect()
         })
         .collect()
 }
 
 /// Site rates [num_sites] for each of the thinned draws, None if site rates are not sampled
 fn thinned_site_rates(site_samples: &[SiteSamples], num_samples: usize) -> Option<Vec<Vec<f64>>> {
-    if site_samples.first().map_or(true, |s| s.dim == NUM_COMPONENTS) {
+    if site_samples.first().map_or(true, |s| s.dim == NUM_COORDINATES) {
         return None;
     }
     Some(
         (0..num_samples)
-            .map(|k| site_samples.iter().map(|s| s.thinned_draws[k * s.dim + NUM_COMPONENTS].exp()).collect())
+            .map(|k| site_samples.iter().map(|s| s.thinned_draws[k * s.dim + NUM_COORDINATES].exp()).collect())
             .collect(),
     )
 }
 
 /// Average substitution rate over all sites and samples, without normalization. Only the site frequencies
 /// enter, the site rates have prior mean 1 and are a correction on top of the normalized MutSel rates.
-fn mean_substitution_rate(Mu: &Tensor, log_pi_samples: &[Tensor]) -> Result<f64, candle_core::Error> {
-    let mut sum = 0.0;
-    for log_pi in log_pi_samples {
-        let (S, sqrt_pi) = calc_rate_matrix(Mu, log_pi, &tensor_full(1.0, &[]));
-        sum += model::substitution_rates_tensor(&S, &sqrt_pi).mean_all()?.to_scalar::<f64>()?;
-    }
-    Ok(sum / log_pi_samples.len() as f64)
+fn mean_substitution_rate(Mu: &SMatrix<f64, 20, 20>, log_pi_samples: &[Vec<SVector<f64, 20>>]) -> f64 {
+    log_pi_samples.iter().map(|log_pi| batch::mean_substitution_rate(Mu, log_pi)).sum::<f64>() / log_pi_samples.len() as f64
 }
 
 /// M-step: maximizes the log likelihood averaged over the posterior samples of the site frequencies (and site
-/// rates, if site_rate_samples are given for the same samples) minus the penalties on Mu and the branch lengths
-/// (as in optimization::ModelParameters), with the rate normalization fixed. Returns the averaged log likelihood
-/// at the optimum.
+/// rates, if site_rate_samples are given for the same samples) plus the log prior of the exchangeabilities,
+/// with the rate normalization fixed. The log exchangeabilities log_S and the
+/// branch lengths are updated in place. Returns the averaged log likelihood at the optimum.
 fn m_step(
-    op: &FelsensteinWithEdgeOp,
-    log_R: &Var,
-    init_log_R: &Tensor,
-    log_branch_lengths: &Var,
-    log_pi_samples: &[Tensor],
+    parents: &[i32],
+    columns: &[&[u8]],
+    log_S: &mut [f64],
+    branch_lengths: &mut [f64],
+    log_pi_samples: &[Vec<SVector<f64, 20>>],
     site_rate_samples: Option<&[Vec<f64>]>,
     rate_scaling: f64,
-    mutsel_params: MutselParams,
+    prior: &Prior,
     max_iterations: usize,
     verbosity: Verbosity,
-) -> Result<f64, candle_core::Error> {
+) -> f64 {
     // L-BFGS on the deterministic objective (given the samples), stopped once an iteration improves it by less
     // than this relative to its value. It starts at the previous Mu and branch lengths and never ends worse.
     const REL_IMPROVEMENT: f64 = 1e-7;
 
     let num_samples = log_pi_samples.len() as f64;
-    let log_pi_samples = log_pi_samples
-        .iter()
-        .map(batch::rows_from_tensor)
-        .collect::<Result<Vec<_>, _>>()?;
-    let R_shape = log_R.as_tensor().dims().to_vec();
-    let num_R = log_R.as_tensor().elem_count();
-    let num_branches = log_branch_lengths.as_tensor().elem_count();
+    let num_branches = branch_lengths.len();
 
-    // Sets the variables to x and returns the expected log likelihood, the objective
-    // (expected log likelihood minus penalty) and its gradient with respect to x
-    let evaluate = |x: &DVector<f64>| -> Result<(f64, f64, DVector<f64>), candle_core::Error> {
-        let device = candle_core::Device::Cpu;
-        log_R.set(&Tensor::from_slice(&x.as_slice()[..num_R], R_shape.as_slice(), &device)?)?;
-        log_branch_lengths.set(&Tensor::from_slice(&x.as_slice()[num_R..], &[num_branches], &device)?)?;
-        let branch_lengths = log_branch_lengths.exp()?;
-        let penalty = (Mu_penalty(log_R, init_log_R, mutsel_params.Mu_reg)
-            + (branch_lengths.sum_all()? * mutsel_params.branch_length_reg)?)?;
-
-        // Log likelihood averaged over the samples, parallel over the sites
-        let Mu_tensor = Mu(log_R);
-        let Mu_matrix = batch::smatrix_from_tensor(&Mu_tensor)?;
-        let branch_length_values = branch_lengths.to_vec1::<f64>()?;
+    // Expected log likelihood, objective (expected log likelihood plus log prior) and its gradient at
+    // x = [log exchangeabilities, log branch lengths]
+    let num_exchangeabilities = optimization::NUM_EXCHANGEABILITIES;
+    let evaluate = |x: &[f64]| -> (f64, f64, Vec<f64>) {
+        let log_S = &x[..num_exchangeabilities];
+        let branch_lengths: Vec<f64> = x[num_exchangeabilities..].iter().map(|l| l.exp()).collect();
+        let Mu = Mu(log_S);
         let mut log_likelihood = 0.0;
         let mut grad_Mu = SMatrix::<f64, 20, 20>::zeros();
-        let mut grad_branch_lengths = vec![0.0; branch_length_values.len()];
+        let mut grad_branch_lengths = vec![0.0; num_branches];
         for (k, log_pi) in log_pi_samples.iter().enumerate() {
             let result = batch::log_likelihood_and_gradients(
-                op.tree(),
-                &Mu_matrix,
+                parents,
+                columns,
+                &Mu,
                 log_pi,
-                &branch_length_values,
+                &branch_lengths,
                 batch::RateScaling::Fixed(rate_scaling),
                 site_rate_samples.map(|rates| rates[k].as_slice()),
             );
@@ -1392,41 +930,31 @@ fn m_step(
                 *sum += g / num_samples;
             }
         }
-        let likelihood = batch::linear_surrogate(
-            log_likelihood,
-            &[
-                (&Mu_tensor, batch::smatrix_to_tensor(&grad_Mu)?),
-                (&branch_lengths, Tensor::from_vec(grad_branch_lengths, &[num_branches], &device)?),
-            ],
-        )?;
-        let grads = (likelihood - &penalty)?.backward()?;
-        let mut gradient = Vec::with_capacity(num_R + num_branches);
-        for var in [log_R, log_branch_lengths] {
-            match grads.get(var.as_tensor()) {
-                Some(g) => gradient.extend(g.flatten_all()?.to_vec1::<f64>()?),
-                None => gradient.extend(std::iter::repeat_n(0.0, var.as_tensor().elem_count())),
-            }
-        }
-        let objective = log_likelihood - penalty.to_scalar::<f64>()?;
-        Ok((log_likelihood, objective, DVector::from_vec(gradient)))
+        let (log_prior, grad_log_prior) = prior.evaluate_exchangeabilities(log_S);
+        let mut gradient: Vec<f64> =
+            optimization::Mu_backward(log_S, &grad_Mu).iter().zip(&grad_log_prior).map(|(g, p)| g + p).collect();
+        gradient.extend(branch_lengths.iter().zip(&grad_branch_lengths).map(|(b, g)| g * b));
+        let objective = log_likelihood + log_prior;
+        (log_likelihood, objective, gradient)
     };
 
-    let mut init = log_R.as_tensor().flatten_all()?.to_vec1::<f64>()?;
-    init.extend(log_branch_lengths.as_tensor().to_vec1::<f64>()?);
+    let mut x = log_S.to_vec();
+    x.extend(branch_lengths.iter().map(|b| b.ln()));
     let start = std::time::Instant::now();
-    let mut num_evaluations = 0;
-    let optimum = lbfgs(
+    let num_evaluations = maximize_finite(
         |x| {
-            num_evaluations += 1;
-            let (_, objective, gradient) = evaluate(x).ok()?;
-            objective.is_finite().then_some((objective, gradient))
+            let (_, objective, gradient) = evaluate(x);
+            Some((objective, gradient))
         },
-        DVector::from_vec(init),
+        &mut x,
         max_iterations,
-        0.0,
         REL_IMPROVEMENT,
     );
-    let (log_likelihood, objective, _) = evaluate(&optimum)?;
+    let (log_likelihood, objective, _) = evaluate(&x);
+    log_S.copy_from_slice(&x[..num_exchangeabilities]);
+    for (b, l) in branch_lengths.iter_mut().zip(&x[num_exchangeabilities..]) {
+        *b = l.exp();
+    }
     if verbosity.should_print(Verbosity::Min) {
         println!(
             "MUTSEL HMC M-step: expected log likelihood {:.3}, objective {:.3} after {} evaluations with {} samples per site ({:.1}s)",
@@ -1437,198 +965,36 @@ fn m_step(
             start.elapsed().as_secs_f64()
         );
     }
-    Ok(log_likelihood)
+    log_likelihood
 }
 
-/// Writes the log likelihood of every draw ([num_sites, num_draws] as draw_log_likelihood) and of the given
-/// frequencies and site rates (mean_pi_log_likelihood [num_sites]) on this tree and alignment to path. A draw
-/// is a position of shared (with the log site rate if shared samples site rates).
-fn write_draw_log_likelihoods(
-    path: &str,
-    shared: &Arc<SharedModel>,
-    tree: &Arc<FelsensteinTree<20>>,
-    alignment: &[u8],
-    num_leaves: usize,
-    draws: &[Vec<f64>],
-    mean_pi: &[SVector<f64, 20>],
-    mean_site_rate: &[f64],
-) -> Result<(), candle_core::Error> {
-    let num_sites = draws.len();
-    let dim = shared.dim();
-    let num_draws = draws[0].len() / dim;
-    let num_nodes = tree.num_nodes();
-    let (draw_ll, mean_ll): (Vec<Vec<f64>>, Vec<f64>) = (0..num_sites)
-        .into_par_iter()
-        .map(|site| {
-            let leaf_pl = leaf_partial_likelihoods(alignment, site, num_leaves);
-            let mut pl = vec![SVector::<f64, 20>::zeros(); num_nodes];
-            let mut log_likelihood = |S: &SMatrix<f64, 20, 20>, sqrt_pi: &SVector<f64, 20>| {
-                pl[..num_leaves].copy_from_slice(&leaf_pl);
-                tree.calculate_likelihood_single_side(S.as_view(), sqrt_pi.as_view(), &mut pl)
-            };
-            let draw_ll = draws[site]
-                .chunks_exact(dim)
-                .map(|position| {
-                    let eval = shared.evaluate_position(position);
-                    log_likelihood(&eval.S, &eval.sqrt_pi)
-                })
-                .collect();
-            let (S, sqrt_pi) = shared.rate_matrix(&mean_pi[site].map(f64::ln));
-            (draw_ll, log_likelihood(&(S * mean_site_rate[site]), &sqrt_pi))
+/// S (upper triangle) and sqrt_pi of every site at the given frequencies, S multiplied by the site rate
+fn rate_matrices(
+    shared: &SharedModel,
+    pi: &[SVector<f64, 20>],
+    site_rates: &[f64],
+) -> (Vec<SMatrix<f64, 20, 20>>, Vec<SVector<f64, 20>>) {
+    pi.par_iter()
+        .zip(site_rates)
+        .map(|(pi, rate)| {
+            let (S, sqrt_pi) = shared.rate_matrix(&pi.map(f64::ln));
+            (S * *rate, sqrt_pi)
         })
-        .unzip();
-    Tensor::write_npz(
-        &[
-            (
-                "draw_log_likelihood",
-                &Tensor::from_vec(draw_ll.concat(), &[num_sites, num_draws], &candle_core::Device::Cpu)?,
-            ),
-            ("mean_pi_log_likelihood", &Tensor::from_vec(mean_ll, &[num_sites], &candle_core::Device::Cpu)?),
-        ],
-        Path::new(path),
-    )?;
-    println!("MUTSEL HMC: log likelihoods of the draws written to {}", path);
-    Ok(())
-}
-
-/// MUTSEL_EVAL_SAMPLES: no sampling, the draws (pca_samples) and posterior mean frequencies (mean_pi) of an
-/// earlier run, e.g. on a subset of the taxa, are evaluated on this tree and alignment (written to
-/// <out_prefix>.draw_ll.npz). Returns the model at those posterior mean frequencies.
-fn evaluate_samples(
-    path: &Path,
-    shared: &Arc<SharedModel>,
-    tree: &Arc<FelsensteinTree<20>>,
-    alignment: &[u8],
-    num_sites: usize,
-    num_leaves: usize,
-    Mu: &Tensor,
-    rate_scaling: f64,
-    out_prefix: &str,
-) -> Result<(Tensor, Tensor), candle_core::Error> {
-    let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
-    let get = |name: &str| {
-        arrays
-            .get(name)
-            .cloned()
-            .ok_or_else(|| candle_core::Error::Msg(format!("{} not found in {}", name, path.display())))
-    };
-    let pca_samples = get("pca_samples")?;
-    let mean_pi = get("mean_pi")?;
-    if pca_samples.dim(0)? != num_sites {
-        return Err(candle_core::Error::Msg(format!("{} does not have {} sites", path.display(), num_sites)));
-    }
-    let log_site_rates = arrays.get("log_site_rates");
-    if log_site_rates.is_some() != shared.site_rate_prior.is_some() {
-        return Err(candle_core::Error::Msg(format!(
-            "{} {} site rates, MUTSEL_SITE_RATE_SD has to be set exactly if it does",
-            path.display(),
-            if log_site_rates.is_some() { "has" } else { "has no" }
-        )));
-    }
-    println!("MUTSEL HMC: evaluating the draws in {} on this tree and alignment, no sampling", path.display());
-    let draws = positions_from_samples(&pca_samples, log_site_rates)?;
-    let mean_site_rate = match arrays.get("mean_site_rate") {
-        Some(rates) => rates.to_vec1::<f64>()?,
-        None => vec![1.0; num_sites],
-    };
-    let mean_pi_rows = batch::rows_from_tensor(&mean_pi)?;
-    write_draw_log_likelihoods(
-        &format!("{}.draw_ll.npz", out_prefix),
-        shared,
-        tree,
-        alignment,
-        num_leaves,
-        &draws,
-        &mean_pi_rows,
-        &mean_site_rate,
-    )?;
-    let (S, sqrt_pi) = calc_rate_matrix(Mu, &mean_pi.log()?, &tensor_full(rate_scaling, &[]));
-    Ok((scale_sites(&S, &mean_site_rate)?, sqrt_pi))
-}
-
-/// Positions [num_sites][num_samples * dim] from pca_samples [num_sites, num_samples, 19] and, if given, the log
-/// site rates [num_sites, num_samples] as the last coordinate of every position
-fn positions_from_samples(pca_samples: &Tensor, log_site_rates: Option<&Tensor>) -> Result<Vec<Vec<f64>>, candle_core::Error> {
-    let samples = match log_site_rates {
-        Some(log_rates) => Tensor::cat(&[pca_samples, &log_rates.unsqueeze(2)?], 2)?,
-        None => pca_samples.clone(),
-    };
-    (0..samples.dim(0)?)
-        .map(|site| samples.get(site)?.flatten_all()?.to_vec1::<f64>())
-        .collect()
-}
-
-/// S [num_sites, 20, 20] with every site's matrix multiplied by its rate
-fn scale_sites(S: &Tensor, site_rates: &[f64]) -> Result<Tensor, candle_core::Error> {
-    S.broadcast_mul(&Tensor::from_slice(site_rates, &[site_rates.len(), 1, 1], &candle_core::Device::Cpu)?)
+        .unzip()
 }
 
 /// Mu, the global rate normalization and the branch lengths the final sampling is conditioned on
 struct FittedModel {
-    Mu: Tensor,
+    log_S: Vec<f64>,
     rate_scaling: f64,
-    branch_lengths: Tensor,
+    branch_lengths: Vec<f64>,
     /// Initial position of the final chain of every site
     positions: Vec<Vec<f64>>,
-    init_pca_tensor: Tensor,
+    init_coordinates: Vec<SVector<f64, NUM_COORDINATES>>,
     em_log_likelihood: Vec<f64>,
     em_tree_length: Vec<f64>,
     /// Prior of the site rates, with the sd fitted by EM if MUTSEL_SITE_RATE_FIT is set
     site_rate_prior: Option<SiteRatePrior>,
-}
-
-impl FittedModel {
-    /// Reads Mu, rate_scaling and branch_lengths of an earlier run (its .hmc.npz file), so its posterior can be
-    /// sampled again under a different prior. The chains start at the last sample of every site.
-    /// With tree_branch_lengths the branch lengths are these instead, e.g. those of a tree with fewer taxa.
-    /// The site rate prior is the one of the earlier run if it sampled site rates, otherwise site_rate_prior.
-    fn read(
-        path: &Path,
-        num_nodes: usize,
-        num_sites: usize,
-        tree_branch_lengths: Option<&[f64]>,
-        site_rate_prior: Option<SiteRatePrior>,
-    ) -> Result<FittedModel, candle_core::Error> {
-        let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
-        let get = |name: &str| {
-            arrays
-                .get(name)
-                .cloned()
-                .ok_or_else(|| candle_core::Error::Msg(format!("{} not found in {}", name, path.display())))
-        };
-        let branch_lengths = match tree_branch_lengths {
-            Some(lengths) => Tensor::from_slice(lengths, &[lengths.len()], &candle_core::Device::Cpu)?,
-            None => get("branch_lengths")?,
-        };
-        let pca_samples = get("pca_samples")?;
-        if branch_lengths.dims() != [num_nodes] || pca_samples.dim(0)? != num_sites {
-            return Err(candle_core::Error::Msg(format!(
-                "{} does not match the tree ({} nodes) and alignment ({} sites)",
-                path.display(),
-                num_nodes,
-                num_sites
-            )));
-        }
-        let last = pca_samples.dim(1)? - 1;
-        if tree_branch_lengths.is_some() {
-            println!("MUTSEL HMC: Mu and rate normalization fixed to the ones in {}, branch lengths of the input tree, no MAP estimate and EM", path.display());
-        } else {
-            println!("MUTSEL HMC: Mu, rate normalization and branch lengths fixed to the ones in {}, no MAP estimate and EM", path.display());
-        }
-        Ok(FittedModel {
-            Mu: get("Mu")?,
-            rate_scaling: get("rate_scaling")?.to_scalar::<f64>()?,
-            branch_lengths,
-            positions: pca_samples.narrow(1, last, 1)?.squeeze(1)?.to_vec2::<f64>()?,
-            init_pca_tensor: get("init_pca_coordinates")?,
-            em_log_likelihood: vec![],
-            em_tree_length: vec![],
-            site_rate_prior: match arrays.get("site_rate_sd") {
-                Some(sd) => Some(SiteRatePrior { sd: sd.to_scalar::<f64>()? }),
-                None => site_rate_prior,
-            },
-        })
-    }
 }
 
 /// Prints the mean and the quantiles of site rates (draws over all sites)
@@ -1659,178 +1025,53 @@ fn fit_with_em(
     parents: &[i32],
     branch_lengths: &[f64],
     alignment: &[u8],
-    num_sites: usize,
     num_leaves: usize,
-    mutsel_params: MutselParams,
-    prior_R_file: Option<&Path>,
     verbosity: Verbosity,
-    out_prefix: &str,
     settings: &HmcSettings,
     em: &EmSettings,
-    pca: &Arc<PCA>,
-    mixture_prior: &Option<Arc<MixturePrior>>,
-    site_rate_prior: Option<SiteRatePrior>,
+    prior: &Arc<Prior>,
     fit_site_rate_sd: bool,
-) -> Result<FittedModel, candle_core::Error> {
-    let mut site_rate_prior = site_rate_prior;
-    let shared_model = |Mu: &Tensor, rate_scaling: f64, site_rate_prior: Option<SiteRatePrior>| {
+) -> FittedModel {
+    let mut site_rate_prior = prior.site_rate;
+    let shared_model = |Mu: &SMatrix<f64, 20, 20>, rate_scaling: f64, site_rate_prior: Option<SiteRatePrior>| {
         Arc::new(
-            SharedModel::new(Mu, rate_scaling, pca, mutsel_params.pi_reg)
-                .with_mixture_prior(mixture_prior.clone())
-                .with_site_rate_prior(site_rate_prior),
+            SharedModel::new(Mu, rate_scaling, Arc::clone(prior)).with_site_rate_prior(site_rate_prior),
         )
     };
-    let felsenstein = crate::create_felsenstein_tree(parents, branch_lengths, alignment, num_sites, num_leaves);
-    let op = FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
-    // The Mu penalty stays relative to the prior Mu
-    let (init_log_R, log_R, log_branch_lengths, edge_op, init_pca_tensor, start) = match std::env::var("MUTSEL_INIT_MU") {
-        Ok(path) => {
-            // Mu from a file (e.g. the average over training alignments), the branch lengths of the input tree times
-            // MUTSEL_INIT_TREE_SCALE and the light PMSF site frequencies, which are moved to the site posterior modes below
-            let path = Path::new(path.trim());
-            let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
-            let init_Mu = arrays
-                .get("Mu")
-                .ok_or_else(|| candle_core::Error::Msg(format!("Mu not found in {}", path.display())))?;
-            let scale: f64 = env_or("MUTSEL_INIT_TREE_SCALE", 1.0);
-            let init_log_R = crate::optimization::initial_log_R(prior_R_file)?;
-            let log_R = Var::from_tensor(&crate::optimization::log_R_from_Mu(init_Mu, &init_log_R)?)?;
-            let scaled: Vec<f64> = branch_lengths.iter().map(|b| b * scale).collect();
-            let log_branch_lengths = Var::from_tensor(&Tensor::from_slice(&scaled, &[scaled.len()], &candle_core::Device::Cpu)?.log()?)?;
-            let site_freq = crate::optimization::light_pmsf(
-                op.into_with_edge_op(),
-                crate::data::UDM256,
-                crate::data::UDM256_WEIGHTS,
-                log_branch_lengths.as_tensor(),
-            );
-            let init_pca_tensor = pca.log_freq_to_pca_coordinates(&site_freq.log()?);
-            let start = format!("Mu from {}, input tree branch lengths x {}", path.display(), scale);
-            (init_log_R, log_R, log_branch_lengths, op.into_with_edge_op(), init_pca_tensor, start)
-        }
-        Err(_) => {
-            // The joint MAP estimate of Mu, the site frequencies and the branch lengths,
-            // the same estimate as optimization::optimize_internal with the default settings
-            let map_params = MutselParams {
-                pi_reg: em.map_pi_reg.unwrap_or(mutsel_params.pi_reg),
-                ..mutsel_params
-            };
-            if verbosity.should_print(Verbosity::Min) {
-                println!("MUTSEL HMC: MAP estimate with pi_reg {}", map_params.pi_reg);
-            }
-            let map_start = std::time::Instant::now();
-            let map = map_estimate(
-                op,
-                branch_lengths,
-                map_params,
-                prior_R_file,
-                em.map_convergence,
-                verbosity,
-                out_prefix,
-            )?;
-            if verbosity.should_print(Verbosity::Min) {
-                println!("MUTSEL HMC: MAP estimate done in {:.1}s", map_start.elapsed().as_secs_f64());
-            }
-            (
-                map.init_log_R.clone(),
-                Var::from_tensor(map.log_R.as_tensor())?,
-                Var::from_tensor(map.log_branch_lengths.as_tensor())?,
-                map.felsenstein_op.clone(),
-                map.pca_coordinates.as_tensor().copy()?,
-                "the MAP estimate".to_string(),
-            )
-        }
-    };
-    let init_log_pi = pca.pca_coordinates_to_log_freq(&init_pca_tensor);
+    let columns = alignment_columns(alignment, num_leaves);
+    // The joint MAP estimate of Mu, the site frequencies and the branch lengths
+    let map_start = std::time::Instant::now();
+    let map = map_estimate(parents, &columns, branch_lengths, prior, em.map_convergence, verbosity);
+    if verbosity.should_print(Verbosity::Min) {
+        println!("MUTSEL HMC: MAP estimate done in {:.1}s", map_start.elapsed().as_secs_f64());
+    }
+    let MapEstimate { mut log_S, mut branch_lengths, coordinates: init_coordinates } = map;
+    let init_log_pi: Vec<SVector<f64, 20>> =
+        init_coordinates.iter().map(helmert::coordinates_to_log_freq).collect();
 
     // Initial normalization: average substitution rate 1 at the initial frequencies, the same as in the
     // MAP estimate, so the branch lengths stay valid.
-    let mut rate_scaling = 1.0 / mean_substitution_rate(&Mu(log_R.as_tensor()).detach(), &[init_log_pi])?;
+    let mut rate_scaling = 1.0 / mean_substitution_rate(&Mu(&log_S), &[init_log_pi]);
     if verbosity.should_print(Verbosity::Min) {
         println!(
-            "MUTSEL HMC: starting from {}, tree length {:.4}, rate normalization 1/{:.5}",
-            start,
-            log_branch_lengths.exp()?.sum_all()?.to_scalar::<f64>()?,
+            "MUTSEL HMC: starting from the MAP estimate, tree length {:.4}, rate normalization 1/{:.5}",
+            branch_lengths.iter().sum::<f64>(),
             1.0 / rate_scaling
         );
     }
-
-    let (init_pca_tensor, mut positions) = if std::env::var("MUTSEL_INIT_MU").is_ok() {
-        // The light PMSF frequencies are much flatter than the site posteriors and so have a higher average
-        // substitution rate, and so do the site modes. The normalization is therefore taken from posterior draws
-        // of a subset of the sites (MUTSEL_INIT_PILOT_SITES, evenly spaced), iterated twice because the draws
-        // depend on it, so that the branch lengths keep the meaning of the input tree's.
-        let pilot_start = std::time::Instant::now();
-        let init_Mu = Mu(log_R.as_tensor()).detach();
-        let tree = Arc::new(FelsensteinTree::<20>::new(parents, &log_branch_lengths.exp()?.to_vec1::<f64>()?));
-        let init_positions: Vec<Vec<f64>> = init_pca_tensor
-            .to_vec2::<f64>()?
-            .into_iter()
-            .map(|x| with_initial_log_rate(x, site_rate_prior))
-            .collect();
-        let num_pilot: usize = env_or("MUTSEL_INIT_PILOT_SITES", 2000).clamp(1, num_sites);
-        let pilot_sites: Vec<usize> = (0..num_pilot).map(|i| i * num_sites / num_pilot).collect();
-        let pilot_alignment: Vec<u8> = pilot_sites
-            .iter()
-            .flat_map(|&site| alignment[site * num_leaves..(site + 1) * num_leaves].iter().copied())
-            .collect();
-        let mut pilot_positions: Vec<Vec<f64>> = pilot_sites.iter().map(|&site| init_positions[site].clone()).collect();
-        for pass in 0..2 {
-            let shared = shared_model(&init_Mu, rate_scaling, site_rate_prior);
-            let pilot_settings = em.hmc_settings(&settings, pass);
-            let site_samples = sample_sites(
-                &shared,
-                &tree,
-                &pilot_alignment,
-                num_leaves,
-                &pilot_positions,
-                &pilot_settings,
-                Verbosity::Quiet,
-                "pilot sampling",
-            );
-            pilot_positions = site_samples
-                .iter()
-                .map(|s| s.thinned_draws[(em.num_samples - 1) * s.dim..].to_vec())
-                .collect();
-            rate_scaling = 1.0 / mean_substitution_rate(&init_Mu, &thinned_log_pi(&site_samples, em.num_samples, pca)?)?;
-            if verbosity.should_print(Verbosity::Min) {
-                println!(
-                    "MUTSEL HMC: pilot sampling pass {} of {} sites, rate normalization 1/{:.5}",
-                    pass + 1,
-                    num_pilot,
-                    1.0 / rate_scaling
-                );
-            }
-        }
-        let shared = shared_model(&init_Mu, rate_scaling, site_rate_prior);
-        let modes = site_modes(&shared, &tree, alignment, num_leaves, &init_positions);
-        if verbosity.should_print(Verbosity::Min) {
-            println!(
-                "MUTSEL HMC: pilot normalization and site posterior modes done in {:.1}s",
-                pilot_start.elapsed().as_secs_f64()
-            );
-        }
-        let mode_coordinates: Vec<f64> = modes.iter().flat_map(|m| m[..NUM_COMPONENTS].iter().copied()).collect();
-        (Tensor::from_vec(mode_coordinates, &[num_sites, NUM_COMPONENTS], &candle_core::Device::Cpu)?, modes)
-    } else {
-        let positions = init_pca_tensor
-            .to_vec2::<f64>()?
-            .into_iter()
-            .map(|x| with_initial_log_rate(x, site_rate_prior))
-            .collect();
-        (init_pca_tensor, positions)
-    };
+    let mut positions: Vec<Vec<f64>> = init_coordinates
+        .iter()
+        .map(|x| with_initial_log_rate(x.as_slice().to_vec(), site_rate_prior))
+        .collect();
 
     let mut chains: Vec<SiteChain> = Vec::new();
     let mut em_log_likelihood = Vec::with_capacity(em.iterations);
     let mut em_tree_length = Vec::with_capacity(em.iterations);
     for iteration in 0..em.iterations {
         let label = format!("EM iteration {}", iteration + 1);
-        let old_Mu = Mu(log_R.as_tensor()).detach();
+        let old_Mu = Mu(&log_S);
         let shared = shared_model(&old_Mu, rate_scaling, site_rate_prior);
-        let tree = Arc::new(FelsensteinTree::<20>::new(
-            parents,
-            &log_branch_lengths.exp()?.to_vec1::<f64>()?,
-        ));
+        let tree = Arc::new(Tree::new(parents, &branch_lengths));
         let em_settings = em.hmc_settings(&settings, iteration);
         let site_samples = sample_sites_persistent(
             &mut chains,
@@ -1851,7 +1092,7 @@ fn fit_with_em(
             .map(|s| s.thinned_draws[(em.num_samples - 1) * s.dim..].to_vec())
             .collect();
 
-        let log_pi_samples = thinned_log_pi(&site_samples, em.num_samples, pca)?;
+        let log_pi_samples = thinned_log_pi(&site_samples, em.num_samples);
         let site_rate_samples = thinned_site_rates(&site_samples, em.num_samples);
         drop(site_samples);
         if let Some(rates) = &site_rate_samples {
@@ -1873,28 +1114,31 @@ fn fit_with_em(
         // The last thinned draws are the furthest from the chain starts
         let (mstep_samples, mstep_iterations) = em.mstep_schedule(iteration);
         let log_likelihood = m_step(
-            &edge_op,
-            &log_R,
-            &init_log_R,
-            &log_branch_lengths,
+            parents,
+            &columns,
+            &mut log_S,
+            &mut branch_lengths,
             &log_pi_samples[em.num_samples - mstep_samples..],
             site_rate_samples.as_deref().map(|rates| &rates[em.num_samples - mstep_samples..]),
             rate_scaling,
-            mutsel_params,
+            prior,
             mstep_iterations,
             verbosity,
-        )?;
+        );
 
-        let new_Mu = Mu(log_R.as_tensor()).detach();
-        let new_rate_scaling = 1.0 / mean_substitution_rate(&new_Mu, &log_pi_samples)?;
+        let new_Mu = Mu(&log_S);
+        let new_rate_scaling = 1.0 / mean_substitution_rate(&new_Mu, &log_pi_samples);
         // Rescale the branch lengths so the likelihood is unchanged with the new normalization
-        log_branch_lengths.set(&(log_branch_lengths.as_tensor() + (rate_scaling / new_rate_scaling).ln())?)?;
+        for b in branch_lengths.iter_mut() {
+            *b *= rate_scaling / new_rate_scaling;
+        }
         rate_scaling = new_rate_scaling;
 
-        let tree_length = log_branch_lengths.exp()?.sum_all()?.to_scalar::<f64>()?;
-        let max_rel_Mu_change = ((&new_Mu - &old_Mu)?.abs()? / &old_Mu)?
-            .max_all()?
-            .to_scalar::<f64>()?;
+        let tree_length: f64 = branch_lengths.iter().sum();
+        let max_rel_Mu_change = (0..20)
+            .flat_map(|i| (0..20).filter(move |&j| j != i).map(move |j| (i, j)))
+            .map(|(i, j)| ((new_Mu[(i, j)] - old_Mu[(i, j)]) / old_Mu[(i, j)]).abs())
+            .fold(0.0, f64::max);
         em_log_likelihood.push(log_likelihood);
         em_tree_length.push(tree_length);
         if verbosity.should_print(Verbosity::Min) {
@@ -1923,27 +1167,27 @@ fn fit_with_em(
         }
     }
 
-    Ok(FittedModel {
-        Mu: Mu(log_R.as_tensor()).detach(),
+    FittedModel {
+        log_S,
         rate_scaling,
-        branch_lengths: log_branch_lengths.exp()?,
+        branch_lengths,
         positions,
-        init_pca_tensor,
+        init_coordinates,
         em_log_likelihood,
         em_tree_length,
         site_rate_prior,
-    })
+    }
 }
 
-/// Samples the PCA coordinates of every site from its posterior and returns (S, sqrt_pi)
-/// evaluated at the posterior mean of the site frequencies, or with num_tree_draws > 1 at that many
-/// evenly spaced posterior draws per site ([num_sites * num_tree_draws], ordered by site), which
+/// Samples the Helmert coordinates of every site from its posterior and returns (S, sqrt_pi) of every site, S with
+/// its upper triangle set, evaluated at the posterior mean of the site frequencies, or with num_tree_draws > 1
+/// at that many evenly spaced posterior draws per site ([num_sites * num_tree_draws], ordered by site), which
 /// IQ-TREE uses as an equally weighted mixture per site.
 ///
 /// Mu and the branch lengths start at the joint MAP estimate (optimization::map_estimate, which also
 /// gives the initial site positions) and are then refined with Monte Carlo EM: the E-step samples the sites
 /// given Mu and the branch lengths, the M-step maximizes the log likelihood averaged over these
-/// samples plus the log prior of Mu and the branch lengths. This converges to their MAP estimate with
+/// samples plus the log prior of the exchangeabilities. This converges to their MAP estimate with
 /// the site frequencies integrated out. The rate normalization is kept fixed within each iteration and
 /// afterwards reset to an average substitution rate of 1 over the posterior samples, rescaling the
 /// branch lengths so that the likelihood stays the same.
@@ -1953,29 +1197,27 @@ pub fn sample_internal(
     alignment: &[u8],
     num_sites: usize,
     num_leaves: usize,
-    mutsel_params: MutselParams,
-    prior_R_file: Option<&Path>,
     verbosity: Verbosity,
     out_prefix: &str,
     num_tree_draws: usize,
-) -> Result<(Tensor, Tensor), candle_core::Error> {
+) -> Result<(Vec<SMatrix<f64, 20, 20>>, Vec<SVector<f64, 20>>)> {
     let settings = HmcSettings::from_env();
     let em = EmSettings::from_env();
-    let site_rate_prior = SiteRatePrior::from_env();
+    let prior = Arc::new(Prior::from_env());
     let fit_site_rate_sd = env_or("MUTSEL_SITE_RATE_FIT", 0u8) != 0;
     assert!(
-        !fit_site_rate_sd || site_rate_prior.is_some(),
-        "MUTSEL_SITE_RATE_FIT needs a starting sd > 0 in MUTSEL_SITE_RATE_SD"
+        !fit_site_rate_sd || prior.site_rate.is_some(),
+        "MUTSEL_SITE_RATE_FIT needs a starting site_rate_sd > 0 in the prior"
     );
     println!(
-        "MUTSEL HMC: sampling pca coordinates per site with NUTS ({} tuning, at least {} draws, until ESS >= {} or {} draws, {} thinned samples per site, seed {}), {}",
+        "MUTSEL HMC: sampling Helmert coordinates per site with NUTS ({} tuning, at least {} draws, until ESS >= {} or {} draws, {} thinned samples per site, seed {}), {}",
         settings.num_tune,
         settings.num_draws,
         settings.target_ess,
         settings.max_draws,
         settings.num_output_samples,
         settings.seed,
-        match site_rate_prior {
+        match prior.site_rate {
             Some(prior) => format!(
                 "with a log-normal site rate multiplying the MutSel rate (log rate ~ N(-sd^2/2, sd^2), mean rate 1, sd {}{})",
                 prior.sd,
@@ -1985,8 +1227,7 @@ pub fn sample_internal(
         }
     );
     println!(
-        "MUTSEL HMC: Mu and branch lengths from the MAP estimate ({}-{} iterations, relative improvement {:.0e}) refined by Monte Carlo EM until the tree length changes by less than {:.1}% over {} iterations, at most {} iterations ({} samples per site, {} tuning draws in the first iteration, then the chains continue with {} burn-in draws, at most {} M-step iterations, fewer samples and M-step iterations in the first {})",
-        em.map_convergence.min_iterations,
+        "MUTSEL HMC: Mu and branch lengths from the MAP estimate (L-BFGS, at most {} iterations, relative improvement {:.0e}) refined by Monte Carlo EM until the tree length changes by less than {:.1}% over {} iterations, at most {} iterations ({} samples per site, {} tuning draws in the first iteration, then the chains continue with {} burn-in draws, at most {} M-step iterations, fewer samples and M-step iterations in the first {})",
         em.map_convergence.max_iterations,
         em.map_convergence.min_rel_improvement,
         100.0 * em.tree_length_tolerance,
@@ -2004,59 +1245,21 @@ pub fn sample_internal(
         "MUTSEL_TREE_DRAWS must be between 1 and MUTSEL_HMC_SAMPLES"
     );
 
-    let pca = Arc::new(PCA::new(NUM_COMPONENTS));
-    let mixture_prior = MixturePrior::from_env();
-    let fitted = match std::env::var("MUTSEL_FIXED_MODEL") {
-        Ok(path) => {
-            // MUTSEL_FIXED_BRANCH_LENGTHS=tree keeps the branch lengths of the input tree
-            let tree_lengths = std::env::var("MUTSEL_FIXED_BRANCH_LENGTHS").map_or(false, |v| v.trim() == "tree");
-            FittedModel::read(
-                Path::new(path.trim()),
-                parents.len(),
-                num_sites,
-                tree_lengths.then_some(branch_lengths),
-                site_rate_prior,
-            )?
-        }
-        Err(_) => fit_with_em(
-            parents,
-            branch_lengths,
-            alignment,
-            num_sites,
-            num_leaves,
-            mutsel_params,
-            prior_R_file,
-            verbosity,
-            out_prefix,
-            &settings,
-            &em,
-            &pca,
-            &mixture_prior,
-            site_rate_prior,
-            fit_site_rate_sd,
-        )?,
-    };
+    let fitted = fit_with_em(parents, branch_lengths, alignment, num_leaves, verbosity, &settings, &em, &prior, fit_site_rate_sd);
     let FittedModel {
-        Mu,
+        log_S,
         rate_scaling,
         branch_lengths,
         positions,
-        init_pca_tensor,
+        init_coordinates,
         em_log_likelihood,
         em_tree_length,
         site_rate_prior,
     } = fitted;
     let shared = Arc::new(
-        SharedModel::new(&Mu, rate_scaling, &pca, mutsel_params.pi_reg)
-            .with_mixture_prior(mixture_prior)
-            .with_site_rate_prior(site_rate_prior),
+        SharedModel::new(&Mu(&log_S), rate_scaling, prior).with_site_rate_prior(site_rate_prior),
     );
-    let tree = Arc::new(FelsensteinTree::<20>::new(parents, &branch_lengths.to_vec1::<f64>()?));
-    if let Ok(path) = std::env::var("MUTSEL_EVAL_SAMPLES") {
-        return evaluate_samples(Path::new(path.trim()), &shared, &tree, alignment, num_sites, num_leaves, &Mu, rate_scaling, out_prefix);
-    }
-    // Positions read from an earlier run (MUTSEL_FIXED_MODEL) have no log site rate
-    let positions: Vec<Vec<f64>> = positions.into_iter().map(|p| with_initial_log_rate(p, site_rate_prior)).collect();
+    let tree = Arc::new(Tree::new(parents, &branch_lengths));
     let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &settings, verbosity, "final");
     let dim = shared.dim();
     if site_rate_prior.is_some() && verbosity.should_print(Verbosity::Min) {
@@ -2064,66 +1267,40 @@ pub fn sample_internal(
             "final",
             site_samples
                 .iter()
-                .flat_map(|s| s.thinned_draws.chunks_exact(dim).map(|draw| draw[NUM_COMPONENTS].exp())),
+                .flat_map(|s| s.thinned_draws.chunks_exact(dim).map(|draw| draw[NUM_COORDINATES].exp())),
         );
     }
-    let rate_scaling = tensor_full(rate_scaling, &[]);
 
-    // Tensor::write_npz does not support zip entries or files of 4 GiB or more, so pca_samples and
-    // pi_samples together are kept below that by writing an evenly spaced subset of the thinned draws.
-    const MAX_SAMPLE_BYTES: usize = (1 << 32) - (1 << 26);
-    let bytes_per_sample = num_sites * (dim + 20) * std::mem::size_of::<f64>();
-    let num_output_samples = settings
-        .num_output_samples
-        .min(MAX_SAMPLE_BYTES / bytes_per_sample.max(1))
-        .max(1);
-    if num_output_samples < settings.num_output_samples {
-        println!(
-            "MUTSEL HMC: WARNING: writing only {} of the {} samples per site, the npz file would exceed 4 GiB",
-            num_output_samples, settings.num_output_samples
-        );
-    }
-    // pca_samples [num_sites, num_output_samples, 19]
-    let output_draw = |i: usize| i * settings.num_output_samples / num_output_samples;
-    let pca_samples: Vec<f64> = site_samples
+    let num_output_samples = settings.num_output_samples;
+    // coordinate_samples [num_sites, num_output_samples, 19]
+    let coordinate_samples: Vec<f64> = site_samples
         .iter()
-        .flat_map(|s| {
-            (0..num_output_samples).flat_map(move |i| {
-                let draw = output_draw(i);
-                s.thinned_draws[draw * dim..draw * dim + NUM_COMPONENTS].iter().copied()
-            })
-        })
+        .flat_map(|s| s.thinned_draws.chunks_exact(dim).flat_map(|draw| draw[..NUM_COORDINATES].iter().copied()))
         .collect();
-    let pca_samples = Tensor::from_vec(
-        pca_samples,
-        &[num_sites, num_output_samples, NUM_COMPONENTS],
-        &candle_core::Device::Cpu,
-    )?;
+    let pi_samples: Vec<f64> = coordinate_samples
+        .par_chunks_exact(NUM_COORDINATES)
+        .flat_map_iter(|x| shared.pi(&SVector::from_column_slice(x)).1.iter().copied().collect::<Vec<_>>())
+        .collect();
+    let coordinate_samples = Array::new(&[num_sites, num_output_samples, NUM_COORDINATES], coordinate_samples);
 
     // log_site_rates [num_sites, num_output_samples], if site rates are sampled
-    let log_site_rates = match site_rate_prior {
-        Some(_) => Some(Tensor::from_vec(
+    let log_site_rates = site_rate_prior.map(|_| {
+        Array::new(
+            &[num_sites, num_output_samples],
             site_samples
                 .iter()
-                .flat_map(|s| (0..num_output_samples).map(move |i| s.thinned_draws[output_draw(i) * dim + NUM_COMPONENTS]))
-                .collect::<Vec<f64>>(),
-            &[num_sites, num_output_samples],
-            &candle_core::Device::Cpu,
-        )?),
-        None => None,
-    };
+                .flat_map(|s| s.thinned_draws.chunks_exact(dim).map(|draw| draw[NUM_COORDINATES]))
+                .collect(),
+        )
+    });
 
     // Posterior mean of the site frequencies and the site rates over all draws
-    let mean_pi: Vec<f64> = site_samples.iter().flat_map(|s| s.mean_pi.iter().copied()).collect();
-    let mean_pi = Tensor::from_vec(mean_pi, &[num_sites, 20], &candle_core::Device::Cpu)?;
+    let mean_pi: Vec<SVector<f64, 20>> = site_samples.iter().map(|s| s.mean_pi).collect();
     let mean_site_rate: Vec<f64> = site_samples.iter().map(|s| s.mean_site_rate).collect();
 
-    let (S, sqrt_pi) = calc_rate_matrix(&Mu, &mean_pi.log()?, &rate_scaling);
-    let S = scale_sites(&S, &mean_site_rate)?;
-
-    let average_rate_mean_pi = model::substitution_rates_tensor(&S, &sqrt_pi)
-        .mean_all()?
-        .to_scalar::<f64>()?;
+    let (S, sqrt_pi) = rate_matrices(&shared, &mean_pi, &mean_site_rate);
+    let average_rate_mean_pi =
+        S.iter().zip(&sqrt_pi).map(|(S, sqrt_pi)| model::substitution_rate(S, sqrt_pi)).sum::<f64>() / num_sites as f64;
     if verbosity.should_print(Verbosity::Min) {
         println!(
             "MUTSEL HMC: average substitution rate at posterior mean frequencies {:.4}",
@@ -2132,191 +1309,103 @@ pub fn sample_internal(
     }
 
     let npz_path = format!("{}.hmc.npz", out_prefix);
-    let mean_site_rate_tensor = Tensor::from_slice(&mean_site_rate, &[num_sites], &candle_core::Device::Cpu)?;
-    let site_rate_sd = tensor_full(site_rate_prior.map_or(0.0, |p| p.sd), &[]);
-    let mut site_rate_arrays = vec![];
-    if let Some(log_site_rates) = &log_site_rates {
-        site_rate_arrays.push(("log_site_rates", log_site_rates));
-        site_rate_arrays.push(("mean_site_rate", &mean_site_rate_tensor));
-        site_rate_arrays.push(("site_rate_sd", &site_rate_sd));
+    let per_site = |f: &dyn Fn(&SiteSamples) -> f64| Array::vector(site_samples.iter().map(f).collect());
+    let mut arrays: Vec<(&str, Array)> = vec![
+        ("coordinate_samples", coordinate_samples),
+        ("pi_samples", Array::new(&[num_sites, num_output_samples, 20], pi_samples)),
+        ("init_coordinates", Array::from_rows(&init_coordinates)),
+        ("mean_pi", Array::from_rows(&mean_pi)),
+        ("Mu", Array::from_matrix(&Mu(&log_S))),
+        ("log_exchangeabilities", Array::vector(log_S.clone())),
+        ("rate_scaling", Array::scalar(rate_scaling)),
+        ("branch_lengths", Array::vector(branch_lengths.clone())),
+        ("em_log_likelihood", Array::vector(em_log_likelihood)),
+        ("em_tree_length", Array::vector(em_tree_length)),
+        ("ess", per_site(&|s| s.ess)),
+        ("num_draws", per_site(&|s| s.num_draws as f64)),
+        ("num_divergences", per_site(&|s| s.num_divergences as f64)),
+        ("step_size", per_site(&|s| s.step_size)),
+        ("mean_num_steps", per_site(&|s| s.mean_num_steps)),
+        ("log_marginal", per_site(&|s| s.log_marginal)),
+        ("parents", Array::vector(parents.iter().map(|&p| p as f64).collect())),
+    ];
+    if let Some(log_site_rates) = log_site_rates {
+        arrays.push(("log_site_rates", log_site_rates));
+        arrays.push(("mean_site_rate", Array::vector(mean_site_rate.clone())));
+        arrays.push(("site_rate_sd", Array::scalar(site_rate_prior.map_or(0.0, |p| p.sd))));
     }
-    Tensor::write_npz(
-        &[
-            ("pca_samples", &pca_samples),
-            (
-                "pi_samples",
-                &candle_nn::ops::softmax(
-                    &pca.pca_coordinates_to_log_freq(
-                        &pca_samples.reshape(&[num_sites * num_output_samples, NUM_COMPONENTS])?,
-                    ),
-                    1,
-                )?
-                .reshape(&[num_sites, num_output_samples, 20])?,
-            ),
-            ("init_pca_coordinates", &init_pca_tensor),
-            ("mean_pi", &mean_pi),
-            ("Mu", &Mu),
-            ("rate_scaling", &rate_scaling),
-            ("branch_lengths", &branch_lengths),
-            ("em_log_likelihood", &Tensor::from_slice(&em_log_likelihood, &[em_log_likelihood.len()], &candle_core::Device::Cpu)?),
-            ("em_tree_length", &Tensor::from_slice(&em_tree_length, &[em_tree_length.len()], &candle_core::Device::Cpu)?),
-            (
-                "ess",
-                &Tensor::from_iter(site_samples.iter().map(|s| s.ess), &candle_core::Device::Cpu)?,
-            ),
-            (
-                "num_draws",
-                &Tensor::from_iter(site_samples.iter().map(|s| s.num_draws as f64), &candle_core::Device::Cpu)?,
-            ),
-            (
-                "num_divergences",
-                &Tensor::from_iter(site_samples.iter().map(|s| s.num_divergences as f64), &candle_core::Device::Cpu)?,
-            ),
-            (
-                "step_size",
-                &Tensor::from_iter(site_samples.iter().map(|s| s.step_size), &candle_core::Device::Cpu)?,
-            ),
-            (
-                "mean_num_steps",
-                &Tensor::from_iter(site_samples.iter().map(|s| s.mean_num_steps), &candle_core::Device::Cpu)?,
-            ),
-            (
-                "log_marginal",
-                &Tensor::from_iter(site_samples.iter().map(|s| s.log_marginal), &candle_core::Device::Cpu)?,
-            ),
-            ("parents", &Tensor::from_iter(parents.iter().map(|&p| p as f64), &candle_core::Device::Cpu)?),
-        ]
-        .into_iter()
-        .chain(site_rate_arrays)
-        .collect::<Vec<_>>(),
-        Path::new(&npz_path),
-    )?;
+    write_npz(Path::new(&npz_path), &arrays.iter().map(|(name, array)| (*name, array)).collect::<Vec<_>>())?;
     println!("MUTSEL HMC: samples written to {}", npz_path);
-
-    // MUTSEL_HMC_DRAW_LL=1: log likelihood of every written draw and of the posterior mean frequencies
-    if env_or("MUTSEL_HMC_DRAW_LL", 0u8) != 0 {
-        let draws = positions_from_samples(&pca_samples, log_site_rates.as_ref())?;
-        let mean_pi_rows = batch::rows_from_tensor(&mean_pi)?;
-        write_draw_log_likelihoods(
-            &format!("{}.draw_ll.npz", out_prefix),
-            &shared,
-            &tree,
-            alignment,
-            num_leaves,
-            &draws,
-            &mean_pi_rows,
-            &mean_site_rate,
-        )?;
-    }
 
     if num_tree_draws == 1 {
         return Ok((S, sqrt_pi));
     }
     println!("MUTSEL HMC: {} posterior draws per site for the tree search", num_tree_draws);
     let tree_draw = |k: usize| k * settings.num_output_samples / num_tree_draws;
-    let draws: Vec<f64> = site_samples
-        .iter()
-        .flat_map(|s| {
-            (0..num_tree_draws).flat_map(move |k| {
-                let draw = tree_draw(k);
-                s.thinned_draws[draw * dim..draw * dim + NUM_COMPONENTS].iter().copied()
+    Ok(site_samples
+        .par_iter()
+        .flat_map_iter(|s| {
+            let shared = &shared;
+            (0..num_tree_draws).map(move |k| {
+                let position = &s.thinned_draws[tree_draw(k) * dim..(tree_draw(k) + 1) * dim];
+                let x = SVector::<f64, NUM_COORDINATES>::from_column_slice(&position[..NUM_COORDINATES]);
+                // rate_matrix only needs log_pi up to a constant
+                let (S, sqrt_pi) = shared.rate_matrix(&(shared.basis.transpose() * x));
+                (S * shared.site_rate(position), sqrt_pi)
             })
         })
-        .collect();
-    let draw_site_rates: Vec<f64> = site_samples
-        .iter()
-        .flat_map(|s| {
-            let shared = &shared;
-            (0..num_tree_draws).map(move |k| shared.site_rate(&s.thinned_draws[tree_draw(k) * dim..(tree_draw(k) + 1) * dim]))
-        })
-        .collect();
-    let draws = Tensor::from_vec(draws, &[num_sites * num_tree_draws, NUM_COMPONENTS], &candle_core::Device::Cpu)?;
-    // calc_rate_matrix only needs log_pi up to a constant per site
-    let (S, sqrt_pi) = calc_rate_matrix(&Mu, &pca.pca_coordinates_to_log_freq(&draws), &rate_scaling);
-    Ok((scale_sites(&S, &draw_site_rates)?, sqrt_pi))
+        .unzip())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Var;
+    use crate::{
+        data::LOG_M_EQUI,
+        prior::tests::{isotropic_gmm, test_prior},
+    };
 
-    const PI_REG: f64 = 0.32;
     const RATE_SCALING: f64 = 1.3;
 
-    fn test_tree() -> FelsensteinTree<20> {
+    fn test_tree() -> Tree {
         // ((0,1),(2,3)) plus a fifth leaf at the root
         let parents = [5, 5, 6, 6, 7, 7, 7, -1];
         let branch_lengths = [0.1, 0.3, 0.2, 0.05, 0.4, 0.15, 0.25, 0.0];
-        FelsensteinTree::<20>::new(&parents, &branch_lengths)
+        Tree::new(&parents, &branch_lengths)
     }
 
-    fn test_Mu() -> Tensor {
-        let init_R = crate::data::load_lower_R_with_equi(crate::data::M_TXT);
-        Mu(&init_R.log().unwrap()).detach()
+    fn test_Mu() -> SMatrix<f64, 20, 20> {
+        Mu(&test_prior().log_exchangeabilities)
+    }
+
+    fn test_shared(rate_scaling: f64) -> SharedModel {
+        SharedModel::new(&test_Mu(), rate_scaling, Arc::new(test_prior()))
+    }
+
+    /// Shared model whose prior on the site frequencies is a single isotropic Gaussian
+    fn gaussian_shared(mean: SVector<f64, NUM_COORDINATES>, std: f64) -> SharedModel {
+        let prior = Prior { site_frequencies: isotropic_gmm(&[1.0], &[mean], &[std]), ..test_prior() };
+        SharedModel::new(&test_Mu(), RATE_SCALING, Arc::new(prior))
     }
 
     const ALIGNMENT: [u8; 5] = [0u8, 0, 3, 20, 7];
 
     fn test_logp() -> SiteLogp {
-        let tree = test_tree();
-        SiteLogp {
-            shared: Arc::new(SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)),
-            leaf_pl: leaf_partial_likelihoods(&ALIGNMENT, 0, 5),
-            pl_buffer: vec![SVector::<f64, 20>::zeros(); tree.num_nodes()],
-            tree: Arc::new(tree),
-        }
-    }
-
-    /// Reference implementation with the candle model code used by the ML optimization.
-    fn candle_logp(position: &[f64]) -> (f64, Vec<f64>) {
-        let pca = PCA::new(NUM_COMPONENTS);
-        let x = Var::from_slice(position, &[1, NUM_COMPONENTS], &candle_core::Device::Cpu).unwrap();
-        let log_pi = pca.pca_coordinates_to_log_freq(x.as_tensor());
-        let (S, sqrt_pi) = calc_rate_matrix(&test_Mu(), &log_pi, &tensor_full(RATE_SCALING, &[]));
-        let log_prior = pca.penalty_on_pca_coordinates(x.as_tensor(), PI_REG).neg().unwrap();
-
-        let tree = test_tree();
-        let mut felsenstein = tree.clone();
-        felsenstein.bind_leaf_pl(vec![leaf_partial_likelihoods(&ALIGNMENT, 0, 5)]);
-        let op = crate::felsenstein::FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
-        let ll = S.apply_op2(&sqrt_pi, op).unwrap().sum_all().unwrap();
-        let logp = (ll + log_prior).unwrap();
-        let grads = logp.backward().unwrap();
-        let grad = grads.get(x.as_tensor()).unwrap().flatten_all().unwrap().to_vec1::<f64>().unwrap();
-        (logp.to_scalar::<f64>().unwrap(), grad)
+        let shared = Arc::new(test_shared(RATE_SCALING));
+        new_site_logp(&shared, &Arc::new(test_tree()), &ALIGNMENT, 5, 0)
     }
 
     fn test_point() -> Vec<f64> {
-        (0..NUM_COMPONENTS).map(|i| 0.3 * ((i as f64) * 1.7).sin()).collect()
+        (0..NUM_COORDINATES).map(|i| 0.3 * ((i as f64) * 1.7).sin()).collect()
     }
 
     #[test]
-    fn matches_candle_model() {
-        let mut logp = test_logp();
-        let x = test_point();
-        let mut grad = vec![0.0; NUM_COMPONENTS];
-        let value = logp.logp(&x, &mut grad).unwrap();
-        let (ref_value, ref_grad) = candle_logp(&x);
-        assert!((value - ref_value).abs() < 1e-13 * ref_value.abs(), "{} vs {}", value, ref_value);
-        for i in 0..NUM_COMPONENTS {
-            assert!(
-                (grad[i] - ref_grad[i]).abs() < 1e-12 * (1.0 + ref_grad[i].abs()),
-                "component {}: {} vs {}",
-                i,
-                grad[i],
-                ref_grad[i]
-            );
-        }
-    }
-
-    #[test]
-    fn rate_matrix_matches_evaluate() {
+    fn rate_matrix_is_invariant_to_a_constant_in_log_pi() {
         let logp = test_logp();
-        let x = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
+        let x = SVector::<f64, NUM_COORDINATES>::from_column_slice(&test_point());
         let eval = logp.shared.evaluate(&x);
         // log_pi up to a constant
-        let (S, sqrt_pi) = logp.shared.rate_matrix(&(logp.shared.components.transpose() * x).add_scalar(0.7));
+        let (S, sqrt_pi) = logp.shared.rate_matrix(&(logp.shared.basis.transpose() * x).add_scalar(0.7));
         assert!((S - eval.S).abs().max() < 1e-13 * eval.S.abs().max());
         assert!((sqrt_pi - eval.sqrt_pi).abs().max() < 1e-14);
     }
@@ -2325,13 +1414,13 @@ mod tests {
     fn gradient_matches_finite_differences() {
         let mut logp = test_logp();
         let x = test_point();
-        let mut grad = vec![0.0; NUM_COMPONENTS];
+        let mut grad = vec![0.0; NUM_COORDINATES];
         let value = logp.logp(&x, &mut grad).unwrap();
         assert!(value.is_finite());
 
         let eps = 1e-6;
-        let mut dummy = vec![0.0; NUM_COMPONENTS];
-        for i in 0..NUM_COMPONENTS {
+        let mut dummy = vec![0.0; NUM_COORDINATES];
+        for i in 0..NUM_COORDINATES {
             let mut xp = x.clone();
             xp[i] += eps;
             let mut xm = x.clone();
@@ -2350,7 +1439,7 @@ mod tests {
     fn test_logp_with_site_rates(rate_scaling: f64, sd: f64) -> SiteLogp {
         let mut logp = test_logp();
         logp.shared = Arc::new(
-            SharedModel::new(&test_Mu(), rate_scaling, &PCA::new(NUM_COMPONENTS), PI_REG)
+            test_shared(rate_scaling)
                 .with_site_rate_prior(Some(SiteRatePrior { sd })),
         );
         logp
@@ -2361,11 +1450,11 @@ mod tests {
         let mut logp = test_logp_with_site_rates(RATE_SCALING, 0.5);
         let mut x = test_point();
         x.push(0.3);
-        let mut grad = vec![0.0; NUM_COMPONENTS + 1];
+        let mut grad = vec![0.0; NUM_COORDINATES + 1];
         logp.logp(&x, &mut grad).unwrap();
         let eps = 1e-6;
-        let mut dummy = vec![0.0; NUM_COMPONENTS + 1];
-        for i in 0..=NUM_COMPONENTS {
+        let mut dummy = vec![0.0; NUM_COORDINATES + 1];
+        for i in 0..=NUM_COORDINATES {
             let mut xp = x.clone();
             xp[i] += eps;
             let mut xm = x.clone();
@@ -2383,15 +1472,15 @@ mod tests {
         let mut with_rate = test_logp_with_site_rates(RATE_SCALING, prior.sd);
         let mut position = test_point();
         position.push(log_rate);
-        let mut grad = vec![0.0; NUM_COMPONENTS + 1];
+        let mut grad = vec![0.0; NUM_COORDINATES + 1];
         let value = with_rate.logp(&position, &mut grad).unwrap() - prior.evaluate(log_rate).0;
 
         let mut scaled = test_logp();
-        scaled.shared = Arc::new(SharedModel::new(&test_Mu(), RATE_SCALING * f64::exp(log_rate), &PCA::new(NUM_COMPONENTS), PI_REG));
-        let mut scaled_grad = vec![0.0; NUM_COMPONENTS];
+        scaled.shared = Arc::new(test_shared(RATE_SCALING * f64::exp(log_rate)));
+        let mut scaled_grad = vec![0.0; NUM_COORDINATES];
         let reference = scaled.logp(&test_point(), &mut scaled_grad).unwrap();
         assert!((value - reference).abs() < 1e-12 * reference.abs(), "{} vs {}", value, reference);
-        for i in 0..NUM_COMPONENTS {
+        for i in 0..NUM_COORDINATES {
             assert!((grad[i] - scaled_grad[i]).abs() < 1e-10 * (1.0 + scaled_grad[i].abs()), "component {}", i);
         }
     }
@@ -2414,7 +1503,7 @@ mod tests {
         // An all-gap column has likelihood 1, so the sampled log rates are draws from the prior
         let sd = 0.6;
         let shared = Arc::new(
-            SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)
+            test_shared(RATE_SCALING)
                 .with_site_rate_prior(Some(SiteRatePrior { sd })),
         );
         let tree = Arc::new(test_tree());
@@ -2430,7 +1519,7 @@ mod tests {
         };
         let init = vec![with_initial_log_rate(test_point(), Some(SiteRatePrior { sd }))];
         let samples = sample_sites(&shared, &tree, &alignment, 5, &init, &settings, Verbosity::Quiet, "prior");
-        let log_rates: Vec<f64> = samples[0].thinned_draws.chunks_exact(NUM_COMPONENTS + 1).map(|d| d[NUM_COMPONENTS]).collect();
+        let log_rates: Vec<f64> = samples[0].thinned_draws.chunks_exact(NUM_COORDINATES + 1).map(|d| d[NUM_COORDINATES]).collect();
         let n = log_rates.len() as f64;
         let mean = log_rates.iter().sum::<f64>() / n;
         let std = (log_rates.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / n).sqrt();
@@ -2485,15 +1574,9 @@ mod tests {
         fn exp_m1(self) -> Dual {
             Dual { v: self.v.exp_m1(), d: self.v.exp() * self.d }
         }
-        fn ln(self) -> Dual {
-            Dual { v: self.v.ln(), d: self.d / self.v }
-        }
         fn sqrt(self) -> Dual {
             let r = self.v.sqrt();
             Dual { v: r, d: self.d / (2.0 * r) }
-        }
-        fn abs(self) -> Dual {
-            if self.v < 0.0 { -self } else { self }
         }
     }
     impl std::ops::Add for Dual {
@@ -2527,8 +1610,7 @@ mod tests {
         }
     }
 
-    /// Independent reference of the per-site model following model::calc_rate_matrix and
-    /// PCA::penalty_on_pca_coordinates: returns <G, S(x)> + <b, sqrt_pi(x)> + log_prior(x)
+    /// Independent reference of the per-site model: returns <G, S(x)> + <b, sqrt_pi(x)>
     fn reference_surrogate(
         model: &SharedModel,
         x: &[Dual],
@@ -2537,13 +1619,13 @@ mod tests {
     ) -> Dual {
         let c = Dual::constant;
         let log_pi: Vec<Dual> = (0..20)
-            .map(|a| (0..NUM_COMPONENTS).fold(c(0.0), |acc, k| acc + c(model.components[(k, a)]) * x[k]))
+            .map(|a| (0..NUM_COORDINATES).fold(c(0.0), |acc, k| acc + c(model.basis[(k, a)]) * x[k]))
             .collect();
         let max = log_pi.iter().map(|l| l.v).fold(f64::NEG_INFINITY, f64::max);
         let unnormalized: Vec<Dual> = log_pi.iter().map(|&l| (l - c(max)).exp()).collect();
         let total = unnormalized.iter().fold(c(0.0), |acc, &u| acc + u);
         let sqrt_pi: Vec<Dual> = unnormalized.iter().map(|&u| (u / total).sqrt()).collect();
-        let fitness: Vec<Dual> = (0..20).map(|a| log_pi[a] - c(model.log_mutation_equilibrium[a])).collect();
+        let fitness: Vec<Dual> = (0..20).map(|a| log_pi[a] - c(LOG_M_EQUI[a])).collect();
         // g(d) = d / (1 - exp(-d)) = 1 + d/2 + (d/2) coth(d/2) - 1; the Taylor series is used for small |d|,
         // since the derivative of the closed form suffers from cancellation (relative error ~ eps / |d|)
         let g = |d: Dual| {
@@ -2567,42 +1649,39 @@ mod tests {
         for a in 0..20 {
             value = value + c(b[a]) * sqrt_pi[a];
         }
-        for k in 0..NUM_COMPONENTS {
-            let z = ((x[k] - c(model.prior_mean[k])) / c(model.prior_scale[k])).abs();
-            value = value - (c(model.prior_beta[k]) * z.ln()).exp();
-        }
         value
     }
 
     #[test]
     fn backpropagation_matches_forward_mode_derivatives() {
-        let model = SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG);
+        let model = test_shared(RATE_SCALING);
 
         // Arbitrary upstream gradients
         let G = SMatrix::<f64, 20, 20>::from_fn(|i, j| ((i * 20 + j) as f64 * 0.37).sin());
         let b = SVector::<f64, 20>::from_fn(|a, _| ((a as f64) * 1.3).cos());
 
         // x with fitness differences exactly zero: log_pi equal to the mutation equilibrium
-        let neutral = model.components * model.log_mutation_equilibrium;
+        let neutral = model.basis * LOG_M_EQUI;
         let direction: Vec<f64> = test_point();
 
         let mut points: Vec<Vec<f64>> = vec![];
         for scale in [0.0, 1e-9, 1e-7, 1e-5, 1e-3, 1e-1, 1.0] {
-            points.push((0..NUM_COMPONENTS).map(|k| neutral[k] + scale * direction[k]).collect());
+            points.push((0..NUM_COORDINATES).map(|k| neutral[k] + scale * direction[k]).collect());
         }
         for scale in [1e-6, 1e-2, 1.0, 3.0] {
             points.push(direction.iter().map(|d| d * scale / 0.3).collect());
         }
 
         for x in points {
-            let x_vec = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&x);
+            let x_vec = SVector::<f64, NUM_COORDINATES>::from_column_slice(&x);
             let eval = model.evaluate(&x_vec);
-            let grad = model.backpropagate(&eval, &G, &b);
+            // The prior is checked in prior.rs
+            let grad = model.backpropagate(&eval, &G, &b) - eval.grad_log_prior;
 
             let mut max_rel_error = 0.0f64;
             let max_grad = grad.iter().map(|g| g.abs()).fold(0.0, f64::max);
-            for k in 0..NUM_COMPONENTS {
-                let x_dual: Vec<Dual> = (0..NUM_COMPONENTS)
+            for k in 0..NUM_COORDINATES {
+                let x_dual: Vec<Dual> = (0..NUM_COORDINATES)
                     .map(|m| Dual { v: x[m], d: if m == k { 1.0 } else { 0.0 } })
                     .collect();
                 let reference = reference_surrogate(&model, &x_dual, &G, &b).d;
@@ -2610,7 +1689,10 @@ mod tests {
             }
             let min_abs_fitness_diff = (0..20)
                 .flat_map(|i| ((i + 1)..20).map(move |j| (i, j)))
-                .map(|(i, j)| (eval.fitness[j] - eval.fitness[i]).abs())
+                .map(|(i, j)| {
+                    let fitness = eval.log_pi - LOG_M_EQUI;
+                    (fitness[j] - fitness[i]).abs()
+                })
                 .fold(f64::INFINITY, f64::min);
             println!(
                 "min |f_j - f_i| {:.1e}: max error relative to max |grad| {:.2e}",
@@ -2620,73 +1702,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gmm_prior_gradient_matches_finite_differences() {
-        let mut prior = GmmPrior { log_norm: vec![], means: vec![], precisions: vec![] };
-        for k in 0..3 {
-            let a = SMatrix::<f64, NUM_COMPONENTS, NUM_COMPONENTS>::from_fn(|i, j| ((i * 7 + j * 3 + k) % 5) as f64 * 0.1);
-            prior.precisions.push(a * a.transpose() + SMatrix::identity());
-            prior.means.push(SVector::from_fn(|i, _| (i + k) as f64 * 0.1));
-            prior.log_norm.push(-(k as f64));
-        }
-        let x = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
-        let (_, grad) = prior.evaluate(&x);
-        let h = 1e-5;
-        for k in 0..NUM_COMPONENTS {
-            let mut e = SVector::<f64, NUM_COMPONENTS>::zeros();
-            e[k] = h;
-            let fd = (prior.evaluate(&(x + e)).0 - prior.evaluate(&(x - e)).0) / (2.0 * h);
-            assert!((fd - grad[k]).abs() < 1e-6 * (1.0 + grad[k].abs()), "{} {} {}", k, fd, grad[k]);
-        }
-    }
-
-    #[test]
-    fn ln_gamma_matches_known_values() {
-        for (x, expected) in [
-            (0.1, 2.252712651734206),
-            (0.5, 0.5723649429247001),
-            (1.0, 0.0),
-            (3.7, 1.428072326665388),
-            (50.0, 144.56574394634487),
-        ] {
-            assert!((ln_gamma(x) - expected).abs() < 1e-12 * (1.0 + expected.abs()), "{} {}", x, ln_gamma(x));
-        }
-    }
-
-    #[test]
-    fn dirichlet_prior_gradient_matches_finite_differences() {
-        let mut prior = DirichletMixturePrior { log_norm: vec![], alphas: vec![] };
-        for k in 0..3 {
-            prior.alphas.push(SVector::from_fn(|i, _| 0.05 + ((i * 7 + k * 3) % 11) as f64 * 0.3));
-            prior.log_norm.push(-(k as f64));
-        }
-        let model = SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG);
-        let x = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
-        let (_, grad) = prior.evaluate(&x, &model.components);
-        let h = 1e-5;
-        for k in 0..NUM_COMPONENTS {
-            let mut e = SVector::<f64, NUM_COMPONENTS>::zeros();
-            e[k] = h;
-            let fd = (prior.evaluate(&(x + e), &model.components).0 - prior.evaluate(&(x - e), &model.components).0)
-                / (2.0 * h);
-            assert!((fd - grad[k]).abs() < 1e-6 * (1.0 + grad[k].abs()), "{} {} {}", k, fd, grad[k]);
-        }
-    }
-
     /// The bridge estimate of the marginal likelihood of a site against brute force Monte Carlo from a Gaussian prior
     #[test]
     fn site_log_marginal_matches_prior_monte_carlo() {
-        let mean = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
+        let mean = SVector::<f64, NUM_COORDINATES>::from_column_slice(&test_point());
         let std = 0.7;
-        let prior = GmmPrior {
-            log_norm: vec![-(NUM_COMPONENTS as f64) * (std as f64).ln() - 0.5 * NUM_COMPONENTS as f64 * (2.0 * std::f64::consts::PI).ln()],
-            means: vec![mean],
-            precisions: vec![SMatrix::identity() / (std * std)],
-        };
-        let shared = Arc::new(
-            SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)
-                .with_mixture_prior(Some(Arc::new(MixturePrior::Gaussian(prior)))),
-        );
+        let shared = Arc::new(gaussian_shared(mean, std));
         let logp = || {
             let mut logp = test_logp();
             logp.shared = Arc::clone(&shared);
@@ -2716,9 +1737,9 @@ mod tests {
         let mut uniform = || ((nuts_rs::rand::Rng::next_u64(&mut rng) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
         let mut tree_logp = logp();
         let mut log_likelihoods = vec![];
-        let mut gradient = vec![0.0; NUM_COMPONENTS];
+        let mut gradient = vec![0.0; NUM_COORDINATES];
         for _ in 0..1 << 17 {
-            let x = SVector::<f64, NUM_COMPONENTS>::from_fn(|_, _| {
+            let x = SVector::<f64, NUM_COORDINATES>::from_fn(|_, _| {
                 (-2.0 * uniform().ln()).sqrt() * (2.0 * std::f64::consts::PI * uniform()).cos() * std
             }) + mean;
             let eval = shared.evaluate(&x);
@@ -2771,14 +1792,14 @@ mod tests {
     #[test]
     fn full_gradient_matches_fourth_order_finite_differences() {
         let mut logp = test_logp();
-        let mut dummy = vec![0.0; NUM_COMPONENTS];
+        let mut dummy = vec![0.0; NUM_COORDINATES];
         for x in [test_point(), test_point().iter().map(|v| v * 5.0).collect::<Vec<f64>>()] {
-            let mut grad = vec![0.0; NUM_COMPONENTS];
+            let mut grad = vec![0.0; NUM_COORDINATES];
             logp.logp(&x, &mut grad).unwrap();
             let max_grad = grad.iter().map(|g| g.abs()).fold(0.0, f64::max);
             let h = 1e-3;
             let mut max_rel_error = 0.0f64;
-            for k in 0..NUM_COMPONENTS {
+            for k in 0..NUM_COORDINATES {
                 let mut f = |offset: f64| {
                     let mut xs = x.clone();
                     xs[k] += offset;
@@ -2795,8 +1816,8 @@ mod tests {
     #[test]
     fn logp_timing() {
         let mut logp = test_logp();
-        let x = vec![0.1; NUM_COMPONENTS];
-        let mut grad = vec![0.0; NUM_COMPONENTS];
+        let x = vec![0.1; NUM_COORDINATES];
+        let mut grad = vec![0.0; NUM_COORDINATES];
         let n = 2000;
         let start = std::time::Instant::now();
         for _ in 0..n {
@@ -2829,14 +1850,10 @@ mod tests {
         }
         let branch_lengths: Vec<f64> = (0..parents.len()).map(|_| 0.01 + 0.29 * uniform()).collect();
         let alignment: Vec<u8> = (0..num_leaves).map(|i| [0u8, 3, 3, 7, 20][i % 5]).collect();
-        let mut logp = SiteLogp {
-            shared: Arc::new(SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)),
-            tree: Arc::new(FelsensteinTree::<20>::new(&parents, &branch_lengths)),
-            leaf_pl: leaf_partial_likelihoods(&alignment, 0, num_leaves),
-            pl_buffer: vec![SVector::<f64, 20>::zeros(); parents.len()],
-        };
-        let x = SVector::<f64, NUM_COMPONENTS>::from_column_slice(&test_point());
-        let mut grad = vec![0.0; NUM_COMPONENTS];
+        let shared = Arc::new(test_shared(RATE_SCALING));
+        let mut logp = new_site_logp(&shared, &Arc::new(Tree::new(&parents, &branch_lengths)), &alignment, num_leaves, 0);
+        let x = SVector::<f64, NUM_COORDINATES>::from_column_slice(&test_point());
+        let mut grad = vec![0.0; NUM_COORDINATES];
         let n = 5000;
         let time = |f: &mut dyn FnMut()| {
             let start = std::time::Instant::now();
@@ -2854,82 +1871,37 @@ mod tests {
             std::hint::black_box(model.evaluate(&x));
         });
         let tree = Arc::clone(&logp.tree);
-        let mut pl = logp.pl_buffer.clone();
-        pl[..num_leaves].copy_from_slice(&logp.leaf_pl);
+        let mut workspace = Workspace::new(tree.num_nodes(), num_leaves);
+        let mut felsenstein = || {
+            phylo_grad::calculate_gradients_single_column(
+                &tree.parents,
+                &alignment,
+                &tree.branch_lengths,
+                eval.S.as_view(),
+                eval.sqrt_pi.as_view(),
+                &mut workspace,
+                None,
+            )
+        };
+        let result = felsenstein();
         let felsenstein = time(&mut || {
-            std::hint::black_box(tree.calculate_gradients_single_side(eval.S.as_view(), eval.sqrt_pi.as_view(), &mut pl));
+            std::hint::black_box(felsenstein());
         });
-        let likelihood_only = time(&mut || {
-            std::hint::black_box(tree.calculate_likelihood_single_side(eval.S.as_view(), eval.sqrt_pi.as_view(), &mut pl));
-        });
-        let result = tree.calculate_gradients_single_side(eval.S.as_view(), eval.sqrt_pi.as_view(), &mut pl);
         let backpropagate = time(&mut || {
             std::hint::black_box(model.backpropagate(&eval, &result.grad_s, &result.grad_sqrt_pi));
         });
         println!(
-            "100 leaves: logp+grad {:.1} us = evaluate {:.1} + phylo_grad {:.1} (likelihood only {:.1}) + backpropagate {:.1}",
-            total, evaluate, felsenstein, likelihood_only, backpropagate
+            "100 leaves: logp+grad {:.1} us = evaluate {:.1} + phylo_grad {:.1} + backpropagate {:.1}",
+            total, evaluate, felsenstein, backpropagate
         );
-    }
-
-    #[test]
-    fn log_R_from_Mu_inverts_Mu() {
-        let init_log_R = crate::optimization::initial_log_R(None).unwrap();
-        let mut values = init_log_R.to_vec2::<f64>().unwrap();
-        for i in 0..20 {
-            for j in 0..i {
-                values[i][j] += 0.5 * ((i * 20 + j) as f64 * 0.73).sin();
-            }
-        }
-        let log_R = Tensor::from_vec(values.concat(), &[20, 20], &candle_core::Device::Cpu).unwrap();
-        let expected = Mu(&log_R).to_vec2::<f64>().unwrap();
-        let inverted = crate::optimization::log_R_from_Mu(&Mu(&log_R), &init_log_R).unwrap();
-        let actual = Mu(&inverted).to_vec2::<f64>().unwrap();
-        for i in 0..20 {
-            for j in 0..20 {
-                assert!((expected[i][j] - actual[i][j]).abs() < 1e-12, "Mu[{}][{}]: {} vs {}", i, j, expected[i][j], actual[i][j]);
-            }
-        }
-    }
-
-    #[test]
-    fn lbfgs_finds_the_site_posterior_mode() {
-        // Two component Gaussian mixture prior (the generalized normal one is not twice differentiable at its mean)
-        let prior = GmmPrior {
-            log_norm: vec![(0.3f64).ln(), (0.7f64).ln()],
-            means: vec![SVector::from_fn(|i, _| 0.2 * (i as f64).cos()), SVector::from_fn(|i, _| -0.1 * (i as f64).sin())],
-            precisions: vec![SMatrix::identity() * 4.0, SMatrix::from_fn(|i, j| if i == j { 2.0 } else { 0.3 / (1.0 + (i + j) as f64) })],
-        };
-        let mut logp = test_logp();
-        logp.shared = Arc::new(
-            SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)
-                .with_mixture_prior(Some(Arc::new(MixturePrior::Gaussian(prior)))),
-        );
-        let start = test_point();
-        let mut gradient = vec![0.0; NUM_COMPONENTS];
-        let start_value = logp.logp(&start, &mut gradient).unwrap();
-        let mode = maximize_lbfgs(&mut logp, &start, 200, 1e-6);
-        let mode_value = logp.logp(&mode, &mut gradient).unwrap();
-        let norm = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-        assert!(mode_value > start_value, "{} <= {}", mode_value, start_value);
-        assert!(norm < 1e-4, "gradient norm {} at the mode", norm);
     }
 
     #[test]
     fn persistent_chains_follow_a_changed_posterior() {
         // A narrow Gaussian prior dominates the posterior, so moving its mean moves the posterior by about as much
         let gaussian_prior = |shift: f64| {
-            let std: f64 = 0.3;
-            let mean = SVector::<f64, NUM_COMPONENTS>::from_iterator(test_point().iter().map(|x| x + shift));
-            let prior = GmmPrior {
-                log_norm: vec![-(NUM_COMPONENTS as f64) * std.ln() - 0.5 * NUM_COMPONENTS as f64 * (2.0 * std::f64::consts::PI).ln()],
-                means: vec![mean],
-                precisions: vec![SMatrix::identity() / (std * std)],
-            };
-            Arc::new(
-                SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)
-                    .with_mixture_prior(Some(Arc::new(MixturePrior::Gaussian(prior)))),
-            )
+            let mean = SVector::<f64, NUM_COORDINATES>::from_iterator(test_point().iter().map(|x| x + shift));
+            Arc::new(gaussian_shared(mean, 0.3))
         };
         let tree = Arc::new(test_tree());
         let alignment: Vec<u8> = ALIGNMENT.iter().chain(ALIGNMENT.iter()).copied().collect();
@@ -2946,9 +1918,9 @@ mod tests {
         let mean_draw = |samples: &SiteSamples| {
             samples
                 .thinned_draws
-                .chunks_exact(NUM_COMPONENTS)
-                .map(SVector::<f64, NUM_COMPONENTS>::from_column_slice)
-                .sum::<SVector<f64, NUM_COMPONENTS>>()
+                .chunks_exact(NUM_COORDINATES)
+                .map(SVector::<f64, NUM_COORDINATES>::from_column_slice)
+                .sum::<SVector<f64, NUM_COORDINATES>>()
                 / settings.num_output_samples as f64
         };
 

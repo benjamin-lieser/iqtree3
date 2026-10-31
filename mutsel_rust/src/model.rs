@@ -1,195 +1,159 @@
-use std::ops::Deref;
+use phylo_grad::nalgebra::{SMatrix, SVector};
 
-use candle_core::{CpuStorage, CustomOp1, Storage, Tensor};
+use crate::data::LOG_M_EQUI;
 
-fn g_scalar(x: f64) -> f64 {
+/// Fixation factor g(x) = x / (1 - exp(-x))
+pub(crate) fn g_scalar(x: f64) -> f64 {
     if x.abs() < 1e-6 {
-        return 1.0 + x / 2.0 + x * x / 12.0;
+        1.0 + x / 2.0 + x * x / 12.0
     } else {
-        return x / (1.0 - (-x).exp());
+        x / (-(-x).exp_m1())
     }
 }
 
-fn dx_g_scalar(x: f64) -> f64 {
-    if x.abs() < 1e-6 {
-        return 0.5 + x / 6.0 - x * x * x / 180.0;
+/// d/dx log g(x) = 1/x - 1/(exp(x) - 1)
+pub(crate) fn dx_log_g_scalar(x: f64) -> f64 {
+    // The closed form loses about eps / |x| to cancellation, so small arguments use the
+    // Bernoulli series 1/2 - sum_k B_2k x^(2k-1) / (2k)!, whose truncation error is below 1e-20 for |x| < 0.1.
+    if x.abs() < 0.1 {
+        let x2 = x * x;
+        0.5 - x * (1.0 / 12.0
+            - x2 * (1.0 / 720.0
+                - x2 * (1.0 / 30240.0 - x2 * (1.0 / 1209600.0 - x2 / 47900160.0))))
     } else {
-        let exp_x = x.exp();
-        return exp_x * (-1.0 + exp_x - x) / (exp_x - 1.0).powi(2);
+        1.0 / x - 1.0 / x.exp_m1()
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct GOp {}
+/// S and sqrt_pi of a site with the mutation rate matrix Mu (zero diagonal, reversible with the equilibrium
+/// data::M_EQUI) and the log frequencies log_pi (up to a constant): S_ij = sqrt(pi_i / pi_j) Mu_ij g(F_j - F_i),
+/// F = log_pi - log M_EQUI. S is symmetric with zero diagonal, since g(x) / g(-x) = exp(x), so only the upper
+/// triangle of Mu is read and the lower triangle of S is a copy of the upper one.
+pub fn rate_matrix(Mu: &SMatrix<f64, 20, 20>, log_pi: &SVector<f64, 20>) -> (SMatrix<f64, 20, 20>, SVector<f64, 20>) {
+    // pi = softmax(log_pi)
+    let max_log_pi = log_pi.max();
+    let unnormalized_pi = log_pi.map(|l| (l - max_log_pi).exp());
+    let sqrt_pi = (unnormalized_pi / unnormalized_pi.sum()).map(f64::sqrt);
 
-impl CustomOp1 for GOp {
-    fn name(&self) -> &'static str {
-        "g_op"
-    }
-
-    fn cpu_fwd(
-        &self,
-        storage: &candle_core::CpuStorage,
-        layout: &candle_core::Layout,
-    ) -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
-        let data = match storage {
-            CpuStorage::F64(data) => data,
-            _ => panic!("Expected f64 storage."),
-        };
-
-        let output = candle_core::cpu_backend::unary_map(&data, layout, g_scalar);
-
-        Ok((CpuStorage::F64(output), layout.shape().clone()))
-    }
-
-    fn bwd(
-        &self,
-        _arg: &Tensor,
-        _res: &Tensor,
-        _grad_res: &Tensor,
-    ) -> candle_core::Result<Option<Tensor>> {
-        let (storage, layout) = _arg.storage_and_layout();
-
-        let data = match storage.deref() {
-            Storage::Cpu(CpuStorage::F64(data)) => data,
-            _ => panic!("Expected f64 storage."),
-        };
-
-        let grads = candle_core::cpu_backend::unary_map(&data, &layout, dx_g_scalar);
-
-        let grad_tensor = Tensor::from_vec(grads, _arg.shape(), &candle_core::Device::Cpu)?;
-
-        Ok(Some(grad_tensor.mul(_grad_res)?))
-    }
-}
-
-/// We assume a mutation process Mu is the rate matrix of the mutation process with its equlibirium in the diagonal.
-/// It should be the output of the Mu function.
-pub fn calc_rate_matrix(
-    Mu: &Tensor,
-    log_pi: &Tensor,
-    global_scaling: &Tensor,
-) -> (Tensor, Tensor) {
-    let L = log_pi.dims()[0];
-
-    let equi_mutation = (Mu * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap()).unwrap();
-    let equi_mutation = equi_mutation.sum(1).unwrap();
-    let log_equi_mutation = equi_mutation.log().unwrap();
-
-    // This is a correction because of the equilibirum of the mutation process.
-    let fitness = log_pi.broadcast_sub(&log_equi_mutation.unsqueeze(0).unwrap()).unwrap();
-
-    let log_pi_diff = fitness.unsqueeze(1).unwrap().broadcast_sub(&fitness.unsqueeze(2).unwrap()).unwrap();
-
-    let fixation = log_pi_diff.apply_op1(GOp {}).unwrap();
-
-    let R = Mu.unsqueeze(0).unwrap().broadcast_as(&[L, 20, 20]).unwrap();
-
-    let Q = R.mul(&fixation).unwrap();
-
-    let pi = candle_nn::ops::softmax(&log_pi, 1).unwrap();
-    let pi_sqrt = pi.sqrt().unwrap();
-
-    let sqrt_pi_Q = pi_sqrt.unsqueeze(2).unwrap().broadcast_mul(&Q).unwrap();
-    let S = sqrt_pi_Q.broadcast_div(&pi_sqrt.unsqueeze(1).unwrap()).unwrap();
-
-    let S = S.broadcast_mul(&global_scaling).unwrap();
-    (S, pi_sqrt)
-}
-
-// From S, sqrt_pi to R, pi
-pub fn phylograd2iqtree_parametrization(
-    S: &Tensor,
-    sqrt_pi: &Tensor,
-) -> Result<(Tensor, Tensor), candle_core::Error> {
-    let S_sqrt_pi_inv = S.broadcast_div(&sqrt_pi.unsqueeze(1)?)?;
-    let R = S_sqrt_pi_inv.broadcast_div(&sqrt_pi.unsqueeze(2)?)?;
-
-    let pi = sqrt_pi.mul(sqrt_pi)?;
-
-    Ok((R, pi))
-}
-
-/// Returns a tensor of shape [L] with the total substitution rate per site,
-/// keeping the computation differentiable w.r.t. S and sqrt_pi.
-/// Assumes S is symmetric.
-pub fn substitution_rates_tensor(S: &Tensor, sqrt_pi: &Tensor) -> Tensor {
-    // Q_ij = S_ij * sqrt_pi_j * sqrt_pi_i (i != j)
-
-    let pi_outer = sqrt_pi.unsqueeze(2).unwrap().broadcast_mul(&sqrt_pi.unsqueeze(1).unwrap()).unwrap();
-    let weighted = S.mul(&pi_outer).unwrap();
-
-    let total = weighted.sum(2).unwrap().sum(1).unwrap();
-
-    let eye = Tensor::eye(20, candle_core::DType::F64, S.device()).unwrap();
-    let diag = weighted.broadcast_mul(&eye).unwrap().sum(2).unwrap().sum(1).unwrap();
-
-    total.sub(&diag).unwrap()
-}
-
-pub fn substitution_rates(S: &Tensor, sqrt_pi: &Tensor) -> Vec<f64> {
-    // Q_ij = S_ij * sqrt_pi_j / sqrt_pi_i
-
-    let S = S.to_vec3::<f64>().unwrap();
-    let sqrt_pi = sqrt_pi.to_vec2::<f64>().unwrap();
-
-    assert_eq!(S.len(), sqrt_pi.len(), "Batch dimensions do not match.");
-
-    let mut rates = Vec::with_capacity(S.len());
-    for site in 0..S.len() {
-        let mut total_rate = 0.0;
-        for i in 0..20 {
-            for j in 0..20 {
-                if i != j {
-                    total_rate += S[site][i][j] * sqrt_pi[site][j] * sqrt_pi[site][i];
-                }
-            }
+    let fitness = log_pi - LOG_M_EQUI;
+    let mut S = SMatrix::<f64, 20, 20>::zeros();
+    for i in 0..20 {
+        for j in (i + 1)..20 {
+            S[(i, j)] = Mu[(i, j)] * (0.5 * (log_pi[i] - log_pi[j])).exp() * g_scalar(fitness[j] - fitness[i]);
+            S[(j, i)] = S[(i, j)];
         }
-        rates.push(total_rate);
     }
-    rates
+    (S, sqrt_pi)
 }
 
-// Tests
+/// Backward pass of rate_matrix: the gradients w.r.t. Mu (upper triangle) and log_pi, given the gradients w.r.t. S
+/// (the two triangles are added, as they are the same entries) and sqrt_pi
+pub fn rate_matrix_backward(
+    log_pi: &SVector<f64, 20>,
+    S: &SMatrix<f64, 20, 20>,
+    sqrt_pi: &SVector<f64, 20>,
+    Mu: &SMatrix<f64, 20, 20>,
+    grad_S: &SMatrix<f64, 20, 20>,
+    grad_sqrt_pi: &SVector<f64, 20>,
+) -> (SMatrix<f64, 20, 20>, SVector<f64, 20>) {
+    let fitness = log_pi - LOG_M_EQUI;
+    let mut grad_Mu = SMatrix::<f64, 20, 20>::zeros();
+    let mut grad_log_pi = SVector::<f64, 20>::zeros();
+    for i in 0..20 {
+        for j in (i + 1)..20 {
+            // w = dL / d log S_ij, every factor of S_ij enters multiplicatively
+            let w = (grad_S[(i, j)] + grad_S[(j, i)]) * S[(i, j)];
+            grad_Mu[(i, j)] = w / Mu[(i, j)];
+            // d log S_ij / d log_pi_i = 1/2 - (log g)'(F_j - F_i), the opposite for log_pi_j
+            let d = w * (0.5 - dx_log_g_scalar(fitness[j] - fitness[i]));
+            grad_log_pi[i] += d;
+            grad_log_pi[j] -= d;
+        }
+    }
+    // d sqrt_pi_a / d log_pi_b = sqrt_pi_a * (delta_ab - pi_b) / 2
+    let pi = sqrt_pi.component_mul(sqrt_pi);
+    let weighted = grad_sqrt_pi.component_mul(sqrt_pi);
+    grad_log_pi += (weighted - pi * weighted.sum()) * 0.5;
+    (grad_Mu, grad_log_pi)
+}
+
+/// From S, sqrt_pi to the exchangeabilities R_ij = S_ij / (sqrt_pi_i sqrt_pi_j) and pi of IQ-TREE
+pub fn phylograd2iqtree_parametrization(
+    S: &SMatrix<f64, 20, 20>,
+    sqrt_pi: &SVector<f64, 20>,
+) -> (SMatrix<f64, 20, 20>, SVector<f64, 20>) {
+    let R = SMatrix::<f64, 20, 20>::from_fn(|i, j| S[(i, j)] / (sqrt_pi[i] * sqrt_pi[j]));
+    (R, sqrt_pi.component_mul(sqrt_pi))
+}
+
+/// Total substitution rate sum_{i != j} pi_i Q_ij = sum_{i != j} S_ij sqrt_pi_i sqrt_pi_j of a symmetric S
+pub fn substitution_rate(S: &SMatrix<f64, 20, 20>, sqrt_pi: &SVector<f64, 20>) -> f64 {
+    let mut rate = 0.0;
+    for i in 0..20 {
+        for j in (i + 1)..20 {
+            rate += S[(i, j)] * sqrt_pi[i] * sqrt_pi[j];
+        }
+    }
+    2.0 * rate
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{optimization::Mu, utils::tensor_full, model::calc_rate_matrix};
+    use super::*;
 
-use super::*;
-    #[test]
-    fn test_mutsel() {
-        let L = 2;
-        let log_pi = Tensor::rand(-1.0, 1.0, &[L, 20], &candle_core::Device::Cpu).unwrap();
+    fn test_Mu() -> SMatrix<f64, 20, 20> {
+        crate::optimization::Mu(&crate::prior::tests::test_prior().log_exchangeabilities)
+    }
 
-        let R = Tensor::rand(0.1, 2.0, &[20, 20], &candle_core::Device::Cpu).unwrap();
-
-        let R = Mu(&R);
-
-        let (S, sqrt_pi) = calc_rate_matrix(&R, &log_pi, &tensor_full(1.0, &[]));
-
-        println!("S: {}", S);
-        println!("sqrt_pi: {}", (&sqrt_pi * &sqrt_pi).unwrap());
-
-        println!("S - S.T: {}", (&S - &S.transpose(1, 2).unwrap()).unwrap());
-
-        assert!((&S - &S.transpose(1, 2).unwrap()).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f64>().unwrap() < 1e-12);
+    fn test_log_pi() -> SVector<f64, 20> {
+        SVector::from_fn(|i, _| ((7 * i) % 9) as f64 * 0.4 - 1.5)
     }
 
     #[test]
-    fn test_substitution_rates_tensor_matches_vec() {
-        let L = 2;
-        let log_pi = Tensor::rand(-1.0, 1.0, &[L, 20], &candle_core::Device::Cpu).unwrap();
-        let R = Tensor::rand(0.1, 2.0, &[20, 20], &candle_core::Device::Cpu).unwrap();
-        let R = Mu(&R);
+    fn lower_triangle_is_the_rate_matrix_formula() {
+        let (Mu, log_pi) = (test_Mu(), test_log_pi());
+        let (S, sqrt_pi) = rate_matrix(&Mu, &log_pi);
+        let fitness = log_pi - LOG_M_EQUI;
+        for i in 0..20 {
+            for j in 0..i {
+                let S_ij = sqrt_pi[i] / sqrt_pi[j] * Mu[(i, j)] * g_scalar(fitness[j] - fitness[i]);
+                assert!((S[(i, j)] - S_ij).abs() < 1e-12 * S_ij, "{} {}: {} vs {}", i, j, S[(i, j)], S_ij);
+            }
+        }
+        assert!((sqrt_pi.norm_squared() - 1.0).abs() < 1e-14);
+        let (R, pi) = phylograd2iqtree_parametrization(&S, &sqrt_pi);
+        // Q_ij = R_ij pi_j has the total rate of S
+        let rate: f64 = (0..20).flat_map(|i| (0..20).map(move |j| (i, j))).filter(|(i, j)| i != j).map(|(i, j)| pi[i] * R[(i, j)] * pi[j]).sum();
+        assert!((rate - substitution_rate(&S, &sqrt_pi)).abs() < 1e-12 * rate);
+    }
 
-        let (S, sqrt_pi) = calc_rate_matrix(&R, &log_pi, &tensor_full(1.0, &[]));
+    #[test]
+    fn rate_matrix_backward_matches_finite_differences() {
+        let (Mu, log_pi) = (test_Mu(), test_log_pi());
+        let grad_S = SMatrix::<f64, 20, 20>::from_fn(|i, j| ((i * 20 + j) % 7) as f64 - 3.0);
+        let grad_sqrt_pi = SVector::<f64, 20>::from_fn(|i, _| ((2 * i) % 9) as f64 - 4.0);
+        let loss = |Mu: &SMatrix<f64, 20, 20>, log_pi: &SVector<f64, 20>| {
+            let (S, sqrt_pi) = rate_matrix(Mu, log_pi);
+            S.component_mul(&grad_S).sum() + sqrt_pi.dot(&grad_sqrt_pi)
+        };
+        let (S, sqrt_pi) = rate_matrix(&Mu, &log_pi);
+        let (grad_Mu, grad_log_pi) = rate_matrix_backward(&log_pi, &S, &sqrt_pi, &Mu, &grad_S, &grad_sqrt_pi);
 
-        let rates_vec = substitution_rates(&S, &sqrt_pi);
-        let rates_tensor = substitution_rates_tensor(&S, &sqrt_pi).to_vec1::<f64>().unwrap();
-
-        assert_eq!(rates_vec.len(), rates_tensor.len());
-        for (a, b) in rates_vec.iter().zip(rates_tensor.iter()) {
-            assert!((a - b).abs() < 1e-10, "rates differ: {} vs {}", a, b);
+        let h = 1e-6;
+        let check = |numeric: f64, analytic: f64| {
+            assert!((numeric - analytic).abs() < 1e-6 * (1.0 + analytic.abs()), "{} vs {}", numeric, analytic);
+        };
+        for k in 0..20 {
+            let (mut plus, mut minus) = (log_pi, log_pi);
+            plus[k] += h;
+            minus[k] -= h;
+            check((loss(&Mu, &plus) - loss(&Mu, &minus)) / (2.0 * h), grad_log_pi[k]);
+        }
+        for (i, j) in [(0, 1), (1, 0), (4, 17), (19, 3)] {
+            let (mut plus, mut minus) = (Mu, Mu);
+            plus[(i, j)] += h;
+            minus[(i, j)] -= h;
+            check((loss(&plus, &log_pi) - loss(&minus, &log_pi)) / (2.0 * h), grad_Mu[(i, j)]);
         }
     }
 }

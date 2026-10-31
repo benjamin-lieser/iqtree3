@@ -1,651 +1,325 @@
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
-
-use candle_core::{Tensor, Var};
-use candle_nn::{Optimizer, ops::softmax};
-use phylo_grad::FelsensteinTree;
+//! The MAP estimate of Mu, the site frequencies and the branch lengths which the Monte Carlo EM starts from
+//! (see hmc::fit_with_em), initialized with the light PMSF procedure, and the parametrization of Mu.
+//!
+//! Mu is parametrized by the log exchangeabilities log S_ij of the entries (i, j), i > j, in row-major order,
+//! with the mutation equilibrium fixed to data::M_EQUI.
 
 use phylo_grad::nalgebra::{SMatrix, SVector};
 use rayon::prelude::*;
 
 use crate::{
-    batch, MutselParams, Verbosity, felsenstein::{self, FelsensteinOp, FelsensteinWithEdgeOp}, model::{self, calc_rate_matrix}, pca::PCA, utils::tensor_full,
+    Verbosity, batch,
+    data::M_EQUI,
+    helmert::{self, NUM_COORDINATES},
+    lbfgs::maximize_finite,
+    prior::Prior,
 };
 
-pub trait Optimizable {
-    fn variables(&self) -> Vec<Var>;
-    fn variables_names(&self) -> Vec<String>;
-    fn model_name(&self) -> String;
-    fn likelihood(&self) -> Tensor;
-    fn penalty(&self) -> Tensor;
-    fn print_state(&self) {}
+/// Number of log exchangeabilities
+pub const NUM_EXCHANGEABILITIES: usize = 190;
+
+/// The entries (i, j), i > j, of the log exchangeabilities in row-major order
+fn lower_indices() -> impl Iterator<Item = (usize, usize)> {
+    (1..20).flat_map(|i| (0..i).map(move |j| (i, j)))
 }
 
-fn calc_likelihood(
-    mu: &Tensor,
-    log_pi: &Tensor,
-    log_branch_lengths: &Tensor,
-    felsenstein_op: FelsensteinWithEdgeOp,
-) -> Tensor {
-    let (S, sqrt_pi) = calc_rate_matrix(mu, log_pi, &tensor_full(1.0, &[]));
-
-    let branch_lengths = log_branch_lengths.exp().unwrap();
-
-    let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi)
-        .mean_all()
-        .unwrap();
-    let S = S.broadcast_div(&average_rate).unwrap();
-
-    S.apply_op3(&sqrt_pi, &branch_lengths, felsenstein_op)
-        .unwrap()
-        .sum_all()
-        .unwrap()
+/// Equilibrium pi of the mutation process (M_EQUI normalized), the unnormalized rate matrix Q_ij = S_ij sqrt(pi_j / pi_i)
+/// (i != j, S symmetric) and its total rate c = sum_{i != j} pi_i Q_ij
+fn Mu_parts(log_S: &[f64]) -> (SVector<f64, 20>, SMatrix<f64, 20, 20>, f64) {
+    assert_eq!(log_S.len(), NUM_EXCHANGEABILITIES);
+    let pi = SVector::from(M_EQUI) / M_EQUI.iter().sum::<f64>();
+    let sqrt_pi = pi.map(f64::sqrt);
+    let mut Q = SMatrix::<f64, 20, 20>::zeros();
+    for ((i, j), log_S) in lower_indices().zip(log_S) {
+        let S = log_S.exp();
+        Q[(i, j)] = S * sqrt_pi[j] / sqrt_pi[i];
+        Q[(j, i)] = S * sqrt_pi[i] / sqrt_pi[j];
+    }
+    let c = (0..20).map(|i| pi[i] * Q.row(i).sum()).sum();
+    (pi, Q, c)
 }
 
-pub struct BranchParameters {
-    pub felsenstein_op: FelsensteinWithEdgeOp,
-    pub log_branch_lengths: Var,
-    pub reg_para: MutselParams,
-    pub Mu: Tensor,
-    pub log_pi: Tensor,
+/// The mutation rate matrix Q / c with total rate 1 and zero diagonal
+pub fn Mu(log_S: &[f64]) -> SMatrix<f64, 20, 20> {
+    let (_, Q, c) = Mu_parts(log_S);
+    Q / c
 }
 
-impl Optimizable for BranchParameters {
-    fn variables(&self) -> Vec<Var> {
-        vec![self.log_branch_lengths.clone()]
-    }
-    fn variables_names(&self) -> Vec<String> {
-        vec!["log_branch_lengths".to_string()]
-    }
-    fn model_name(&self) -> String {
-        "BranchParameters".to_string()
-    }
-
-    fn likelihood(&self) -> Tensor {
-        calc_likelihood(
-            &self.Mu,
-            &self.log_pi,
-            &self.log_branch_lengths,
-            self.felsenstein_op.clone(),
-        )
-    }
-
-    fn penalty(&self) -> Tensor {
-        let branch_penalty = (&self.log_branch_lengths.exp().unwrap()).sum_all().unwrap();
-        (branch_penalty * self.reg_para.branch_length_reg).unwrap()
-    }
-
-    fn print_state(&self) {}
-}
-
-pub struct ModelParameters {
-    pub felsenstein_op: FelsensteinWithEdgeOp,
-    pub log_R: Var,
-    /// Defines the log pi per site
-    pub pca_coordinates: Var,
-    pub log_branch_lengths: Var,
-    pub init_log_branch_lengths: Tensor,
-    pub reg_para: MutselParams,
-    pub init_log_R: Tensor,
-    pub pca_data: PCA,
-}
-
-impl ModelParameters {
-    pub fn log_pi(&self) -> Tensor {
-        self.pca_data
-            .pca_coordinates_to_log_freq(&self.pca_coordinates)
-    }
-
-    pub fn calc_rate_matrix(&self) -> (Tensor, Tensor) {
-        let (S, sqrt_pi) =
-            calc_rate_matrix(&Mu(&self.log_R), &self.log_pi(), &tensor_full(1.0, &[]));
-        let average_rate = model::substitution_rates_tensor(&S, &sqrt_pi)
-            .mean_all()
-            .unwrap();
-        let S = S.broadcast_div(&average_rate).unwrap();
-        (S, sqrt_pi)
-    }
-
-    /// Same as likelihood_candle, with the per-site computations parallelized over the sites
-    pub fn likelihood_parallel(&self) -> Result<Tensor, candle_core::Error> {
-        let Mu = Mu(&self.log_R);
-        let pca_coordinates = self.pca_coordinates.as_tensor();
-        let branch_lengths = self.log_branch_lengths.exp()?;
-        let components = batch_components(&self.pca_data)?;
-        let coordinates = pca_coordinates.flatten_all()?.to_vec1::<f64>()?;
-        let num_components = self.pca_data.num_components;
-        let log_pi: Vec<SVector<f64, 20>> = coordinates
-            .par_chunks_exact(num_components)
-            .map(|x| components.transpose() * SVector::<f64, 19>::from_column_slice(x))
-            .collect();
-
-        let result = batch::log_likelihood_and_gradients(
-            self.felsenstein_op.tree(),
-            &batch::smatrix_from_tensor(&Mu)?,
-            &log_pi,
-            &branch_lengths.to_vec1::<f64>()?,
-            batch::RateScaling::MeanRate,
-            None,
-        );
-        let grad_coordinates: Vec<f64> = result
-            .grad_log_pi
-            .par_iter()
-            .flat_map_iter(|g| (components * g).iter().copied().collect::<Vec<_>>())
-            .collect();
-        let num_branches = result.grad_branch_lengths.len();
-        batch::linear_surrogate(
-            result.log_likelihood,
-            &[
-                (&Mu, batch::smatrix_to_tensor(&result.grad_Mu)?),
-                (pca_coordinates, Tensor::from_vec(grad_coordinates, pca_coordinates.shape(), &candle_core::Device::Cpu)?),
-                (&branch_lengths, Tensor::from_vec(result.grad_branch_lengths, &[num_branches], &candle_core::Device::Cpu)?),
-            ],
-        )
-    }
-
-    /// Log likelihood as a candle graph, single threaded outside of phylo_grad
-    pub fn likelihood_candle(&self) -> Tensor {
-        let (S, sqrt_pi) = self.calc_rate_matrix();
-        let branch_lengths = self.log_branch_lengths.exp().unwrap();
-        S.apply_op3(&sqrt_pi, &branch_lengths, self.felsenstein_op.clone())
-            .unwrap()
-            .sum_all()
-            .unwrap()
-    }
-
-    pub fn save_npz(&self, path: &Path) {
-        let Mu = Mu(&self.log_R.as_detached_tensor());
-        let pi = softmax(&self.log_pi().detach(), 1).unwrap();
-
-        Tensor::write_npz(
-            &[
-                ("Mu", &Mu),
-                ("pi", &pi),
-                ("init_log_R", &self.init_log_R),
-                ("branch_lengths", &self.log_branch_lengths.exp().unwrap()),
-            ],
-            path,
-        )
-        .unwrap();
-    }
-}
-
-impl Optimizable for ModelParameters {
-    fn variables(&self) -> Vec<Var> {
-        vec![
-            self.log_R.clone(),
-            self.pca_coordinates.clone(),
-            self.log_branch_lengths.clone(),
-        ]
-    }
-
-    fn variables_names(&self) -> Vec<String> {
-        vec![
-            "log_R".to_string(),
-            "pca_coordinates".to_string(),
-            "log_branch_lengths".to_string(),
-        ]
-    }
-
-    fn model_name(&self) -> String {
-        "ModelParameters".to_string()
-    }
-
-    /// Evaluated with batch::log_likelihood_and_gradients, parallel over the sites
-    fn likelihood(&self) -> Tensor {
-        self.likelihood_parallel().unwrap()
-    }
-
-    fn penalty(&self) -> Tensor {
-        let pi_penalty = self
-            .pca_data
-            .penalty_on_pca_coordinates(&self.pca_coordinates, self.reg_para.pi_reg);
-
-        let Mu_penalty = Mu_penalty(&self.log_R, &self.init_log_R, self.reg_para.Mu_reg);
-
-        let branch_penalty = (&self.log_branch_lengths.exp().unwrap()).sum_all().unwrap();
-        let branch_penalty = (branch_penalty * self.reg_para.branch_length_reg).unwrap();
-
-        (pi_penalty + Mu_penalty + branch_penalty).unwrap()
-    }
-
-    fn print_state(&self) {
-    }
-}
-
-/// PCA components [19, 20] (all 19 coordinates are optimized in the MAP estimate)
-fn batch_components(pca: &PCA) -> Result<SMatrix<f64, 19, 20>, candle_core::Error> {
-    assert_eq!(pca.num_components, 19);
-    Ok(SMatrix::<f64, 19, 20>::from_row_slice(&pca.components.flatten_all()?.to_vec1::<f64>()?))
-}
-
-/// Squared difference of the log off-diagonal Mu entries to the initial ones, times Mu_reg
-pub fn Mu_penalty(log_R: &Tensor, init_log_R: &Tensor, Mu_reg: f64) -> Tensor {
-    fn log_Mu(log_R: &Tensor) -> Tensor {
-        let Mu = Mu(log_R);
-
-        // One out the diagonal, since we only want to penalize the off-diagonal elements
-        let Mu = (&Mu
-            - (&Mu - 1.0).unwrap()
-                * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
-        .unwrap();
-
-        return Mu.log().unwrap();
-    }
-
-    let Mu = log_Mu(log_R)
-        .sub(&log_Mu(init_log_R))
-        .unwrap()
-        .powf(2.0)
-        .unwrap()
-        .sum_all()
-        .unwrap();
-    (Mu * Mu_reg).unwrap()
-}
-
-pub fn optimize(
-    model: &impl Optimizable,
-    min_iterations: usize,
-    max_iterations: usize,
-    min_rel_improvement: f64,
-    no_improve_patience: usize,
-    verbosity: Verbosity,
-    _prefix: &str,
-) {
-    let variables = model.variables();
-    // let variable_names = model.variables_names();
-    // let mut trajectory_tensors: Vec<Vec<Tensor>> = variables
-    //     .iter()
-    //     .map(|variable| vec![variable.as_tensor().copy().unwrap()])
-    //     .collect();
-    let mut opt = candle_nn::optim::AdamW::new_lr(variables, 0.05).unwrap();
-    let parameter = candle_nn::optim::ParamsAdamW {
-        lr: 0.03,
-        weight_decay: 0.0,
-        ..Default::default()
-    };
-    opt.set_params(parameter);
-
-    let variables = model.variables();
-
-    let mut best_opt = f64::INFINITY;
-    let mut best_params: Vec<Tensor> = variables
-        .iter()
-        .map(|variable| variable.as_tensor().copy().unwrap())
-        .collect();
-    let mut no_improve_count = 0;
-
-    for iteration in 0.. {
-        let neg_likelihood = model.likelihood().neg().unwrap();
-        let penalty = model.penalty();
-        let opt_fn = (&neg_likelihood + &penalty).unwrap();
-
-        let current_opt = opt_fn.to_scalar::<f64>().unwrap();
-
-        if current_opt < best_opt {
-            best_params = variables
-                .iter()
-                .map(|variable| variable.as_tensor().copy().unwrap())
-                .collect();
-        }
-
-        if verbosity.should_print(Verbosity::Med) {
-            println!(
-                "Iteration {}: neg Loglikelihood {:.3}, Optfn {:.3}",
-                iteration,
-                neg_likelihood.to_scalar::<f64>().unwrap(),
-                current_opt
-            );
-            model.print_state();
-        }
-
-        let grads = opt_fn.backward().unwrap();
-        opt.step(&grads).unwrap();
-
-        // for (traj, new) in &mut trajectory_tensors.iter_mut().zip(variables.iter()) {
-        //     traj.push(new.as_tensor().copy().unwrap());
-        // }
-        if iteration > min_iterations.saturating_sub(no_improve_patience) {
-            let rel_improvement = (best_opt - current_opt) / best_opt.abs().max(1e-12);
-            if rel_improvement > min_rel_improvement {
-                no_improve_count = 0;
-            } else {
-                no_improve_count += 1;
-            }
-            if no_improve_count >= no_improve_patience {
-                println!(
-                    "Stopping at iteration {} (relative loss improvement {:.2e} <= {:.2e} for {} consecutive iterations)",
-                    iteration, rel_improvement, min_rel_improvement, no_improve_patience
-                );
-                break;
+/// Gradient w.r.t. the log exchangeabilities given the gradient grad_Mu w.r.t. the off-diagonal entries of Mu
+pub fn Mu_backward(log_S: &[f64], grad_Mu: &SMatrix<f64, 20, 20>) -> Vec<f64> {
+    let (pi, Q, c) = Mu_parts(log_S);
+    let mut grad_c = 0.0;
+    for i in 0..20 {
+        for j in 0..20 {
+            if i != j {
+                grad_c -= grad_Mu[(i, j)] * Q[(i, j)] / (c * c);
             }
         }
-
-        if iteration > max_iterations {
-            println!("Reached maximum iterations ({})", max_iterations);
-            break;
-        }
-
-        best_opt = current_opt.min(best_opt);
     }
-
-    // Obtain parameters from best iteration
-    for (variable, value) in variables.iter().zip(best_params.iter()) {
-        variable.set(value).unwrap();
-    }
-
-    // Combine trajectory tensors into a single tensor for each variable
-    // let trajectory_tensors: Vec<Tensor> = trajectory_tensors
-    //     .into_iter()
-    //     .map(|tensors| Tensor::stack(&tensors, 0).unwrap())
-    //     .collect();
-    // let filename = format!("{}.traj_{}.npz", _prefix, model.model_name());
-    // Tensor::write_npz(
-    //     &variable_names
-    //         .iter()
-    //         .zip(trajectory_tensors.iter())
-    //         .collect::<Vec<_>>(),
-    //     Path::new(&filename),
-    // )
-    // .unwrap();
+    // Q_ij enters Mu_ij = Q_ij / c directly and c with weight pi_i
+    let grad_Q = |i: usize, j: usize| grad_Mu[(i, j)] / c + pi[i] * grad_c;
+    // Q_ij and Q_ji are proportional to S_ij = exp(log_S_ij)
+    lower_indices().map(|(i, j)| grad_Q(i, j) * Q[(i, j)] + grad_Q(j, i) * Q[(j, i)]).collect()
 }
 
-pub fn optimize_branch_lengths(
-    felsenstein_op: FelsensteinWithEdgeOp,
-    log_pi: &Tensor,
-    Mu: &Tensor,
-    log_branch_lengths: &Tensor,
-    verbosity: Verbosity,
-    prefix: &str,
-    mutsel_params: super::MutselParams
-) -> Tensor {
-    let model = BranchParameters {
-        felsenstein_op,
-        log_branch_lengths: Var::from_tensor(log_branch_lengths).unwrap(),
-        reg_para: mutsel_params,
-        Mu: Mu.clone(),
-        log_pi: log_pi.clone(),
-    };
-
-    optimize(&model, 10, 200, 1e-6, 5, verbosity, prefix);
-
-    model.log_branch_lengths.as_tensor().copy().unwrap()
-}
-
-pub fn two_step_light_pmsf(
-    felsenstein_op: FelsensteinOp,
-    categories: &[[f64; 20]],
-    weights: &[f64],
-    log_branch_lengths: &Tensor,
-    mutsel_params: super::MutselParams,
-    verbosity: Verbosity,
-    prefix: &str,
-) -> (Tensor, Tensor) {
-    let step1_site_freq = light_pmsf(
-        felsenstein_op.into_with_edge_op(),
-        categories,
-        weights,
-        log_branch_lengths,
-    );
-
-    let Mu = loadMu();
-
-    let log_pi = step1_site_freq.log().unwrap();
-
-    let log_branch_lengths = optimize_branch_lengths(
-        felsenstein_op.into_with_edge_op(),
-        &log_pi,
-        &Mu,
-        log_branch_lengths,
-        verbosity,
-        prefix,
-        mutsel_params,
-    );
-
-    let final_site_freq = light_pmsf(
-        felsenstein_op.into_with_edge_op(),
-        categories,
-        weights,
-        &log_branch_lengths,
-    );
-
-    (final_site_freq, log_branch_lengths)
-}
-
+/// Site frequencies of the light PMSF: the posterior mean over the profile mixture (categories with weights)
+/// under Mu, given the tree. The categories are not normalized to a mean substitution rate.
 pub fn light_pmsf(
-    felsenstein_op: FelsensteinWithEdgeOp,
+    parents: &[i32],
+    columns: &[&[u8]],
+    Mu: &SMatrix<f64, 20, 20>,
     categories: &[[f64; 20]],
     weights: &[f64],
-    log_branch_lengths: &Tensor,
-) -> Tensor {
-    let mut likelihoods = vec![];
+    branch_lengths: &[f64],
+) -> Vec<SVector<f64, 20>> {
+    // log likelihood [category][site] plus the log weight of the category
+    let log_joint: Vec<Vec<f64>> = categories
+        .iter()
+        .zip(weights)
+        .map(|(category, weight)| {
+            let (S, sqrt_pi) = crate::model::rate_matrix(Mu, &SVector::from(*category).map(f64::ln));
+            let result = phylo_grad::calculate_gradients_columns(
+                parents,
+                columns,
+                branch_lengths,
+                &[S],
+                &[sqrt_pi],
+                None::<&mut [Vec<f64>]>,
+            );
+            result.log_likelihood.iter().map(|ll| ll + weight.ln()).collect()
+        })
+        .collect();
 
-    let Mu = loadMu();
-
-    for category in categories.iter() {
-        let category_tensor =
-            Tensor::from_vec(category.to_vec(), &[20], &candle_core::Device::Cpu).unwrap();
-        let log_pi = category_tensor.log().unwrap().unsqueeze(0).unwrap();
-
-        let (S, sqrt_pi) = model::calc_rate_matrix(&Mu, &log_pi, &tensor_full(1.0, &[]));
-
-        let likelihood = S
-            .apply_op3(
-                &sqrt_pi,
-                &log_branch_lengths.exp().unwrap(),
-                felsenstein_op.into_fwd_op(),
-            )
-            .unwrap();
-        likelihoods.push(likelihood);
-    }
-
-    let likelihoods = Tensor::stack(&likelihoods, 0).unwrap();
-    let weights_tensor =
-        Tensor::from_slice(&weights, &[weights.len()], &candle_core::Device::Cpu).unwrap();
-    let log_weights_tensor = weights_tensor.log().unwrap().unsqueeze(1).unwrap();
-
-    let weighted_likelihoods = (likelihoods.broadcast_add(&log_weights_tensor)).unwrap();
-
-    let posteriors = candle_nn::ops::softmax(&weighted_likelihoods, 0).unwrap();
-
-    let category_tensor = Tensor::from_vec(
-        categories.iter().flatten().copied().collect(),
-        &[categories.len(), 20],
-        &candle_core::Device::Cpu,
-    )
-    .unwrap();
-
-    let site_freq = posteriors.t().unwrap().matmul(&category_tensor).unwrap();
-
-    site_freq
+    (0..columns.len())
+        .into_par_iter()
+        .map(|site| {
+            let max = log_joint.iter().map(|l| l[site]).fold(f64::NEG_INFINITY, f64::max);
+            let mut sum = 0.0;
+            let mut freq = SVector::<f64, 20>::zeros();
+            for (log_joint, category) in log_joint.iter().zip(categories) {
+                let posterior = (log_joint[site] - max).exp();
+                sum += posterior;
+                freq += SVector::from(*category) * posterior;
+            }
+            freq / sum
+        })
+        .collect()
 }
 
-/// Calculates the mutation rate matrix from the log_R variable. This is a lower triangular matrix with the exchanabilities and the equilibirum in the diagonal. Both as in log space.
-/// Returns Mut and the equilibrium frequencies in the diagonal. (not log space)
-pub fn Mu(log_parameter: &Tensor) -> Tensor {
-    let parameter = log_parameter.exp().unwrap();
-    let diagonal = (&parameter
-        * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
-    .unwrap();
-    let off_diagonal = (parameter - &diagonal).unwrap();
-
-    // Mutation equilibrium should stay fixed to neutral
-    let diagonal = diagonal.detach();
-
-    let pi = diagonal
-        .broadcast_div(&diagonal.sum_all().unwrap())
-        .unwrap();
-    let pi_vec = pi.sum(1).unwrap();
-    let sqrt_pi = pi_vec.sqrt().unwrap();
-    let sqrt_pi_inv = sqrt_pi.recip().unwrap();
-
-    let S = (&off_diagonal + off_diagonal.t().unwrap()).unwrap();
-
-    // Q = diag(sqrt_pi_inv) * S * diag(sqrt_pi)
-    let Q = sqrt_pi_inv
-        .unsqueeze(1)
-        .unwrap()
-        .broadcast_mul(&S)
-        .unwrap()
-        .broadcast_mul(&sqrt_pi.unsqueeze(0).unwrap())
-        .unwrap();
-    let Q = (&Q
-        - &Q * Tensor::eye(20, candle_core::DType::F64, &candle_core::Device::Cpu).unwrap())
-    .unwrap();
-
-    let row_sum = Q.sum(1).unwrap();
-    let sum = row_sum.dot(&pi_vec).unwrap();
-    let Q = Q.broadcast_div(&sum).unwrap();
-
-    // The scaling of Q does not matter, since we always scale it so the subsitution rate over all rate averages to 1.0.
-
-    // diagonal is zero here, but they are not used anyway
-    (Q + pi).unwrap()
+/// Branch lengths maximizing the log likelihood with Mu and the site frequencies fixed (the rate matrices
+/// normalized to a mean substitution rate of 1)
+fn optimize_branch_lengths(
+    parents: &[i32],
+    columns: &[&[u8]],
+    Mu: &SMatrix<f64, 20, 20>,
+    log_pi: &[SVector<f64, 20>],
+    branch_lengths: &[f64],
+    convergence: Convergence,
+) -> Vec<f64> {
+    let mut log_branch_lengths: Vec<f64> = branch_lengths.iter().map(|b| b.ln()).collect();
+    maximize_finite(
+        |x| {
+            let branch_lengths: Vec<f64> = x.iter().map(|l| l.exp()).collect();
+            let result = batch::log_likelihood_and_gradients(
+                parents,
+                columns,
+                Mu,
+                log_pi,
+                &branch_lengths,
+                batch::RateScaling::MeanRate,
+                None,
+            );
+            let gradient = branch_lengths.iter().zip(&result.grad_branch_lengths).map(|(b, g)| g * b).collect();
+            Some((result.log_likelihood, gradient))
+        },
+        &mut log_branch_lengths,
+        convergence.max_iterations,
+        convergence.min_rel_improvement,
+    );
+    log_branch_lengths.iter().map(|l| l.exp()).collect()
 }
 
-// Used with the MutSel model.
-fn loadMu() -> Tensor {
-    let R_lower = crate::data::load_lower_R_with_equi(crate::data::M_TXT);
-    let log_R = R_lower.log().unwrap();
-    Mu(&log_R)
-}
-
-/// Convergence criteria of optimize
+/// Stopping criteria of the L-BFGS optimizations: at most max_iterations, or until an iteration improves
+/// the objective by less than min_rel_improvement relative to its value
 #[derive(Debug, Clone, Copy)]
 pub struct Convergence {
-    pub min_iterations: usize,
     pub max_iterations: usize,
     pub min_rel_improvement: f64,
-    pub no_improve_patience: usize,
 }
 
 impl Convergence {
-    /// Criteria of the MAP estimate in optimize_internal
+    /// Criteria of the MAP estimate and the branch lengths of the light PMSF initialization
     pub const MAP: Convergence = Convergence {
-        min_iterations: 100,
         max_iterations: 500,
-        min_rel_improvement: 1e-6,
-        no_improve_patience: 5,
+        min_rel_improvement: 1e-7,
     };
 }
 
-/// log of the lower triangular R with the equilibrium in the diagonal (-inf above it), from prior_R_file or
-/// the default M_TXT. Mu is penalized relative to it.
-pub fn initial_log_R(prior_R_file: Option<&Path>) -> Result<Tensor, candle_core::Error> {
-    let init_R = if let Some(prior_R_file) = prior_R_file {
-        let file_content = std::fs::read_to_string(prior_R_file)?;
-        crate::data::load_lower_R_with_equi(&file_content)
-    } else {
-        crate::data::load_lower_R_with_equi(crate::data::M_TXT)
-    };
-    init_R.log()
+/// Log posterior of the MAP estimate (log likelihood with the rate matrices normalized to a mean substitution rate
+/// of 1 plus the log priors of the exchangeabilities and the site frequencies) and its gradient at
+/// x = [log exchangeabilities, Helmert coordinates of every site, log branch lengths]
+fn map_objective(parents: &[i32], columns: &[&[u8]], prior: &Prior, x: &[f64]) -> (f64, Vec<f64>) {
+    let num_coordinates = columns.len() * NUM_COORDINATES;
+    let log_S = &x[..NUM_EXCHANGEABILITIES];
+    let coordinates = &x[NUM_EXCHANGEABILITIES..NUM_EXCHANGEABILITIES + num_coordinates];
+    let branch_lengths: Vec<f64> = x[NUM_EXCHANGEABILITIES + num_coordinates..].iter().map(|l| l.exp()).collect();
+    let basis = helmert::basis();
+    let log_pi: Vec<SVector<f64, 20>> = coordinates
+        .par_chunks_exact(NUM_COORDINATES)
+        .map(|c| helmert::coordinates_to_log_freq(&SVector::from_column_slice(c)))
+        .collect();
+    let result = batch::log_likelihood_and_gradients(
+        parents,
+        columns,
+        &Mu(log_S),
+        &log_pi,
+        &branch_lengths,
+        batch::RateScaling::MeanRate,
+        None,
+    );
+
+    let (log_prior_S, grad_log_prior_S) = prior.evaluate_exchangeabilities(log_S);
+    let mut gradient: Vec<f64> =
+        Mu_backward(log_S, &result.grad_Mu).iter().zip(&grad_log_prior_S).map(|(g, p)| g + p).collect();
+
+    let (log_prior_pi, grad_coordinates): (Vec<f64>, Vec<SVector<f64, NUM_COORDINATES>>) = coordinates
+        .par_chunks_exact(NUM_COORDINATES)
+        .zip(result.grad_log_pi.par_iter())
+        .map(|(c, grad_log_pi)| {
+            let (log_prior, grad_log_prior) = prior.site_frequencies.evaluate(&SVector::from_column_slice(c));
+            (log_prior, basis * grad_log_pi + grad_log_prior)
+        })
+        .unzip();
+    gradient.extend(grad_coordinates.iter().flat_map(|g| g.iter().copied()));
+    gradient.extend(branch_lengths.iter().zip(&result.grad_branch_lengths).map(|(b, g)| g * b));
+
+    (result.log_likelihood + log_prior_S + log_prior_pi.iter().sum::<f64>(), gradient)
 }
 
-/// log_R with Mu(log_R) = Mu up to the normalization, the inverse of Mu. The upper triangle is taken
-/// from template (an output of initial_log_R).
-pub fn log_R_from_Mu(Mu: &Tensor, template: &Tensor) -> Result<Tensor, candle_core::Error> {
-    let Mu = Mu.to_vec2::<f64>()?;
-    let mut log_R = template.to_vec2::<f64>()?;
-    let pi: Vec<f64> = (0..20).map(|i| Mu[i][i]).collect();
-    for i in 0..20 {
-        log_R[i][i] = pi[i].ln();
-        // Q_ij = S_ij sqrt(pi_j / pi_i) / normalization, R holds S_ij in the lower triangle
-        for j in 0..i {
-            log_R[i][j] = (Mu[i][j] * (pi[i] / pi[j]).sqrt()).ln();
-        }
-    }
-    Tensor::from_vec(log_R.concat(), &[20, 20], &candle_core::Device::Cpu)
+pub struct MapEstimate {
+    pub log_S: Vec<f64>,
+    pub branch_lengths: Vec<f64>,
+    pub coordinates: Vec<SVector<f64, NUM_COORDINATES>>,
 }
 
-/// Joint MAP estimate of Mu, the pca coordinates of every site and the branch lengths,
-/// initialized with the two step light PMSF procedure.
+/// Joint MAP estimate of Mu, the Helmert coordinates of every site and the branch lengths, with the rate matrices
+/// normalized to a mean substitution rate of 1 over the sites. Initialized with the prior Mu and the two step
+/// light PMSF procedure: light PMSF frequencies on the input tree, the branch lengths optimized for them, light
+/// PMSF frequencies on these branch lengths.
 pub fn map_estimate(
-    op: FelsensteinOp,
-    distances: &[f64],
-    mutsel_params: super::MutselParams,
-    prior_R_file: Option<&Path>,
+    parents: &[i32],
+    columns: &[&[u8]],
+    branch_lengths: &[f64],
+    prior: &Prior,
     convergence: Convergence,
     verbosity: Verbosity,
-    out_prefix: &str,
-) -> Result<ModelParameters, candle_core::Error> {
-    let init_log_R = initial_log_R(prior_R_file)?;
+) -> MapEstimate {
+    let num_sites = columns.len();
+    let prior_Mu = Mu(&prior.log_exchangeabilities);
 
-    let log_branch_lengths =
-        Tensor::from_slice(distances, &[distances.len()], &candle_core::Device::Cpu)?.log()?;
+    let site_freq = light_pmsf(parents, columns, &prior_Mu, crate::data::UDM256, crate::data::UDM256_WEIGHTS, branch_lengths);
+    let log_pi: Vec<SVector<f64, 20>> = site_freq.iter().map(|f| f.map(f64::ln)).collect();
+    let branch_lengths = optimize_branch_lengths(parents, columns, &prior_Mu, &log_pi, branch_lengths, convergence);
+    let site_freq = light_pmsf(parents, columns, &prior_Mu, crate::data::UDM256, crate::data::UDM256_WEIGHTS, &branch_lengths);
 
-    // Do our lightweight PMSF procedure for initialization:
-    let (site_freq, log_branch_lengths) = two_step_light_pmsf(
-        op.clone(),
-        crate::data::UDM256,
-        crate::data::UDM256_WEIGHTS,
-        &log_branch_lengths,
-        mutsel_params,
-        verbosity,
-        out_prefix,
-    );
+    // x = [log exchangeabilities, Helmert coordinates of every site, log branch lengths]
+    let num_coordinates = num_sites * NUM_COORDINATES;
+    let mut x = prior.log_exchangeabilities.clone();
+    x.extend(site_freq.iter().flat_map(|f| helmert::log_freq_to_coordinates(&f.map(f64::ln)).iter().copied().collect::<Vec<_>>()));
+    x.extend(branch_lengths.iter().map(|b| b.ln()));
 
-    // Variable which gets optimized
-    let log_R = Var::from_tensor(&init_log_R)?;
-    let init_log_pi = site_freq.log()?;
-
-    let pca = PCA::new(19);
-
-    let pca_coordinates = pca.log_freq_to_pca_coordinates(&init_log_pi);
-
-    let model = ModelParameters {
-        felsenstein_op: op.into_with_edge_op(),
-        log_R,
-        pca_coordinates: Var::from_tensor(&pca_coordinates).unwrap(),
-        log_branch_lengths: Var::from_tensor(&log_branch_lengths).unwrap(),
-        init_log_branch_lengths: log_branch_lengths.detach().copy().unwrap(),
-        reg_para: mutsel_params,
-        init_log_R,
-        pca_data: pca,
-    };
-
-    optimize(
-        &model,
-        convergence.min_iterations,
+    let start = std::time::Instant::now();
+    let num_evaluations = maximize_finite(
+        |x| Some(map_objective(parents, columns, prior, x)),
+        &mut x,
         convergence.max_iterations,
         convergence.min_rel_improvement,
-        convergence.no_improve_patience,
-        verbosity,
-        out_prefix,
     );
-
-    Ok(model)
-}
-
-/// Returns the optimal S, sqrt_pi and rate parameters.
-/// S: [L, 20, 20], sqrt_pi: [L, 20]
-/// rate parameters is either alpha shape: [1] or [2 * num_cat] for free rate model (first num_cat weights, second num_cat are rates)
-pub fn optimize_internal(
-    felsenstein: FelsensteinTree<20>,
-    distances: &[f64],
-    mutsel_params: super::MutselParams,
-    prior_R_file: Option<&Path>,
-    verbosity: Verbosity,
-    out_prefix: &str,
-) -> Result<(Tensor, Tensor), candle_core::Error> {
-    let op = felsenstein::FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
-
-    let model = map_estimate(
-        op,
-        distances,
-        mutsel_params,
-        prior_R_file,
-        Convergence::MAP,
-        verbosity,
-        out_prefix,
-    )?;
-
-    let (S, sqrt_pi) = model.calc_rate_matrix();
-
-    if verbosity.should_print(Verbosity::Med) {
-        model.save_npz(Path::new(&format!("{}.mutsel.npz", out_prefix)));
+    if verbosity.should_print(Verbosity::Min) {
+        println!(
+            "MUTSEL MAP estimate: {} evaluations ({:.1}s)",
+            num_evaluations,
+            start.elapsed().as_secs_f64()
+        );
     }
 
-    Ok((S, sqrt_pi))
+    MapEstimate {
+        log_S: x[..NUM_EXCHANGEABILITIES].to_vec(),
+        branch_lengths: x[NUM_EXCHANGEABILITIES + num_coordinates..].iter().map(|l| l.exp()).collect(),
+        coordinates: x[NUM_EXCHANGEABILITIES..NUM_EXCHANGEABILITIES + num_coordinates]
+            .chunks_exact(NUM_COORDINATES)
+            .map(SVector::from_column_slice)
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Log exchangeabilities away from those of the test prior
+    fn perturbed_log_S() -> Vec<f64> {
+        crate::prior::tests::test_prior()
+            .log_exchangeabilities
+            .iter()
+            .zip(lower_indices())
+            .map(|(l, (i, j))| l + 0.3 * ((i * 20 + j) as f64 * 0.73).sin())
+            .collect()
+    }
+
+    /// Central differences of f
+    fn finite_differences(f: impl Fn(&[f64]) -> f64, x: &[f64], h: f64) -> Vec<f64> {
+        (0..x.len())
+            .map(|k| {
+                let (mut plus, mut minus) = (x.to_vec(), x.to_vec());
+                plus[k] += h;
+                minus[k] -= h;
+                (f(&plus) - f(&minus)) / (2.0 * h)
+            })
+            .collect()
+    }
+
+    fn max_difference(a: &[f64], b: &[f64]) -> f64 {
+        a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max)
+    }
+
+    fn max_abs(a: &[f64]) -> f64 {
+        a.iter().fold(0.0f64, |m, x| m.max(x.abs()))
+    }
+
+    #[test]
+    fn Mu_has_rate_one_and_the_fixed_equilibrium() {
+        let Mu = Mu(&perturbed_log_S());
+        let pi = SVector::from(M_EQUI) / M_EQUI.iter().sum::<f64>();
+        let rate: f64 = (0..20).map(|i| pi[i] * Mu.row(i).sum()).sum();
+        assert!((rate - 1.0).abs() < 1e-13);
+        assert_eq!(Mu.diagonal(), SVector::<f64, 20>::zeros());
+        // Reversible with the equilibrium M_EQUI: pi_i Mu_ij = pi_j Mu_ji
+        for (i, j) in lower_indices() {
+            assert!((pi[i] * Mu[(i, j)] - pi[j] * Mu[(j, i)]).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn Mu_backward_matches_finite_differences() {
+        let log_S = perturbed_log_S();
+        let G = SMatrix::<f64, 20, 20>::from_fn(|i, j| ((i * 20 + j) as f64 * 0.37).sin());
+        let fd = finite_differences(|log_S| Mu(log_S).component_mul(&G).sum(), &log_S, 1e-6);
+        let gradient = Mu_backward(&log_S, &G);
+        assert!(max_difference(&fd, &gradient) < 1e-8 * max_abs(&gradient));
+    }
+
+    #[test]
+    fn map_objective_gradient_matches_finite_differences() {
+        use crate::batch::tests::*;
+        let alignment = alignment();
+        let columns: Vec<&[u8]> = alignment.chunks_exact(NUM_LEAVES).collect();
+        let prior = crate::prior::tests::test_prior();
+        let mut x = perturbed_log_S();
+        x.extend(log_pi().iter().flat_map(|lp| helmert::log_freq_to_coordinates(lp).iter().copied().collect::<Vec<_>>()));
+        x.extend(branch_lengths().iter().map(|b| b.ln()));
+        let (_, gradient) = map_objective(&PARENTS, &columns, &prior, &x);
+        let fd = finite_differences(|x| map_objective(&PARENTS, &columns, &prior, x).0, &x, 1e-5);
+        assert!(max_difference(&fd, &gradient) < 1e-5 * max_abs(&gradient), "{}", max_difference(&fd, &gradient));
+    }
 }

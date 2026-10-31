@@ -4,13 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-candle-core = "0.9.2"
-candle-nn = "0.9.2"
-phylo_grad = "2.7.0"
+phylo_grad = { git = "https://github.com/soedinglab/phylo_grad", branch = "main" }
 rayon = "1.11.0"
 libc = "0.2.182"
 nuts-rs = { git = "https://github.com/benjamin-lieser/nuts-rs", branch = "persistent-chain" }
 thiserror = "2.0.20"
+zip = { version = "9.2.0", default-features = false, features = ["deflate"] }
 
 [lib]
 name = "mutsel_rust"

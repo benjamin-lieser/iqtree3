@@ -10,8 +10,6 @@ void rust_mutsel(int32_t *parents,
                  uint32_t leave_num,
                  uint32_t node_num,
                  const char *model_string,
-                 const char *priorMuFile,
-                 const char *priorPiFile,
                  uint8_t verbose,
                  uint32_t num_tree_draws,
                  double *out_site_freq,
@@ -52,17 +50,16 @@ std::pair<std::vector<double>, std::vector<int32_t>> prepare_mutsel_tree(MTree *
 
     auto root = orig_root->neighbors[0]->node;
 
-    std::vector<std::pair<Node *, Node *>> stack;
-    stack.push_back({root, nullptr});
-
-    branch_lengths.at(root->id) = 0.0; // root branch length
-    parent_indices.at(root->id) = -1;  // root has no parent
+    // Nodes in pre-order with their parent and the length of the branch to it
+    std::vector<std::tuple<Node *, Node *, double>> preorder;
+    std::vector<std::tuple<Node *, Node *, double>> stack;
+    stack.push_back({root, nullptr, 0.0});
 
     while (!stack.empty())
     {
-        Node *node = stack.back().first;
-        Node *dad = stack.back().second;
+        auto [node, dad, length] = stack.back();
         stack.pop_back();
+        preorder.push_back({node, dad, length});
 
         for (auto nei : node->neighbors)
         {
@@ -70,18 +67,31 @@ std::pair<std::vector<double>, std::vector<int32_t>> prepare_mutsel_tree(MTree *
             {
                 continue;
             }
-            Node *child = nei->node;
 
             if (nei->length < 0.0)
             {
                 throw std::runtime_error("The guide Tree for MUTSEL needs to have branchlengths. Please provide a tree with branch lengths.");
             }
 
-            branch_lengths.at(child->id) = nei->length;
-            parent_indices.at(child->id) = node->id;
-
-            stack.push_back({child, node});
+            stack.push_back({nei->node, node, nei->length});
         }
+    }
+
+    // phylo_grad needs the nodes topologically sorted: leaves first, every parent after its children and the root last.
+    // Leaves keep their ids (the sequence index in the alignment), internal nodes are numbered in reverse pre-order.
+    std::vector<int32_t> new_id(num_nodes, -1);
+    int32_t next_id = tree->leafNum;
+    for (auto it = preorder.rbegin(); it != preorder.rend(); ++it)
+    {
+        Node *node = std::get<0>(*it);
+        new_id.at(node->id) = node->isLeaf() ? node->id : next_id++;
+    }
+    ASSERT(next_id == num_nodes);
+
+    for (auto [node, dad, length] : preorder)
+    {
+        branch_lengths.at(new_id[node->id]) = length; // 0.0 for the root
+        parent_indices.at(new_id[node->id]) = dad == nullptr ? -1 : new_id[dad->id];
     }
 
     delete tree;
@@ -508,8 +518,6 @@ void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
                 N,
                 parent_indices.size(),
                 params.model_name.c_str(),
-                params.mutsel_prior_rate_file.empty() ? nullptr : params.mutsel_prior_rate_file.c_str(),
-                params.mutsel_prior_freq_file.empty() ? nullptr : params.mutsel_prior_freq_file.c_str(),
                 verbose_mode,
                 num_draws,
                 site_freq,
