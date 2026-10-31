@@ -1,9 +1,10 @@
 //! Per-site posterior sampling of the PCA coordinates with NUTS (nuts-rs).
 //!
 //! Mu, the branch lengths and the global rate normalization are shared and kept
-//! constant while sampling. Site rates are fixed to 1. With everything shared fixed, the
+//! constant while sampling. Site rates are fixed to 1, or with MUTSEL_SITE_RATE_SD sampled as a
+//! log-normal correction of the MutSel rate (see SiteRatePrior). With everything shared fixed, the
 //! posterior factorizes over alignment columns, so every column gets its own
-//! independent 19-dimensional NUTS chain.
+//! independent 19-dimensional (20 with site rates) NUTS chain.
 //!
 //! Before the final sampling, Mu and the branch lengths are fitted with Monte Carlo EM
 //! (see sample_internal).
@@ -93,6 +94,53 @@ impl LogpError for SiteLogpError {
     }
 }
 
+/// Log-normal prior of a site rate r that multiplies the site's MutSel rate matrix: log r ~ N(-sd^2/2, sd^2),
+/// so that the prior mean of r is 1 and the rates only correct the rates given by the site frequencies.
+#[derive(Debug, Clone, Copy)]
+pub struct SiteRatePrior {
+    pub sd: f64,
+}
+
+impl SiteRatePrior {
+    /// Reads MUTSEL_SITE_RATE_SD, unset or 0 keeps all site rates 1
+    pub fn from_env() -> Option<SiteRatePrior> {
+        let sd: f64 = env_or("MUTSEL_SITE_RATE_SD", 0.0);
+        assert!(sd >= 0.0, "MUTSEL_SITE_RATE_SD must not be negative");
+        (sd > 0.0).then_some(SiteRatePrior { sd })
+    }
+
+    /// M-step of the sd given draws of the log site rates: maximizes the mean of log N(l; -sd^2/2, sd^2)
+    /// = -l^2 / (2 sd^2) - l / 2 - sd^2 / 8 - log sd + const, which is at sd^4 / 4 + sd^2 = mean(l^2)
+    fn fit(log_rates: impl Iterator<Item = f64>) -> SiteRatePrior {
+        let (sum, count) = log_rates.fold((0.0, 0usize), |(sum, count), l| (sum + l * l, count + 1));
+        let mean_square = sum / count as f64;
+        SiteRatePrior { sd: (2.0 * ((1.0 + mean_square).sqrt() - 1.0)).sqrt() }
+    }
+
+    fn mean(&self) -> f64 {
+        -0.5 * self.sd * self.sd
+    }
+
+    /// Log density of the log rate and its derivative
+    fn evaluate(&self, log_rate: f64) -> (f64, f64) {
+        let z = (log_rate - self.mean()) / self.sd;
+        (
+            -0.5 * z * z - self.sd.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln(),
+            -z / self.sd,
+        )
+    }
+}
+
+/// Appends the prior mean of the log site rate to a position of only pca coordinates, if site rates are sampled
+fn with_initial_log_rate(mut position: Vec<f64>, site_rate_prior: Option<SiteRatePrior>) -> Vec<f64> {
+    if let Some(prior) = site_rate_prior {
+        if position.len() == NUM_COMPONENTS {
+            position.push(prior.mean());
+        }
+    }
+    position
+}
+
 /// Constants of the per-site posterior which are shared by all sites.
 struct SharedModel {
     /// PCA components [19, 20], log_pi = components^T * x (up to a constant)
@@ -107,6 +155,8 @@ struct SharedModel {
     prior_beta: SVector<f64, NUM_COMPONENTS>,
     /// Replaces the generalized normal prior if set
     mixture_prior: Option<Arc<MixturePrior>>,
+    /// If set, the position has the log site rate as an additional last coordinate
+    site_rate_prior: Option<SiteRatePrior>,
 }
 
 /// Alternative priors on the pca coordinates, see MixturePrior::from_env
@@ -316,6 +366,7 @@ impl SharedModel {
             prior_scale: to_vec(&pca.alpha) / pi_reg,
             prior_beta: to_vec(&pca.beta),
             mixture_prior: None,
+            site_rate_prior: None,
         }
     }
 }
@@ -323,6 +374,55 @@ impl SharedModel {
 impl SharedModel {
     fn with_mixture_prior(self, mixture_prior: Option<Arc<MixturePrior>>) -> SharedModel {
         SharedModel { mixture_prior, ..self }
+    }
+
+    fn with_site_rate_prior(self, site_rate_prior: Option<SiteRatePrior>) -> SharedModel {
+        SharedModel { site_rate_prior, ..self }
+    }
+
+    /// Dimension of a site's position: the pca coordinates and, if sampled, the log site rate
+    fn dim(&self) -> usize {
+        NUM_COMPONENTS + self.site_rate_prior.is_some() as usize
+    }
+
+    /// Site rate of a position, 1 if site rates are not sampled
+    fn site_rate(&self, position: &[f64]) -> f64 {
+        if self.site_rate_prior.is_some() { position[NUM_COMPONENTS].exp() } else { 1.0 }
+    }
+
+    /// evaluate() at the pca coordinates of a position, with S multiplied by the site rate and the log prior of
+    /// the log site rate added if site rates are sampled
+    fn evaluate_position(&self, position: &[f64]) -> SiteModelEval {
+        let mut eval = self.evaluate(&SVector::<f64, NUM_COMPONENTS>::from_column_slice(&position[..NUM_COMPONENTS]));
+        if let Some(prior) = &self.site_rate_prior {
+            eval.S *= position[NUM_COMPONENTS].exp();
+            eval.log_prior += prior.evaluate(position[NUM_COMPONENTS]).0;
+        }
+        eval
+    }
+
+    /// Gradient of log_likelihood + log_prior w.r.t. the position (see backpropagate) for an eval of
+    /// evaluate_position
+    fn backpropagate_position(
+        &self,
+        position: &[f64],
+        eval: &SiteModelEval,
+        grad_S: &SMatrix<f64, 20, 20>,
+        grad_sqrt_pi: &SVector<f64, 20>,
+        gradient: &mut [f64],
+    ) {
+        // S scales with the site rate, so backpropagate gives the gradient w.r.t. the pca coordinates
+        // with the scaled S, and d S_ij / d log r = S_ij
+        gradient[..NUM_COMPONENTS].copy_from_slice(self.backpropagate(eval, grad_S, grad_sqrt_pi).as_slice());
+        if let Some(prior) = &self.site_rate_prior {
+            let mut grad_log_rate = prior.evaluate(position[NUM_COMPONENTS]).1;
+            for i in 0..20 {
+                for j in (i + 1)..20 {
+                    grad_log_rate += grad_S[(i, j)] * eval.S[(i, j)];
+                }
+            }
+            gradient[NUM_COMPONENTS] = grad_log_rate;
+        }
     }
 
     /// Site frequencies for the given pca coordinates
@@ -461,7 +561,7 @@ struct SiteLogp {
 
 impl HasDims for SiteLogp {
     fn dim_sizes(&self) -> std::collections::HashMap<String, u64> {
-        [("unconstrained_parameter".to_string(), NUM_COMPONENTS as u64)]
+        [("unconstrained_parameter".to_string(), self.shared.dim() as u64)]
             .into_iter()
             .collect()
     }
@@ -473,13 +573,12 @@ impl CpuLogpFunc for SiteLogp {
     type ExpandedVector = Vec<f64>;
 
     fn dim(&self) -> usize {
-        NUM_COMPONENTS
+        self.shared.dim()
     }
 
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, SiteLogpError> {
         let model = &*self.shared;
-        let x = SVector::<f64, NUM_COMPONENTS>::from_column_slice(position);
-        let eval = model.evaluate(&x);
+        let eval = model.evaluate_position(position);
 
         let num_leaves = self.leaf_pl.len();
         self.pl_buffer[..num_leaves].copy_from_slice(&self.leaf_pl);
@@ -494,11 +593,10 @@ impl CpuLogpFunc for SiteLogp {
             return Err(SiteLogpError::NonFinite);
         }
 
-        let grad_x = model.backpropagate(&eval, &result.grad_s, &result.grad_sqrt_pi);
-        if grad_x.iter().any(|g| !g.is_finite()) {
+        model.backpropagate_position(position, &eval, &result.grad_s, &result.grad_sqrt_pi, gradient);
+        if gradient.iter().any(|g| !g.is_finite()) {
             return Err(SiteLogpError::NonFinite);
         }
-        gradient.copy_from_slice(grad_x.as_slice());
 
         Ok(logp)
     }
@@ -513,10 +611,14 @@ impl CpuLogpFunc for SiteLogp {
 }
 
 struct SiteSamples {
-    /// Evenly thinned draws [num_output_samples * 19]
+    /// Dimension of a draw, the pca coordinates and, if sampled, the log site rate
+    dim: usize,
+    /// Evenly thinned draws [num_output_samples * dim]
     thinned_draws: Vec<f64>,
     /// Posterior mean of the site frequencies over all draws
     mean_pi: SVector<f64, 20>,
+    /// Posterior mean of the site rate over all draws, 1 if site rates are not sampled
+    mean_site_rate: f64,
     num_draws: usize,
     /// Minimum over the pca coordinates of the effective sample size of all draws
     ess: f64,
@@ -608,8 +710,10 @@ fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index:
 /// Draws from a chain until the ESS target is reached, after its tuning draws and then burn_in further draws
 fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site_index: usize) -> SiteSamples {
     let shared = Arc::clone(&chain.math().logp_func().shared);
+    let dim = shared.dim();
+    assert!(!settings.marginal || dim == NUM_COMPONENTS, "marginal likelihoods are not supported with site rates");
     let mut num_burn_in = 0;
-    let mut draws = Vec::with_capacity(settings.num_draws as usize * NUM_COMPONENTS);
+    let mut draws = Vec::with_capacity(settings.num_draws as usize * dim);
     let mut num_divergences = 0;
     let mut num_steps = 0u64;
     let mut step_size;
@@ -633,11 +737,11 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
         num_steps += progress.num_steps;
         step_size = progress.step_size;
 
-        let num_draws = draws.len() / NUM_COMPONENTS;
+        let num_draws = draws.len() / dim;
         if num_draws < next_check {
             continue;
         }
-        ess = min_effective_sample_size(&draws, NUM_COMPONENTS);
+        ess = min_effective_sample_size(&draws, dim);
         if ess >= settings.target_ess as f64 || num_draws as u64 >= settings.max_draws {
             break;
         }
@@ -647,13 +751,13 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
             .clamp(num_draws + num_draws / 4 + 1, 2 * num_draws)
             .min(settings.max_draws as usize);
     }
-    let num_draws = draws.len() / NUM_COMPONENTS;
+    let num_draws = draws.len() / dim;
 
-    let mut thinned_draws = Vec::with_capacity(settings.num_output_samples * NUM_COMPONENTS);
+    let mut thinned_draws = Vec::with_capacity(settings.num_output_samples * dim);
     for i in 0..settings.num_output_samples {
         // Last draw of each of num_output_samples equally sized blocks
         let draw = ((i + 1) * num_draws) / settings.num_output_samples - 1;
-        thinned_draws.extend_from_slice(&draws[draw * NUM_COMPONENTS..(draw + 1) * NUM_COMPONENTS]);
+        thinned_draws.extend_from_slice(&draws[draw * dim..(draw + 1) * dim]);
     }
 
     let mut proposal = None;
@@ -679,14 +783,19 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
     }
 
     let mut mean_pi = SVector::<f64, 20>::zeros();
-    for draw in draws.chunks_exact(NUM_COMPONENTS) {
-        mean_pi += shared.pi(&SVector::<f64, NUM_COMPONENTS>::from_column_slice(draw)).1;
+    let mut mean_site_rate = 0.0;
+    for draw in draws.chunks_exact(dim) {
+        mean_pi += shared.pi(&SVector::<f64, NUM_COMPONENTS>::from_column_slice(&draw[..NUM_COMPONENTS])).1;
+        mean_site_rate += shared.site_rate(draw);
     }
     mean_pi /= num_draws as f64;
+    mean_site_rate /= num_draws as f64;
 
     SiteSamples {
+        dim,
         thinned_draws,
         mean_pi,
+        mean_site_rate,
         num_draws,
         ess,
         num_divergences,
@@ -928,8 +1037,9 @@ fn site_modes(
 /// Maximizes logp with L-BFGS (memory 6) and a backtracking line search, starting at init. Returns init if
 /// logp is not finite there.
 fn maximize_lbfgs(logp: &mut SiteLogp, init: &[f64], max_iterations: usize, gradient_tolerance: f64) -> Vec<f64> {
+    let dim = logp.shared.dim();
     let eval = |x: &DVector<f64>| -> Option<(f64, DVector<f64>)> {
-        let mut gradient = [0.0; NUM_COMPONENTS];
+        let mut gradient = vec![0.0; dim];
         let value = logp.logp(x.as_slice(), &mut gradient).ok()?;
         Some((value, DVector::from_column_slice(&gradient)))
     };
@@ -1189,7 +1299,7 @@ fn thinned_log_pi(site_samples: &[SiteSamples], num_samples: usize, pca: &PCA) -
         .map(|k| {
             let coordinates: Vec<f64> = site_samples
                 .iter()
-                .flat_map(|s| s.thinned_draws[k * NUM_COMPONENTS..(k + 1) * NUM_COMPONENTS].iter().copied())
+                .flat_map(|s| s.thinned_draws[k * s.dim..k * s.dim + NUM_COMPONENTS].iter().copied())
                 .collect();
             let coordinates =
                 Tensor::from_vec(coordinates, &[site_samples.len(), NUM_COMPONENTS], &candle_core::Device::Cpu)?;
@@ -1198,7 +1308,20 @@ fn thinned_log_pi(site_samples: &[SiteSamples], num_samples: usize, pca: &PCA) -
         .collect()
 }
 
-/// Average substitution rate over all sites and samples, without normalization
+/// Site rates [num_sites] for each of the thinned draws, None if site rates are not sampled
+fn thinned_site_rates(site_samples: &[SiteSamples], num_samples: usize) -> Option<Vec<Vec<f64>>> {
+    if site_samples.first().map_or(true, |s| s.dim == NUM_COMPONENTS) {
+        return None;
+    }
+    Some(
+        (0..num_samples)
+            .map(|k| site_samples.iter().map(|s| s.thinned_draws[k * s.dim + NUM_COMPONENTS].exp()).collect())
+            .collect(),
+    )
+}
+
+/// Average substitution rate over all sites and samples, without normalization. Only the site frequencies
+/// enter, the site rates have prior mean 1 and are a correction on top of the normalized MutSel rates.
 fn mean_substitution_rate(Mu: &Tensor, log_pi_samples: &[Tensor]) -> Result<f64, candle_core::Error> {
     let mut sum = 0.0;
     for log_pi in log_pi_samples {
@@ -1208,15 +1331,17 @@ fn mean_substitution_rate(Mu: &Tensor, log_pi_samples: &[Tensor]) -> Result<f64,
     Ok(sum / log_pi_samples.len() as f64)
 }
 
-/// M-step: maximizes the log likelihood averaged over the posterior samples of the site frequencies
-/// minus the penalties on Mu and the branch lengths (as in optimization::ModelParameters),
-/// with the rate normalization fixed. Returns the averaged log likelihood at the optimum.
+/// M-step: maximizes the log likelihood averaged over the posterior samples of the site frequencies (and site
+/// rates, if site_rate_samples are given for the same samples) minus the penalties on Mu and the branch lengths
+/// (as in optimization::ModelParameters), with the rate normalization fixed. Returns the averaged log likelihood
+/// at the optimum.
 fn m_step(
     op: &FelsensteinWithEdgeOp,
     log_R: &Var,
     init_log_R: &Tensor,
     log_branch_lengths: &Var,
     log_pi_samples: &[Tensor],
+    site_rate_samples: Option<&[Vec<f64>]>,
     rate_scaling: f64,
     mutsel_params: MutselParams,
     max_iterations: usize,
@@ -1252,13 +1377,14 @@ fn m_step(
         let mut log_likelihood = 0.0;
         let mut grad_Mu = SMatrix::<f64, 20, 20>::zeros();
         let mut grad_branch_lengths = vec![0.0; branch_length_values.len()];
-        for log_pi in &log_pi_samples {
+        for (k, log_pi) in log_pi_samples.iter().enumerate() {
             let result = batch::log_likelihood_and_gradients(
                 op.tree(),
                 &Mu_matrix,
                 log_pi,
                 &branch_length_values,
                 batch::RateScaling::Fixed(rate_scaling),
+                site_rate_samples.map(|rates| rates[k].as_slice()),
             );
             log_likelihood += result.log_likelihood / num_samples;
             grad_Mu += result.grad_Mu / num_samples;
@@ -1315,7 +1441,8 @@ fn m_step(
 }
 
 /// Writes the log likelihood of every draw ([num_sites, num_draws] as draw_log_likelihood) and of the given
-/// frequencies (mean_pi_log_likelihood [num_sites]) on this tree and alignment to path
+/// frequencies and site rates (mean_pi_log_likelihood [num_sites]) on this tree and alignment to path. A draw
+/// is a position of shared (with the log site rate if shared samples site rates).
 fn write_draw_log_likelihoods(
     path: &str,
     shared: &Arc<SharedModel>,
@@ -1324,9 +1451,11 @@ fn write_draw_log_likelihoods(
     num_leaves: usize,
     draws: &[Vec<f64>],
     mean_pi: &[SVector<f64, 20>],
+    mean_site_rate: &[f64],
 ) -> Result<(), candle_core::Error> {
     let num_sites = draws.len();
-    let num_draws = draws[0].len() / NUM_COMPONENTS;
+    let dim = shared.dim();
+    let num_draws = draws[0].len() / dim;
     let num_nodes = tree.num_nodes();
     let (draw_ll, mean_ll): (Vec<Vec<f64>>, Vec<f64>) = (0..num_sites)
         .into_par_iter()
@@ -1338,14 +1467,14 @@ fn write_draw_log_likelihoods(
                 tree.calculate_likelihood_single_side(S.as_view(), sqrt_pi.as_view(), &mut pl)
             };
             let draw_ll = draws[site]
-                .chunks_exact(NUM_COMPONENTS)
-                .map(|x| {
-                    let eval = shared.evaluate(&SVector::<f64, NUM_COMPONENTS>::from_column_slice(x));
+                .chunks_exact(dim)
+                .map(|position| {
+                    let eval = shared.evaluate_position(position);
                     log_likelihood(&eval.S, &eval.sqrt_pi)
                 })
                 .collect();
             let (S, sqrt_pi) = shared.rate_matrix(&mean_pi[site].map(f64::ln));
-            (draw_ll, log_likelihood(&S, &sqrt_pi))
+            (draw_ll, log_likelihood(&(S * mean_site_rate[site]), &sqrt_pi))
         })
         .unzip();
     Tensor::write_npz(
@@ -1388,10 +1517,20 @@ fn evaluate_samples(
     if pca_samples.dim(0)? != num_sites {
         return Err(candle_core::Error::Msg(format!("{} does not have {} sites", path.display(), num_sites)));
     }
+    let log_site_rates = arrays.get("log_site_rates");
+    if log_site_rates.is_some() != shared.site_rate_prior.is_some() {
+        return Err(candle_core::Error::Msg(format!(
+            "{} {} site rates, MUTSEL_SITE_RATE_SD has to be set exactly if it does",
+            path.display(),
+            if log_site_rates.is_some() { "has" } else { "has no" }
+        )));
+    }
     println!("MUTSEL HMC: evaluating the draws in {} on this tree and alignment, no sampling", path.display());
-    let draws: Vec<Vec<f64>> = (0..num_sites)
-        .map(|site| pca_samples.get(site)?.flatten_all()?.to_vec1::<f64>())
-        .collect::<Result<_, _>>()?;
+    let draws = positions_from_samples(&pca_samples, log_site_rates)?;
+    let mean_site_rate = match arrays.get("mean_site_rate") {
+        Some(rates) => rates.to_vec1::<f64>()?,
+        None => vec![1.0; num_sites],
+    };
     let mean_pi_rows = batch::rows_from_tensor(&mean_pi)?;
     write_draw_log_likelihoods(
         &format!("{}.draw_ll.npz", out_prefix),
@@ -1401,8 +1540,27 @@ fn evaluate_samples(
         num_leaves,
         &draws,
         &mean_pi_rows,
+        &mean_site_rate,
     )?;
-    Ok(calc_rate_matrix(Mu, &mean_pi.log()?, &tensor_full(rate_scaling, &[])))
+    let (S, sqrt_pi) = calc_rate_matrix(Mu, &mean_pi.log()?, &tensor_full(rate_scaling, &[]));
+    Ok((scale_sites(&S, &mean_site_rate)?, sqrt_pi))
+}
+
+/// Positions [num_sites][num_samples * dim] from pca_samples [num_sites, num_samples, 19] and, if given, the log
+/// site rates [num_sites, num_samples] as the last coordinate of every position
+fn positions_from_samples(pca_samples: &Tensor, log_site_rates: Option<&Tensor>) -> Result<Vec<Vec<f64>>, candle_core::Error> {
+    let samples = match log_site_rates {
+        Some(log_rates) => Tensor::cat(&[pca_samples, &log_rates.unsqueeze(2)?], 2)?,
+        None => pca_samples.clone(),
+    };
+    (0..samples.dim(0)?)
+        .map(|site| samples.get(site)?.flatten_all()?.to_vec1::<f64>())
+        .collect()
+}
+
+/// S [num_sites, 20, 20] with every site's matrix multiplied by its rate
+fn scale_sites(S: &Tensor, site_rates: &[f64]) -> Result<Tensor, candle_core::Error> {
+    S.broadcast_mul(&Tensor::from_slice(site_rates, &[site_rates.len(), 1, 1], &candle_core::Device::Cpu)?)
 }
 
 /// Mu, the global rate normalization and the branch lengths the final sampling is conditioned on
@@ -1415,17 +1573,21 @@ struct FittedModel {
     init_pca_tensor: Tensor,
     em_log_likelihood: Vec<f64>,
     em_tree_length: Vec<f64>,
+    /// Prior of the site rates, with the sd fitted by EM if MUTSEL_SITE_RATE_FIT is set
+    site_rate_prior: Option<SiteRatePrior>,
 }
 
 impl FittedModel {
     /// Reads Mu, rate_scaling and branch_lengths of an earlier run (its .hmc.npz file), so its posterior can be
     /// sampled again under a different prior. The chains start at the last sample of every site.
     /// With tree_branch_lengths the branch lengths are these instead, e.g. those of a tree with fewer taxa.
+    /// The site rate prior is the one of the earlier run if it sampled site rates, otherwise site_rate_prior.
     fn read(
         path: &Path,
         num_nodes: usize,
         num_sites: usize,
         tree_branch_lengths: Option<&[f64]>,
+        site_rate_prior: Option<SiteRatePrior>,
     ) -> Result<FittedModel, candle_core::Error> {
         let arrays: std::collections::HashMap<String, Tensor> = Tensor::read_npz(path)?.into_iter().collect();
         let get = |name: &str| {
@@ -1461,8 +1623,35 @@ impl FittedModel {
             init_pca_tensor: get("init_pca_coordinates")?,
             em_log_likelihood: vec![],
             em_tree_length: vec![],
+            site_rate_prior: match arrays.get("site_rate_sd") {
+                Some(sd) => Some(SiteRatePrior { sd: sd.to_scalar::<f64>()? }),
+                None => site_rate_prior,
+            },
         })
     }
+}
+
+/// Prints the mean and the quantiles of site rates (draws over all sites)
+fn print_site_rate_summary(label: &str, rates: impl Iterator<Item = f64>) {
+    let mut rates: Vec<f64> = rates.collect();
+    rates.sort_by(|a, b| a.total_cmp(b));
+    let quantile = |q: f64| rates[((rates.len() - 1) as f64 * q).round() as usize];
+    let log_sd = {
+        let logs: Vec<f64> = rates.iter().map(|r| r.ln()).collect();
+        let mean = logs.iter().sum::<f64>() / logs.len() as f64;
+        (logs.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / logs.len() as f64).sqrt()
+    };
+    println!(
+        "MUTSEL HMC {}: site rates mean {:.3}, quantiles 5/25/50/75/95% {:.3} {:.3} {:.3} {:.3} {:.3}, sd of log rates {:.3}",
+        label,
+        rates.iter().sum::<f64>() / rates.len() as f64,
+        quantile(0.05),
+        quantile(0.25),
+        quantile(0.5),
+        quantile(0.75),
+        quantile(0.95),
+        log_sd
+    );
 }
 
 /// Mu and the branch lengths from the MAP estimate refined with Monte Carlo EM, see sample_internal
@@ -1480,7 +1669,17 @@ fn fit_with_em(
     em: &EmSettings,
     pca: &Arc<PCA>,
     mixture_prior: &Option<Arc<MixturePrior>>,
+    site_rate_prior: Option<SiteRatePrior>,
+    fit_site_rate_sd: bool,
 ) -> Result<FittedModel, candle_core::Error> {
+    let mut site_rate_prior = site_rate_prior;
+    let shared_model = |Mu: &Tensor, rate_scaling: f64, site_rate_prior: Option<SiteRatePrior>| {
+        Arc::new(
+            SharedModel::new(Mu, rate_scaling, pca, mutsel_params.pi_reg)
+                .with_mixture_prior(mixture_prior.clone())
+                .with_site_rate_prior(site_rate_prior),
+        )
+    };
     let felsenstein = crate::create_felsenstein_tree(parents, branch_lengths, alignment, num_sites, num_leaves);
     let op = FelsensteinOp::new(Arc::new(Mutex::new(felsenstein)));
     // The Mu penalty stays relative to the prior Mu
@@ -1555,7 +1754,7 @@ fn fit_with_em(
         );
     }
 
-    let init_pca_tensor = if std::env::var("MUTSEL_INIT_MU").is_ok() {
+    let (init_pca_tensor, mut positions) = if std::env::var("MUTSEL_INIT_MU").is_ok() {
         // The light PMSF frequencies are much flatter than the site posteriors and so have a higher average
         // substitution rate, and so do the site modes. The normalization is therefore taken from posterior draws
         // of a subset of the sites (MUTSEL_INIT_PILOT_SITES, evenly spaced), iterated twice because the draws
@@ -1563,7 +1762,11 @@ fn fit_with_em(
         let pilot_start = std::time::Instant::now();
         let init_Mu = Mu(log_R.as_tensor()).detach();
         let tree = Arc::new(FelsensteinTree::<20>::new(parents, &log_branch_lengths.exp()?.to_vec1::<f64>()?));
-        let init_positions = init_pca_tensor.to_vec2::<f64>()?;
+        let init_positions: Vec<Vec<f64>> = init_pca_tensor
+            .to_vec2::<f64>()?
+            .into_iter()
+            .map(|x| with_initial_log_rate(x, site_rate_prior))
+            .collect();
         let num_pilot: usize = env_or("MUTSEL_INIT_PILOT_SITES", 2000).clamp(1, num_sites);
         let pilot_sites: Vec<usize> = (0..num_pilot).map(|i| i * num_sites / num_pilot).collect();
         let pilot_alignment: Vec<u8> = pilot_sites
@@ -1572,9 +1775,7 @@ fn fit_with_em(
             .collect();
         let mut pilot_positions: Vec<Vec<f64>> = pilot_sites.iter().map(|&site| init_positions[site].clone()).collect();
         for pass in 0..2 {
-            let shared = Arc::new(
-                SharedModel::new(&init_Mu, rate_scaling, pca, mutsel_params.pi_reg).with_mixture_prior(mixture_prior.clone()),
-            );
+            let shared = shared_model(&init_Mu, rate_scaling, site_rate_prior);
             let pilot_settings = em.hmc_settings(&settings, pass);
             let site_samples = sample_sites(
                 &shared,
@@ -1586,10 +1787,9 @@ fn fit_with_em(
                 Verbosity::Quiet,
                 "pilot sampling",
             );
-            let last = (em.num_samples - 1) * NUM_COMPONENTS;
             pilot_positions = site_samples
                 .iter()
-                .map(|s| s.thinned_draws[last..last + NUM_COMPONENTS].to_vec())
+                .map(|s| s.thinned_draws[(em.num_samples - 1) * s.dim..].to_vec())
                 .collect();
             rate_scaling = 1.0 / mean_substitution_rate(&init_Mu, &thinned_log_pi(&site_samples, em.num_samples, pca)?)?;
             if verbosity.should_print(Verbosity::Min) {
@@ -1601,9 +1801,7 @@ fn fit_with_em(
                 );
             }
         }
-        let shared = Arc::new(
-            SharedModel::new(&init_Mu, rate_scaling, pca, mutsel_params.pi_reg).with_mixture_prior(mixture_prior.clone()),
-        );
+        let shared = shared_model(&init_Mu, rate_scaling, site_rate_prior);
         let modes = site_modes(&shared, &tree, alignment, num_leaves, &init_positions);
         if verbosity.should_print(Verbosity::Min) {
             println!(
@@ -1611,19 +1809,24 @@ fn fit_with_em(
                 pilot_start.elapsed().as_secs_f64()
             );
         }
-        Tensor::from_vec(modes.concat(), &[num_sites, NUM_COMPONENTS], &candle_core::Device::Cpu)?
+        let mode_coordinates: Vec<f64> = modes.iter().flat_map(|m| m[..NUM_COMPONENTS].iter().copied()).collect();
+        (Tensor::from_vec(mode_coordinates, &[num_sites, NUM_COMPONENTS], &candle_core::Device::Cpu)?, modes)
     } else {
-        init_pca_tensor
+        let positions = init_pca_tensor
+            .to_vec2::<f64>()?
+            .into_iter()
+            .map(|x| with_initial_log_rate(x, site_rate_prior))
+            .collect();
+        (init_pca_tensor, positions)
     };
 
-    let mut positions = init_pca_tensor.to_vec2::<f64>()?;
     let mut chains: Vec<SiteChain> = Vec::new();
     let mut em_log_likelihood = Vec::with_capacity(em.iterations);
     let mut em_tree_length = Vec::with_capacity(em.iterations);
     for iteration in 0..em.iterations {
         let label = format!("EM iteration {}", iteration + 1);
         let old_Mu = Mu(log_R.as_tensor()).detach();
-        let shared = Arc::new(SharedModel::new(&old_Mu, rate_scaling, pca, mutsel_params.pi_reg).with_mixture_prior(mixture_prior.clone()));
+        let shared = shared_model(&old_Mu, rate_scaling, site_rate_prior);
         let tree = Arc::new(FelsensteinTree::<20>::new(
             parents,
             &log_branch_lengths.exp()?.to_vec1::<f64>()?,
@@ -1643,14 +1846,30 @@ fn fit_with_em(
         );
 
         // The last draw, which is the last thinned draw, for the final sampling
-        let last = (em.num_samples - 1) * NUM_COMPONENTS;
         positions = site_samples
             .iter()
-            .map(|s| s.thinned_draws[last..last + NUM_COMPONENTS].to_vec())
+            .map(|s| s.thinned_draws[(em.num_samples - 1) * s.dim..].to_vec())
             .collect();
 
         let log_pi_samples = thinned_log_pi(&site_samples, em.num_samples, pca)?;
+        let site_rate_samples = thinned_site_rates(&site_samples, em.num_samples);
         drop(site_samples);
+        if let Some(rates) = &site_rate_samples {
+            if verbosity.should_print(Verbosity::Min) {
+                print_site_rate_summary(&label, rates.iter().flatten().copied());
+            }
+            if fit_site_rate_sd {
+                let fitted = SiteRatePrior::fit(rates.iter().flatten().map(|r| r.ln()));
+                if verbosity.should_print(Verbosity::Min) {
+                    println!(
+                        "MUTSEL HMC M-step: sd of the log site rates {:.4} (was {:.4})",
+                        fitted.sd,
+                        site_rate_prior.map_or(0.0, |p| p.sd)
+                    );
+                }
+                site_rate_prior = Some(fitted);
+            }
+        }
         // The last thinned draws are the furthest from the chain starts
         let (mstep_samples, mstep_iterations) = em.mstep_schedule(iteration);
         let log_likelihood = m_step(
@@ -1659,6 +1878,7 @@ fn fit_with_em(
             &init_log_R,
             &log_branch_lengths,
             &log_pi_samples[em.num_samples - mstep_samples..],
+            site_rate_samples.as_deref().map(|rates| &rates[em.num_samples - mstep_samples..]),
             rate_scaling,
             mutsel_params,
             mstep_iterations,
@@ -1711,6 +1931,7 @@ fn fit_with_em(
         init_pca_tensor,
         em_log_likelihood,
         em_tree_length,
+        site_rate_prior,
     })
 }
 
@@ -1740,14 +1961,28 @@ pub fn sample_internal(
 ) -> Result<(Tensor, Tensor), candle_core::Error> {
     let settings = HmcSettings::from_env();
     let em = EmSettings::from_env();
+    let site_rate_prior = SiteRatePrior::from_env();
+    let fit_site_rate_sd = env_or("MUTSEL_SITE_RATE_FIT", 0u8) != 0;
+    assert!(
+        !fit_site_rate_sd || site_rate_prior.is_some(),
+        "MUTSEL_SITE_RATE_FIT needs a starting sd > 0 in MUTSEL_SITE_RATE_SD"
+    );
     println!(
-        "MUTSEL HMC: sampling pca coordinates per site with NUTS ({} tuning, at least {} draws, until ESS >= {} or {} draws, {} thinned samples per site, seed {}), site rates 1",
+        "MUTSEL HMC: sampling pca coordinates per site with NUTS ({} tuning, at least {} draws, until ESS >= {} or {} draws, {} thinned samples per site, seed {}), {}",
         settings.num_tune,
         settings.num_draws,
         settings.target_ess,
         settings.max_draws,
         settings.num_output_samples,
-        settings.seed
+        settings.seed,
+        match site_rate_prior {
+            Some(prior) => format!(
+                "with a log-normal site rate multiplying the MutSel rate (log rate ~ N(-sd^2/2, sd^2), mean rate 1, sd {}{})",
+                prior.sd,
+                if fit_site_rate_sd { " at the start, fitted in every M-step" } else { "" }
+            ),
+            None => "site rates 1".to_string(),
+        }
     );
     println!(
         "MUTSEL HMC: Mu and branch lengths from the MAP estimate ({}-{} iterations, relative improvement {:.0e}) refined by Monte Carlo EM until the tree length changes by less than {:.1}% over {} iterations, at most {} iterations ({} samples per site, {} tuning draws in the first iteration, then the chains continue with {} burn-in draws, at most {} M-step iterations, fewer samples and M-step iterations in the first {})",
@@ -1775,7 +2010,13 @@ pub fn sample_internal(
         Ok(path) => {
             // MUTSEL_FIXED_BRANCH_LENGTHS=tree keeps the branch lengths of the input tree
             let tree_lengths = std::env::var("MUTSEL_FIXED_BRANCH_LENGTHS").map_or(false, |v| v.trim() == "tree");
-            FittedModel::read(Path::new(path.trim()), parents.len(), num_sites, tree_lengths.then_some(branch_lengths))?
+            FittedModel::read(
+                Path::new(path.trim()),
+                parents.len(),
+                num_sites,
+                tree_lengths.then_some(branch_lengths),
+                site_rate_prior,
+            )?
         }
         Err(_) => fit_with_em(
             parents,
@@ -1791,6 +2032,8 @@ pub fn sample_internal(
             &em,
             &pca,
             &mixture_prior,
+            site_rate_prior,
+            fit_site_rate_sd,
         )?,
     };
     let FittedModel {
@@ -1801,19 +2044,35 @@ pub fn sample_internal(
         init_pca_tensor,
         em_log_likelihood,
         em_tree_length,
+        site_rate_prior,
     } = fitted;
-    let shared = Arc::new(SharedModel::new(&Mu, rate_scaling, &pca, mutsel_params.pi_reg).with_mixture_prior(mixture_prior));
+    let shared = Arc::new(
+        SharedModel::new(&Mu, rate_scaling, &pca, mutsel_params.pi_reg)
+            .with_mixture_prior(mixture_prior)
+            .with_site_rate_prior(site_rate_prior),
+    );
     let tree = Arc::new(FelsensteinTree::<20>::new(parents, &branch_lengths.to_vec1::<f64>()?));
     if let Ok(path) = std::env::var("MUTSEL_EVAL_SAMPLES") {
         return evaluate_samples(Path::new(path.trim()), &shared, &tree, alignment, num_sites, num_leaves, &Mu, rate_scaling, out_prefix);
     }
+    // Positions read from an earlier run (MUTSEL_FIXED_MODEL) have no log site rate
+    let positions: Vec<Vec<f64>> = positions.into_iter().map(|p| with_initial_log_rate(p, site_rate_prior)).collect();
     let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &settings, verbosity, "final");
+    let dim = shared.dim();
+    if site_rate_prior.is_some() && verbosity.should_print(Verbosity::Min) {
+        print_site_rate_summary(
+            "final",
+            site_samples
+                .iter()
+                .flat_map(|s| s.thinned_draws.chunks_exact(dim).map(|draw| draw[NUM_COMPONENTS].exp())),
+        );
+    }
     let rate_scaling = tensor_full(rate_scaling, &[]);
 
     // Tensor::write_npz does not support zip entries or files of 4 GiB or more, so pca_samples and
     // pi_samples together are kept below that by writing an evenly spaced subset of the thinned draws.
     const MAX_SAMPLE_BYTES: usize = (1 << 32) - (1 << 26);
-    let bytes_per_sample = num_sites * (NUM_COMPONENTS + 20) * std::mem::size_of::<f64>();
+    let bytes_per_sample = num_sites * (dim + 20) * std::mem::size_of::<f64>();
     let num_output_samples = settings
         .num_output_samples
         .min(MAX_SAMPLE_BYTES / bytes_per_sample.max(1))
@@ -1825,12 +2084,13 @@ pub fn sample_internal(
         );
     }
     // pca_samples [num_sites, num_output_samples, 19]
+    let output_draw = |i: usize| i * settings.num_output_samples / num_output_samples;
     let pca_samples: Vec<f64> = site_samples
         .iter()
         .flat_map(|s| {
             (0..num_output_samples).flat_map(move |i| {
-                let draw = i * settings.num_output_samples / num_output_samples;
-                s.thinned_draws[draw * NUM_COMPONENTS..(draw + 1) * NUM_COMPONENTS].iter().copied()
+                let draw = output_draw(i);
+                s.thinned_draws[draw * dim..draw * dim + NUM_COMPONENTS].iter().copied()
             })
         })
         .collect();
@@ -1840,11 +2100,26 @@ pub fn sample_internal(
         &candle_core::Device::Cpu,
     )?;
 
-    // Posterior mean of the site frequencies over all draws
+    // log_site_rates [num_sites, num_output_samples], if site rates are sampled
+    let log_site_rates = match site_rate_prior {
+        Some(_) => Some(Tensor::from_vec(
+            site_samples
+                .iter()
+                .flat_map(|s| (0..num_output_samples).map(move |i| s.thinned_draws[output_draw(i) * dim + NUM_COMPONENTS]))
+                .collect::<Vec<f64>>(),
+            &[num_sites, num_output_samples],
+            &candle_core::Device::Cpu,
+        )?),
+        None => None,
+    };
+
+    // Posterior mean of the site frequencies and the site rates over all draws
     let mean_pi: Vec<f64> = site_samples.iter().flat_map(|s| s.mean_pi.iter().copied()).collect();
     let mean_pi = Tensor::from_vec(mean_pi, &[num_sites, 20], &candle_core::Device::Cpu)?;
+    let mean_site_rate: Vec<f64> = site_samples.iter().map(|s| s.mean_site_rate).collect();
 
     let (S, sqrt_pi) = calc_rate_matrix(&Mu, &mean_pi.log()?, &rate_scaling);
+    let S = scale_sites(&S, &mean_site_rate)?;
 
     let average_rate_mean_pi = model::substitution_rates_tensor(&S, &sqrt_pi)
         .mean_all()?
@@ -1857,6 +2132,14 @@ pub fn sample_internal(
     }
 
     let npz_path = format!("{}.hmc.npz", out_prefix);
+    let mean_site_rate_tensor = Tensor::from_slice(&mean_site_rate, &[num_sites], &candle_core::Device::Cpu)?;
+    let site_rate_sd = tensor_full(site_rate_prior.map_or(0.0, |p| p.sd), &[]);
+    let mut site_rate_arrays = vec![];
+    if let Some(log_site_rates) = &log_site_rates {
+        site_rate_arrays.push(("log_site_rates", log_site_rates));
+        site_rate_arrays.push(("mean_site_rate", &mean_site_rate_tensor));
+        site_rate_arrays.push(("site_rate_sd", &site_rate_sd));
+    }
     Tensor::write_npz(
         &[
             ("pca_samples", &pca_samples),
@@ -1902,16 +2185,17 @@ pub fn sample_internal(
                 &Tensor::from_iter(site_samples.iter().map(|s| s.log_marginal), &candle_core::Device::Cpu)?,
             ),
             ("parents", &Tensor::from_iter(parents.iter().map(|&p| p as f64), &candle_core::Device::Cpu)?),
-        ],
+        ]
+        .into_iter()
+        .chain(site_rate_arrays)
+        .collect::<Vec<_>>(),
         Path::new(&npz_path),
     )?;
     println!("MUTSEL HMC: samples written to {}", npz_path);
 
     // MUTSEL_HMC_DRAW_LL=1: log likelihood of every written draw and of the posterior mean frequencies
     if env_or("MUTSEL_HMC_DRAW_LL", 0u8) != 0 {
-        let draws: Vec<Vec<f64>> = (0..num_sites)
-            .map(|site| pca_samples.get(site)?.flatten_all()?.to_vec1::<f64>())
-            .collect::<Result<_, _>>()?;
+        let draws = positions_from_samples(&pca_samples, log_site_rates.as_ref())?;
         let mean_pi_rows = batch::rows_from_tensor(&mean_pi)?;
         write_draw_log_likelihoods(
             &format!("{}.draw_ll.npz", out_prefix),
@@ -1921,6 +2205,7 @@ pub fn sample_internal(
             num_leaves,
             &draws,
             &mean_pi_rows,
+            &mean_site_rate,
         )?;
     }
 
@@ -1928,18 +2213,27 @@ pub fn sample_internal(
         return Ok((S, sqrt_pi));
     }
     println!("MUTSEL HMC: {} posterior draws per site for the tree search", num_tree_draws);
+    let tree_draw = |k: usize| k * settings.num_output_samples / num_tree_draws;
     let draws: Vec<f64> = site_samples
         .iter()
         .flat_map(|s| {
             (0..num_tree_draws).flat_map(move |k| {
-                let draw = k * settings.num_output_samples / num_tree_draws;
-                s.thinned_draws[draw * NUM_COMPONENTS..(draw + 1) * NUM_COMPONENTS].iter().copied()
+                let draw = tree_draw(k);
+                s.thinned_draws[draw * dim..draw * dim + NUM_COMPONENTS].iter().copied()
             })
+        })
+        .collect();
+    let draw_site_rates: Vec<f64> = site_samples
+        .iter()
+        .flat_map(|s| {
+            let shared = &shared;
+            (0..num_tree_draws).map(move |k| shared.site_rate(&s.thinned_draws[tree_draw(k) * dim..(tree_draw(k) + 1) * dim]))
         })
         .collect();
     let draws = Tensor::from_vec(draws, &[num_sites * num_tree_draws, NUM_COMPONENTS], &candle_core::Device::Cpu)?;
     // calc_rate_matrix only needs log_pi up to a constant per site
-    Ok(calc_rate_matrix(&Mu, &pca.pca_coordinates_to_log_freq(&draws), &rate_scaling))
+    let (S, sqrt_pi) = calc_rate_matrix(&Mu, &pca.pca_coordinates_to_log_freq(&draws), &rate_scaling);
+    Ok((scale_sites(&S, &draw_site_rates)?, sqrt_pi))
 }
 
 #[cfg(test)]
@@ -2051,6 +2345,99 @@ mod tests {
                 grad[i]
             );
         }
+    }
+
+    fn test_logp_with_site_rates(rate_scaling: f64, sd: f64) -> SiteLogp {
+        let mut logp = test_logp();
+        logp.shared = Arc::new(
+            SharedModel::new(&test_Mu(), rate_scaling, &PCA::new(NUM_COMPONENTS), PI_REG)
+                .with_site_rate_prior(Some(SiteRatePrior { sd })),
+        );
+        logp
+    }
+
+    #[test]
+    fn site_rate_gradient_matches_finite_differences() {
+        let mut logp = test_logp_with_site_rates(RATE_SCALING, 0.5);
+        let mut x = test_point();
+        x.push(0.3);
+        let mut grad = vec![0.0; NUM_COMPONENTS + 1];
+        logp.logp(&x, &mut grad).unwrap();
+        let eps = 1e-6;
+        let mut dummy = vec![0.0; NUM_COMPONENTS + 1];
+        for i in 0..=NUM_COMPONENTS {
+            let mut xp = x.clone();
+            xp[i] += eps;
+            let mut xm = x.clone();
+            xm[i] -= eps;
+            let fd = (logp.logp(&xp, &mut dummy).unwrap() - logp.logp(&xm, &mut dummy).unwrap()) / (2.0 * eps);
+            assert!((fd - grad[i]).abs() < 1e-5 * (1.0 + fd.abs()), "component {}: finite difference {} vs gradient {}", i, fd, grad[i]);
+        }
+    }
+
+    #[test]
+    fn site_rate_multiplies_the_rate_scaling() {
+        // Without the prior of the log rate, a site rate r is the rate scaling times r
+        let log_rate = -0.4;
+        let prior = SiteRatePrior { sd: 0.7 };
+        let mut with_rate = test_logp_with_site_rates(RATE_SCALING, prior.sd);
+        let mut position = test_point();
+        position.push(log_rate);
+        let mut grad = vec![0.0; NUM_COMPONENTS + 1];
+        let value = with_rate.logp(&position, &mut grad).unwrap() - prior.evaluate(log_rate).0;
+
+        let mut scaled = test_logp();
+        scaled.shared = Arc::new(SharedModel::new(&test_Mu(), RATE_SCALING * f64::exp(log_rate), &PCA::new(NUM_COMPONENTS), PI_REG));
+        let mut scaled_grad = vec![0.0; NUM_COMPONENTS];
+        let reference = scaled.logp(&test_point(), &mut scaled_grad).unwrap();
+        assert!((value - reference).abs() < 1e-12 * reference.abs(), "{} vs {}", value, reference);
+        for i in 0..NUM_COMPONENTS {
+            assert!((grad[i] - scaled_grad[i]).abs() < 1e-10 * (1.0 + scaled_grad[i].abs()), "component {}", i);
+        }
+    }
+
+    #[test]
+    fn site_rate_sd_fit_recovers_the_prior() {
+        // The mean square of log rates from N(-sd^2/2, sd^2) is sd^2 + sd^4/4, which the fit maps back to sd
+        for sd in [0.1, 0.5, 1.0, 2.0] {
+            let mean = -0.5 * sd * sd;
+            let fitted = SiteRatePrior::fit([mean - sd, mean + sd].into_iter());
+            assert!((fitted.sd - sd).abs() < 1e-12, "{} vs {}", fitted.sd, sd);
+            // and it maximizes the mean log density of the draws
+            let objective = |s: f64| [mean - sd, mean + sd].iter().map(|&l| SiteRatePrior { sd: s }.evaluate(l).0).sum::<f64>();
+            assert!(objective(sd) > objective(sd * 1.01) && objective(sd) > objective(sd * 0.99));
+        }
+    }
+
+    #[test]
+    fn site_rates_of_an_uninformative_column_follow_the_prior() {
+        // An all-gap column has likelihood 1, so the sampled log rates are draws from the prior
+        let sd = 0.6;
+        let shared = Arc::new(
+            SharedModel::new(&test_Mu(), RATE_SCALING, &PCA::new(NUM_COMPONENTS), PI_REG)
+                .with_site_rate_prior(Some(SiteRatePrior { sd })),
+        );
+        let tree = Arc::new(test_tree());
+        let alignment = [20u8; 5];
+        let settings = HmcSettings {
+            num_tune: 400,
+            num_draws: 2000,
+            target_ess: 1000,
+            max_draws: 50000,
+            num_output_samples: 1000,
+            seed: 3,
+            marginal: false,
+        };
+        let init = vec![with_initial_log_rate(test_point(), Some(SiteRatePrior { sd }))];
+        let samples = sample_sites(&shared, &tree, &alignment, 5, &init, &settings, Verbosity::Quiet, "prior");
+        let log_rates: Vec<f64> = samples[0].thinned_draws.chunks_exact(NUM_COMPONENTS + 1).map(|d| d[NUM_COMPONENTS]).collect();
+        let n = log_rates.len() as f64;
+        let mean = log_rates.iter().sum::<f64>() / n;
+        let std = (log_rates.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / n).sqrt();
+        // About 1000 effective samples: standard errors 0.019 of the mean and 0.013 of the standard deviation
+        assert!((mean + 0.5 * sd * sd).abs() < 0.08, "mean log rate {} instead of {}", mean, -0.5 * sd * sd);
+        assert!((std - sd).abs() < 0.06, "sd of the log rates {} instead of {}", std, sd);
+        assert!((samples[0].mean_site_rate - 1.0).abs() < 0.1, "mean rate {}", samples[0].mean_site_rate);
     }
 
     #[test]

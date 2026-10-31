@@ -127,6 +127,7 @@ impl ModelParameters {
             &log_pi,
             &branch_lengths.to_vec1::<f64>()?,
             batch::RateScaling::MeanRate,
+            None,
         );
         let grad_coordinates: Vec<f64> = result
             .grad_log_pi

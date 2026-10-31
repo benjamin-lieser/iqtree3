@@ -62,15 +62,22 @@ fn site_model(Mu: &SMatrix<f64, 20, 20>, log_mutation_equilibrium: &SVector<f64,
 }
 
 /// Summed log likelihood of all sites bound to the tree and its gradients. log_pi [num_sites] are the log
-/// frequencies up to a constant per site, branch_lengths in the node order of the tree's parents.
+/// frequencies up to a constant per site, branch_lengths in the node order of the tree's parents. site_rates
+/// [num_sites] multiply the rate matrices of the sites on top of the scaling (only with RateScaling::Fixed).
 pub fn log_likelihood_and_gradients(
     tree: &Mutex<FelsensteinTree<20>>,
     Mu: &SMatrix<f64, 20, 20>,
     log_pi: &[SVector<f64, 20>],
     branch_lengths: &[f64],
     scaling: RateScaling,
+    site_rates: Option<&[f64]>,
 ) -> BatchGradients {
     let num_sites = log_pi.len();
+    if let Some(rates) = site_rates {
+        assert_eq!(rates.len(), num_sites);
+        assert!(matches!(scaling, RateScaling::Fixed(_)), "site rates need a fixed rate scaling");
+    }
+    let site_rate = |site: usize| site_rates.map_or(1.0, |rates| rates[site]);
     let log_mutation_equilibrium = Mu.diagonal().map(f64::ln);
     let models: Vec<SiteModel> = log_pi
         .par_iter()
@@ -80,7 +87,11 @@ pub fn log_likelihood_and_gradients(
         RateScaling::Fixed(scale) => scale,
         RateScaling::MeanRate => num_sites as f64 / models.par_iter().map(|m| m.rate).sum::<f64>(),
     };
-    let S: Vec<SMatrix<f64, 20, 20>> = models.par_iter().map(|m| m.S * scale).collect();
+    let S: Vec<SMatrix<f64, 20, 20>> = models
+        .par_iter()
+        .enumerate()
+        .map(|(site, m)| m.S * (scale * site_rate(site)))
+        .collect();
     let sqrt_pi: Vec<SVector<f64, 20>> = models.iter().map(|m| m.sqrt_pi).collect();
 
     let result = {
@@ -116,7 +127,9 @@ pub fn log_likelihood_and_gradients(
         .par_iter()
         .zip(result.grad_s.par_iter())
         .zip(result.grad_sqrt_pi.par_iter())
-        .map(|((m, grad_S), grad_sqrt_pi)| {
+        .enumerate()
+        .map(|(site, ((m, grad_S), grad_sqrt_pi))| {
+            let site_scale = scale * site_rate(site);
             // Gradient w.r.t. the sqrt_pi given to phylo_grad and through the site's substitution rate
             let mut grad_sqrt_pi = *grad_sqrt_pi;
             let mut grad_log_pi = SVector::<f64, 20>::zeros();
@@ -129,7 +142,7 @@ pub fn log_likelihood_and_gradients(
                     }
                     let mut grad = grad_rate * m.sqrt_pi[i] * m.sqrt_pi[j];
                     if i < j {
-                        grad += scale * grad_S[(i, j)];
+                        grad += site_scale * grad_S[(i, j)];
                     }
                     grad_sqrt_pi[i] += grad_rate * m.S[(i, j)] * m.sqrt_pi[j];
                     grad_sqrt_pi[j] += grad_rate * m.S[(i, j)] * m.sqrt_pi[i];
@@ -289,6 +302,7 @@ mod tests {
             &rows_from_tensor(log_pi.as_tensor()).unwrap(),
             &branch_lengths.to_vec1::<f64>().unwrap(),
             RateScaling::Fixed(1.3),
+            None,
         );
         let grad_log_pi: Vec<f64> = result.grad_log_pi.iter().flat_map(|g| g.iter().copied()).collect();
         assert_close(
@@ -311,6 +325,39 @@ mod tests {
                 parallel_grads.get(v.as_tensor()).unwrap(),
                 reference_grads.get(v.as_tensor()).unwrap(),
                 name,
+            );
+        }
+    }
+
+    #[test]
+    fn site_rates_scale_the_rate_matrices() {
+        let op = test_op().into_with_edge_op();
+        let Mu = smatrix_from_tensor(&Mu(&log_R())).unwrap();
+        let log_pi = rows_from_tensor(&PCA::new(19).pca_coordinates_to_log_freq(pca_coordinates().as_tensor())).unwrap();
+        let branch_lengths = log_branch_lengths().exp().unwrap().to_vec1::<f64>().unwrap();
+        let run = |scale: f64, rates: Option<&[f64]>| {
+            log_likelihood_and_gradients(op.tree(), &Mu, &log_pi, &branch_lengths, RateScaling::Fixed(scale), rates)
+        };
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-10 * (1.0 + b.abs());
+
+        // The same rate at every site is the same as a larger rate scaling
+        let equal = run(1.3, Some(&[0.7; NUM_SITES]));
+        let scaled = run(1.3 * 0.7, None);
+        assert!(close(equal.log_likelihood, scaled.log_likelihood));
+        assert!((equal.grad_Mu - scaled.grad_Mu).abs().max() <= 1e-10 * (1.0 + scaled.grad_Mu.abs().max()));
+        for (a, b) in equal.grad_branch_lengths.iter().zip(&scaled.grad_branch_lengths) {
+            assert!(close(*a, *b), "{} vs {}", a, b);
+        }
+
+        // Different rates: the gradient of every site is the one with that site's rate as the scaling
+        let rates: Vec<f64> = (0..NUM_SITES).map(|site| 0.5 + 0.3 * site as f64).collect();
+        let with_rates = run(1.3, Some(&rates));
+        for site in 0..NUM_SITES {
+            let alone = run(1.3 * rates[site], None);
+            assert!(
+                (with_rates.grad_log_pi[site] - alone.grad_log_pi[site]).abs().max() <= 1e-10 * (1.0 + alone.grad_log_pi[site].abs().max()),
+                "site {}",
+                site
             );
         }
     }
