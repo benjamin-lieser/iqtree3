@@ -23,7 +23,7 @@ use nuts_rs::{
 };
 use phylo_grad::{
     Workspace,
-    nalgebra::{SMatrix, SVector},
+    nalgebra::{DMatrix, DVector, SMatrix, SVector},
 };
 use rayon::prelude::*;
 
@@ -32,7 +32,7 @@ use crate::{
     helmert::{self, NUM_COORDINATES},
     lbfgs::maximize_finite,
     model,
-    npz::{Array, write_npz},
+    npz::{Array, Npz, write_npz},
     optimization::{self, Convergence, MapEstimate, Mu, map_estimate},
     prior::{Prior, SiteRatePrior},
 };
@@ -324,10 +324,11 @@ struct SiteSamples {
     step_size: f64,
     mean_num_steps: f64,
     /// Mean and covariance of the draws in the first half of the chain, if settings.marginal
-    proposal: Option<(SVector<f64, NUM_COORDINATES>, SMatrix<f64, NUM_COORDINATES, NUM_COORDINATES>)>,
+    proposal: Option<(DVector<f64>, DMatrix<f64>)>,
     /// Thinned draws from the second half of the chain, which are independent of the proposal
-    bridge_draws: Vec<SVector<f64, NUM_COORDINATES>>,
-    /// Log marginal likelihood (log likelihood and log prior integrated over the Helmert coordinates), NaN if not estimated
+    bridge_draws: Vec<DVector<f64>>,
+    /// Log marginal likelihood (log likelihood and log prior integrated over the Helmert coordinates and the log
+    /// site rate), NaN if not estimated
     log_marginal: f64,
 }
 
@@ -409,7 +410,6 @@ fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index:
 fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site_index: usize) -> SiteSamples {
     let shared = Arc::clone(&chain.math().logp_func().shared);
     let dim = shared.dim();
-    assert!(!settings.marginal || dim == NUM_COORDINATES, "marginal likelihoods are not supported with site rates");
     let mut num_burn_in = 0;
     let mut draws = Vec::with_capacity(settings.num_draws as usize * dim);
     let mut num_divergences = 0;
@@ -461,21 +461,19 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
     let mut proposal = None;
     let mut bridge_draws = vec![];
     if settings.marginal {
-        let first_half: Vec<_> = draws[..(num_draws / 2) * NUM_COORDINATES]
-            .chunks_exact(NUM_COORDINATES)
-            .map(SVector::<f64, NUM_COORDINATES>::from_column_slice)
-            .collect();
-        let mean = first_half.iter().sum::<SVector<f64, NUM_COORDINATES>>() / first_half.len() as f64;
-        let mut cov = SMatrix::<f64, NUM_COORDINATES, NUM_COORDINATES>::zeros();
+        let first_half: Vec<_> = draws[..(num_draws / 2) * dim].chunks_exact(dim).map(DVector::from_column_slice).collect();
+        let mean = first_half.iter().fold(DVector::zeros(dim), |sum, x| sum + x) / first_half.len() as f64;
+        let mut cov = DMatrix::<f64>::zeros(dim, dim);
         for x in &first_half {
-            cov += (x - mean) * (x - mean).transpose();
+            let difference = x - &mean;
+            cov += &difference * difference.transpose();
         }
         cov /= (first_half.len() - 1) as f64;
         proposal = Some((mean, cov));
         for i in 0..settings.num_output_samples {
             let draw = ((i + 1) * num_draws) / settings.num_output_samples - 1;
             if draw >= num_draws / 2 {
-                bridge_draws.push(SVector::from_column_slice(&draws[draw * NUM_COORDINATES..(draw + 1) * NUM_COORDINATES]));
+                bridge_draws.push(DVector::from_column_slice(&draws[draw * dim..(draw + 1) * dim]));
             }
         }
     }
@@ -513,38 +511,39 @@ const NUM_PROPOSAL_DRAWS: usize = 200;
 /// The proposal only has to overlap with this site's own posterior, so this works for any prior.
 fn site_log_marginal(logp: &mut SiteLogp, samples: &SiteSamples, seed: u64) -> f64 {
     let (mean, cov) = samples.proposal.as_ref().unwrap();
+    let dim = mean.len();
     // A small jitter keeps the proposal proper if a coordinate barely moved
-    let jitter = 1e-10 * cov.trace().max(1e-300) / NUM_COORDINATES as f64;
-    let chol = match (cov + SMatrix::<f64, NUM_COORDINATES, NUM_COORDINATES>::identity() * jitter).cholesky() {
+    let jitter = 1e-10 * cov.trace().max(1e-300) / dim as f64;
+    let chol = match (cov + DMatrix::<f64>::identity(dim, dim) * jitter).cholesky() {
         Some(chol) => chol,
         None => return f64::NAN,
     };
     let l = chol.l();
-    let log_norm = -l.diagonal().map(f64::ln).sum() - 0.5 * NUM_COORDINATES as f64 * (2.0 * std::f64::consts::PI).ln();
-    let log_proposal = |x: &SVector<f64, NUM_COORDINATES>| {
+    let log_norm = -l.diagonal().map(f64::ln).sum() - 0.5 * dim as f64 * (2.0 * std::f64::consts::PI).ln();
+    let log_proposal = |x: &DVector<f64>| {
         let z = l.solve_lower_triangular(&(x - mean)).unwrap();
         log_norm - 0.5 * z.norm_squared()
     };
-    let mut gradient = vec![0.0; NUM_COORDINATES];
-    let mut log_posterior = |x: &SVector<f64, NUM_COORDINATES>| {
+    let mut gradient = vec![0.0; dim];
+    let mut log_posterior = |x: &DVector<f64>| {
         logp.logp(x.as_slice(), &mut gradient).unwrap_or(f64::NEG_INFINITY)
     };
 
     // Standard normal draws with Box-Muller
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut uniform = || ((nuts_rs::rand::Rng::next_u64(&mut rng) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
-    let mut normal = SVector::<f64, NUM_COORDINATES>::zeros();
+    let mut normal = DVector::<f64>::zeros(dim);
     let mut log_ratio_proposal = Vec::with_capacity(NUM_PROPOSAL_DRAWS);
     for _ in 0..NUM_PROPOSAL_DRAWS {
-        for k in (0..NUM_COORDINATES).step_by(2) {
+        for k in (0..dim).step_by(2) {
             let r = (-2.0 * uniform().ln()).sqrt();
             let phi = 2.0 * std::f64::consts::PI * uniform();
             normal[k] = r * phi.cos();
-            if k + 1 < NUM_COORDINATES {
+            if k + 1 < dim {
                 normal[k + 1] = r * phi.sin();
             }
         }
-        let x = mean + l * normal;
+        let x = mean + &l * &normal;
         log_ratio_proposal.push(log_posterior(&x) - log_proposal(&x));
     }
     let log_ratio_posterior: Vec<f64> = samples
@@ -1179,6 +1178,38 @@ fn fit_with_em(
     }
 }
 
+/// Mu, the rate normalization and the branch lengths of an earlier run (its hmc.npz output) instead of fitting them,
+/// for MUTSEL_FIXED_SHARED. The tree must be the same (same parents). The chains start at the run's initial
+/// coordinates, and the site rate prior is the one of the current prior (MUTSEL_PRIOR).
+fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -> Result<FittedModel> {
+    let npz = Npz::read(path)?;
+    let run_parents = &npz.get("parents")?.data;
+    if run_parents.len() != parents.len() || run_parents.iter().zip(parents).any(|(&a, &b)| a != b as f64) {
+        return Err(format!("The tree of {} is not the tree of this run", path.display()).into());
+    }
+    let init_coordinates = npz.get("init_coordinates")?.rows::<NUM_COORDINATES>()?;
+    if init_coordinates.len() != num_sites {
+        return Err(format!("{} has {} sites, this alignment {}", path.display(), init_coordinates.len(), num_sites).into());
+    }
+    let fitted = FittedModel {
+        log_S: npz.get("log_exchangeabilities")?.data.clone(),
+        rate_scaling: npz.get("rate_scaling")?.to_scalar()?,
+        branch_lengths: npz.get("branch_lengths")?.data.clone(),
+        positions: init_coordinates.iter().map(|x| with_initial_log_rate(x.as_slice().to_vec(), prior.site_rate)).collect(),
+        init_coordinates,
+        em_log_likelihood: vec![],
+        em_tree_length: vec![],
+        site_rate_prior: prior.site_rate,
+    };
+    println!(
+        "MUTSEL HMC: Mu, rate normalization 1/{:.5} and branch lengths (tree length {:.4}) fixed from {}, no EM",
+        1.0 / fitted.rate_scaling,
+        fitted.branch_lengths.iter().sum::<f64>(),
+        path.display()
+    );
+    Ok(fitted)
+}
+
 /// Samples the Helmert coordinates of every site from its posterior and returns (S, sqrt_pi) of every site, S with
 /// its upper triangle set, evaluated at the posterior mean of the site frequencies, or with num_tree_draws > 1
 /// at that many evenly spaced posterior draws per site ([num_sites * num_tree_draws], ordered by site), which
@@ -1245,7 +1276,10 @@ pub fn sample_internal(
         "MUTSEL_TREE_DRAWS must be between 1 and MUTSEL_HMC_SAMPLES"
     );
 
-    let fitted = fit_with_em(parents, branch_lengths, alignment, num_leaves, verbosity, &settings, &em, &prior, fit_site_rate_sd);
+    let fitted = match std::env::var("MUTSEL_FIXED_SHARED") {
+        Ok(path) => fixed_shared(Path::new(path.trim()), parents, num_sites, &prior)?,
+        Err(_) => fit_with_em(parents, branch_lengths, alignment, num_leaves, verbosity, &settings, &em, &prior, fit_site_rate_sd),
+    };
     let FittedModel {
         log_S,
         rate_scaling,
@@ -1705,9 +1739,19 @@ mod tests {
     /// The bridge estimate of the marginal likelihood of a site against brute force Monte Carlo from a Gaussian prior
     #[test]
     fn site_log_marginal_matches_prior_monte_carlo() {
+        check_site_log_marginal(None);
+    }
+
+    /// The same with a log-normal site rate, which adds a dimension to the posterior and the proposal
+    #[test]
+    fn site_log_marginal_with_site_rates_matches_prior_monte_carlo() {
+        check_site_log_marginal(Some(SiteRatePrior { sd: 0.5 }));
+    }
+
+    fn check_site_log_marginal(site_rate_prior: Option<SiteRatePrior>) {
         let mean = SVector::<f64, NUM_COORDINATES>::from_column_slice(&test_point());
         let std = 0.7;
-        let shared = Arc::new(gaussian_shared(mean, std));
+        let shared = Arc::new(gaussian_shared(mean, std).with_site_rate_prior(site_rate_prior));
         let logp = || {
             let mut logp = test_logp();
             logp.shared = Arc::clone(&shared);
@@ -1722,11 +1766,12 @@ mod tests {
             seed: 3,
             marginal: true,
         };
+        let init = with_initial_log_rate(mean.as_slice().to_vec(), site_rate_prior);
         // A single estimate has a standard deviation of about 0.1, so the bias is checked with the average of several chains
         let num_chains = 8;
         let estimate = (0..num_chains)
             .map(|seed| {
-                let samples = sample_site(logp(), mean.as_slice(), &HmcSettings { seed, ..settings }, 0);
+                let samples = sample_site(logp(), &init, &HmcSettings { seed, ..settings }, 0);
                 site_log_marginal(&mut logp(), &samples, seed)
             })
             .sum::<f64>()
@@ -1737,13 +1782,15 @@ mod tests {
         let mut uniform = || ((nuts_rs::rand::Rng::next_u64(&mut rng) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
         let mut tree_logp = logp();
         let mut log_likelihoods = vec![];
-        let mut gradient = vec![0.0; NUM_COORDINATES];
+        let mut gradient = vec![0.0; init.len()];
         for _ in 0..1 << 17 {
-            let x = SVector::<f64, NUM_COORDINATES>::from_fn(|_, _| {
-                (-2.0 * uniform().ln()).sqrt() * (2.0 * std::f64::consts::PI * uniform()).cos() * std
-            }) + mean;
-            let eval = shared.evaluate(&x);
-            log_likelihoods.push(tree_logp.logp(x.as_slice(), &mut gradient).unwrap() - eval.log_prior);
+            let mut normal = || (-2.0 * uniform().ln()).sqrt() * (2.0 * std::f64::consts::PI * uniform()).cos();
+            let mut position: Vec<f64> = (0..NUM_COORDINATES).map(|i| mean[i] + std * normal()).collect();
+            if let Some(prior) = site_rate_prior {
+                position.push(prior.mean() + prior.sd * normal());
+            }
+            let log_prior = shared.evaluate_position(&position).log_prior;
+            log_likelihoods.push(tree_logp.logp(&position, &mut gradient).unwrap() - log_prior);
         }
         let reference = log_sum_exp(log_likelihoods.iter().copied()) - (log_likelihoods.len() as f64).ln();
         println!("bridge {:.4}, prior Monte Carlo {:.4}", estimate, reference);
