@@ -34,6 +34,7 @@ use crate::{
     model,
     npz::{Array, Npz, write_npz},
     optimization::{self, Convergence, MapEstimate, Mu, map_estimate},
+    hyperprior::{Hyperprior, LearnSettings, LowRankGmm},
     prior::{Prior, SiteRatePrior},
 };
 
@@ -59,7 +60,7 @@ fn alignment_columns(alignment: &[u8], num_leaves: usize) -> Vec<&[u8]> {
     alignment.chunks_exact(num_leaves).collect()
 }
 
-fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+pub(crate) fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     match std::env::var(name) {
         Ok(value) => value
             .trim()
@@ -862,6 +863,16 @@ fn thinned_log_pi(site_samples: &[SiteSamples], num_samples: usize) -> Vec<Vec<S
         .collect()
 }
 
+/// Helmert coordinates of the thinned draws first..num_samples of every site
+fn thinned_coordinates(site_samples: &[SiteSamples], first: usize, num_samples: usize) -> Vec<SVector<f64, NUM_COORDINATES>> {
+    site_samples
+        .iter()
+        .flat_map(|s| {
+            (first..num_samples).map(move |k| SVector::from_column_slice(&s.thinned_draws[k * s.dim..k * s.dim + NUM_COORDINATES]))
+        })
+        .collect()
+}
+
 /// Site rates [num_sites] for each of the thinned draws, None if site rates are not sampled
 fn thinned_site_rates(site_samples: &[SiteSamples], num_samples: usize) -> Option<Vec<Vec<f64>>> {
     if site_samples.first().map_or(true, |s| s.dim == NUM_COORDINATES) {
@@ -992,8 +1003,12 @@ struct FittedModel {
     init_coordinates: Vec<SVector<f64, NUM_COORDINATES>>,
     em_log_likelihood: Vec<f64>,
     em_tree_length: Vec<f64>,
-    /// Prior of the site rates, with the sd fitted by EM if MUTSEL_SITE_RATE_FIT is set
+    /// Prior of the site rates, with the sd fitted by EM if MUTSEL_SITE_RATE_FIT is set or the prior is learned
     site_rate_prior: Option<SiteRatePrior>,
+    /// Prior of the site frequencies (and exchangeabilities): the prior file, or the prior learned by EM
+    prior: Arc<Prior>,
+    /// The learned mixture of factor analyzers, if the prior is learned (MUTSEL_PRIOR_LEARN)
+    learned_gmm: Option<LowRankGmm>,
 }
 
 /// Prints the mean and the quantiles of site rates (draws over all sites)
@@ -1030,13 +1045,19 @@ fn fit_with_em(
     em: &EmSettings,
     prior: &Arc<Prior>,
     fit_site_rate_sd: bool,
+    learn: Option<LearnSettings>,
 ) -> FittedModel {
     let mut site_rate_prior = prior.site_rate;
-    let shared_model = |Mu: &SMatrix<f64, 20, 20>, rate_scaling: f64, site_rate_prior: Option<SiteRatePrior>| {
+    let shared_model = |Mu: &SMatrix<f64, 20, 20>, rate_scaling: f64, prior: &Arc<Prior>, site_rate_prior: Option<SiteRatePrior>| {
         Arc::new(
             SharedModel::new(Mu, rate_scaling, Arc::clone(prior)).with_site_rate_prior(site_rate_prior),
         )
     };
+    // Hierarchical prior: the prior file is the hyperprior, the per-alignment prior starts at its low-rank
+    // approximation after the first E-step (which, like the MAP estimate, uses the prior file)
+    let hyperprior = learn.map(|settings| Hyperprior::new(prior, settings.strength));
+    let mut learned_gmm = learn.map(|settings| LowRankGmm::from_gmm(&prior.site_frequencies, settings.rank));
+    let mut current_prior = Arc::clone(prior);
     let columns = alignment_columns(alignment, num_leaves);
     // The joint MAP estimate of Mu, the site frequencies and the branch lengths
     let map_start = std::time::Instant::now();
@@ -1069,7 +1090,7 @@ fn fit_with_em(
     for iteration in 0..em.iterations {
         let label = format!("EM iteration {}", iteration + 1);
         let old_Mu = Mu(&log_S);
-        let shared = shared_model(&old_Mu, rate_scaling, site_rate_prior);
+        let shared = shared_model(&old_Mu, rate_scaling, &current_prior, site_rate_prior);
         let tree = Arc::new(Tree::new(parents, &branch_lengths));
         let em_settings = em.hmc_settings(&settings, iteration);
         let site_samples = sample_sites_persistent(
@@ -1091,14 +1112,30 @@ fn fit_with_em(
             .map(|s| s.thinned_draws[(em.num_samples - 1) * s.dim..].to_vec())
             .collect();
 
+        // The last thinned draws are the furthest from the chain starts
+        let (mstep_samples, mstep_iterations) = em.mstep_schedule(iteration);
         let log_pi_samples = thinned_log_pi(&site_samples, em.num_samples);
         let site_rate_samples = thinned_site_rates(&site_samples, em.num_samples);
+        let coordinate_samples =
+            learn.map(|_| thinned_coordinates(&site_samples, em.num_samples - mstep_samples, em.num_samples));
         drop(site_samples);
         if let Some(rates) = &site_rate_samples {
             if verbosity.should_print(Verbosity::Min) {
                 print_site_rate_summary(&label, rates.iter().flatten().copied());
             }
-            if fit_site_rate_sd {
+            if let Some(hyperprior) = &hyperprior {
+                let mstep_rates = &rates[em.num_samples - mstep_samples..];
+                let fitted = hyperprior.fit_site_rate(mstep_rates.iter().flatten().map(|r| r.ln()), 1.0 / mstep_samples as f64);
+                if verbosity.should_print(Verbosity::Min) {
+                    println!(
+                        "MUTSEL HMC prior M-step: sd of the log site rates {:.4} (was {:.4}, hyperprior {:.4})",
+                        fitted.map_or(0.0, |p| p.sd),
+                        site_rate_prior.map_or(0.0, |p| p.sd),
+                        prior.site_rate.map_or(0.0, |p| p.sd)
+                    );
+                }
+                site_rate_prior = fitted;
+            } else if fit_site_rate_sd {
                 let fitted = SiteRatePrior::fit(rates.iter().flatten().map(|r| r.ln()));
                 if verbosity.should_print(Verbosity::Min) {
                     println!(
@@ -1110,8 +1147,19 @@ fn fit_with_em(
                 site_rate_prior = Some(fitted);
             }
         }
-        // The last thinned draws are the furthest from the chain starts
-        let (mstep_samples, mstep_iterations) = em.mstep_schedule(iteration);
+        if let (Some(gmm), Some(hyperprior), Some(points), Some(settings)) =
+            (learned_gmm.as_mut(), &hyperprior, &coordinate_samples, learn)
+        {
+            let report = gmm.fit(points, 1.0 / mstep_samples as f64, hyperprior, settings.max_iterations);
+            current_prior = Arc::new(Prior {
+                site_frequencies: gmm.to_gmm().expect("L-BFGS keeps the covariances positive definite"),
+                site_rate: site_rate_prior,
+                ..(**prior).clone()
+            });
+            if verbosity.should_print(Verbosity::Min) {
+                print_prior_mstep(&label, &report, gmm, prior, columns.len());
+            }
+        }
         let log_likelihood = m_step(
             parents,
             &columns,
@@ -1175,7 +1223,33 @@ fn fit_with_em(
         em_log_likelihood,
         em_tree_length,
         site_rate_prior,
+        prior: current_prior,
+        learned_gmm,
     }
+}
+
+/// Prints the result of the M-step of the learned prior: its objective per site and how far it is from the prior file
+fn print_prior_mstep(label: &str, report: &crate::hyperprior::FitReport, gmm: &LowRankGmm, hyperprior: &Prior, num_sites: usize) {
+    let weights = gmm.weights();
+    let weight_distance: f64 =
+        0.5 * weights.iter().zip(hyperprior.site_frequencies.weights()).map(|(w, w0)| (w - w0).abs()).sum::<f64>();
+    let mean_shift: f64 = weights
+        .iter()
+        .zip(gmm.to_gmm().expect("positive definite").means().iter().zip(hyperprior.site_frequencies.means()))
+        .map(|(w, (mu, mu0))| w * (mu - mu0).norm())
+        .sum();
+    println!(
+        "MUTSEL HMC {} prior M-step: mean log density per site {:.4} -> {:.4}, log hyperprior {:.3} -> {:.3}, after {} evaluations ({:.1}s); weights differ from the hyperprior by {:.4} (total variation), weighted mean shift of the means {:.4}",
+        label,
+        report.before.log_density / num_sites as f64,
+        report.after.log_density / num_sites as f64,
+        report.before.log_hyperprior,
+        report.after.log_hyperprior,
+        report.num_evaluations,
+        report.seconds,
+        weight_distance,
+        mean_shift
+    );
 }
 
 /// Mu, the rate normalization and the branch lengths of an earlier run (its hmc.npz output) instead of fitting them,
@@ -1200,6 +1274,8 @@ fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -
         em_log_likelihood: vec![],
         em_tree_length: vec![],
         site_rate_prior: prior.site_rate,
+        prior: Arc::new(prior.clone()),
+        learned_gmm: None,
     };
     println!(
         "MUTSEL HMC: Mu, rate normalization 1/{:.5} and branch lengths (tree length {:.4}) fixed from {}, no EM",
@@ -1222,6 +1298,11 @@ fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -
 /// the site frequencies integrated out. The rate normalization is kept fixed within each iteration and
 /// afterwards reset to an average substitution rate of 1 over the posterior samples, rescaling the
 /// branch lengths so that the likelihood stays the same.
+///
+/// With MUTSEL_PRIOR_LEARN=1 the prior is hierarchical (see hyperprior.rs): every M-step also fits the prior of the
+/// site frequencies (and the sd of the site rates) to the posterior samples, regularized by the prior file as
+/// hyperprior, and the next E-step and the final sampling use the fitted prior, which is written to
+/// <out_prefix>.prior.npz.
 pub fn sample_internal(
     parents: &[i32],
     branch_lengths: &[f64],
@@ -1236,6 +1317,7 @@ pub fn sample_internal(
     let em = EmSettings::from_env();
     let prior = Arc::new(Prior::from_env());
     let fit_site_rate_sd = env_or("MUTSEL_SITE_RATE_FIT", 0u8) != 0;
+    let learn = LearnSettings::from_env();
     assert!(
         !fit_site_rate_sd || prior.site_rate.is_some(),
         "MUTSEL_SITE_RATE_FIT needs a starting site_rate_sd > 0 in the prior"
@@ -1270,6 +1352,18 @@ pub fn sample_internal(
         em.max_mstep_iterations,
         em.mstep_ramp
     );
+    if let Some(learn) = learn {
+        println!(
+            "MUTSEL HMC: hierarchical prior: the Gaussian mixture (low-rank plus diagonal covariances of rank {}){} fitted per alignment in every M-step (at most {} L-BFGS iterations), with the prior file as hyperprior of strength {} pseudo-sites",
+            learn.rank,
+            if prior.site_rate.is_some() { " and the sd of the site rates" } else { "" },
+            learn.max_iterations,
+            learn.strength
+        );
+        if fit_site_rate_sd {
+            println!("MUTSEL HMC: MUTSEL_SITE_RATE_FIT is replaced by the regularized fit of the hierarchical prior");
+        }
+    }
     assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
     assert!(
         num_tree_draws >= 1 && num_tree_draws <= settings.num_output_samples,
@@ -1278,7 +1372,7 @@ pub fn sample_internal(
 
     let fitted = match std::env::var("MUTSEL_FIXED_SHARED") {
         Ok(path) => fixed_shared(Path::new(path.trim()), parents, num_sites, &prior)?,
-        Err(_) => fit_with_em(parents, branch_lengths, alignment, num_leaves, verbosity, &settings, &em, &prior, fit_site_rate_sd),
+        Err(_) => fit_with_em(parents, branch_lengths, alignment, num_leaves, verbosity, &settings, &em, &prior, fit_site_rate_sd, learn),
     };
     let FittedModel {
         log_S,
@@ -1289,9 +1383,26 @@ pub fn sample_internal(
         em_log_likelihood,
         em_tree_length,
         site_rate_prior,
+        prior: fitted_prior,
+        learned_gmm,
     } = fitted;
+    if let Some(gmm) = &learned_gmm {
+        let prior_path = format!("{}.prior.npz", out_prefix);
+        let (factors, psi) = gmm.factor_data();
+        let num_components = gmm.weights().len();
+        fitted_prior.write(
+            Path::new(&prior_path),
+            &[
+                ("factors", &Array::new(&[num_components, NUM_COORDINATES, gmm.rank()], factors)),
+                ("psi", &Array::new(&[num_components, NUM_COORDINATES], psi)),
+                ("strength", &Array::scalar(learn.map_or(0.0, |l| l.strength))),
+            ],
+        )?;
+        println!("MUTSEL HMC: learned prior written to {} (usable as MUTSEL_PRIOR)", prior_path);
+    }
+    drop(prior);
     let shared = Arc::new(
-        SharedModel::new(&Mu(&log_S), rate_scaling, prior).with_site_rate_prior(site_rate_prior),
+        SharedModel::new(&Mu(&log_S), rate_scaling, fitted_prior).with_site_rate_prior(site_rate_prior),
     );
     let tree = Arc::new(Tree::new(parents, &branch_lengths));
     let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &settings, verbosity, "final");

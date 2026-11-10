@@ -10,8 +10,13 @@ use std::path::Path;
 
 use phylo_grad::nalgebra::{SMatrix, SVector};
 
-use crate::{Result, helmert::NUM_COORDINATES, npz::Npz};
+use crate::{
+    Result,
+    helmert::NUM_COORDINATES,
+    npz::{Array, Npz, write_npz},
+};
 
+#[derive(Clone)]
 pub struct Prior {
     /// Log exchangeabilities of the prior Mu, the entries (i, j), i > j, in row-major order
     pub log_exchangeabilities: Vec<f64>,
@@ -45,6 +50,27 @@ impl Prior {
         prior
     }
 
+    /// Writes the prior in the format of Prior::read, with additional arrays (e.g. the low-rank factors)
+    pub fn write(&self, path: &Path, extra: &[(&str, &Array)]) -> Result<()> {
+        let mut exchangeabilities = SMatrix::<f64, 20, 20>::identity();
+        for ((i, j), l) in (1..20).flat_map(|i| (0..i).map(move |j| (i, j))).zip(&self.log_exchangeabilities) {
+            exchangeabilities[(i, j)] = l.exp();
+            exchangeabilities[(j, i)] = l.exp();
+        }
+        let gmm = &self.site_frequencies;
+        let arrays = [
+            ("exchangeabilities", Array::from_matrix(&exchangeabilities)),
+            ("exchangeability_reg", Array::scalar(self.exchangeability_reg)),
+            ("weights", Array::vector(gmm.weights.clone())),
+            ("means", Array::from_rows(&gmm.means)),
+            ("covs", gmm.covs_array()),
+            ("site_rate_sd", Array::scalar(self.site_rate.map_or(0.0, |p| p.sd))),
+        ];
+        let mut all: Vec<(&str, &Array)> = arrays.iter().map(|(name, array)| (*name, array)).collect();
+        all.extend_from_slice(extra);
+        write_npz(path, &all)
+    }
+
     pub fn read(path: &Path) -> Result<Prior> {
         let npz = Npz::read(path)?;
         let exchangeabilities = npz.get("exchangeabilities")?.to_matrix::<20, 20>()?;
@@ -65,7 +91,10 @@ impl Prior {
 }
 
 /// Gaussian mixture on the Helmert coordinates
+#[derive(Clone)]
 pub struct Gmm {
+    weights: Vec<f64>,
+    covs: Vec<SMatrix<f64, NUM_COORDINATES, NUM_COORDINATES>>,
     /// log weight - log det(cov) / 2 - 19 log(2 pi) / 2
     log_norm: Vec<f64>,
     means: Vec<SVector<f64, NUM_COORDINATES>>,
@@ -79,15 +108,47 @@ impl Gmm {
         if means.len() != weights.len() || covs.len() != weights.len() * size {
             return Err("weights, means and covs of the Gaussian mixture do not match".into());
         }
-        let mut gmm = Gmm { log_norm: vec![], means: means.to_vec(), precisions: vec![] };
-        for k in 0..weights.len() {
-            let cov = SMatrix::<f64, NUM_COORDINATES, NUM_COORDINATES>::from_row_slice(&covs[k * size..(k + 1) * size]);
+        let covs: Vec<_> =
+            (0..weights.len()).map(|k| SMatrix::<f64, NUM_COORDINATES, NUM_COORDINATES>::from_row_slice(&covs[k * size..(k + 1) * size])).collect();
+        Gmm::from_covs(weights, means, &covs)
+    }
+
+    /// Like new, with the covariances as matrices
+    pub fn from_covs(
+        weights: &[f64],
+        means: &[SVector<f64, NUM_COORDINATES>],
+        covs: &[SMatrix<f64, NUM_COORDINATES, NUM_COORDINATES>],
+    ) -> Result<Gmm> {
+        if means.len() != weights.len() || covs.len() != weights.len() {
+            return Err("weights, means and covs of the Gaussian mixture do not match".into());
+        }
+        let mut gmm = Gmm { weights: weights.to_vec(), covs: covs.to_vec(), log_norm: vec![], means: means.to_vec(), precisions: vec![] };
+        for (k, &cov) in covs.iter().enumerate() {
             let chol = cov.cholesky().ok_or_else(|| format!("Covariance {} of the Gaussian mixture is not positive definite", k))?;
             let log_det = 2.0 * chol.l().diagonal().map(f64::ln).sum();
             gmm.log_norm.push(weights[k].ln() - 0.5 * log_det - 0.5 * NUM_COORDINATES as f64 * (2.0 * std::f64::consts::PI).ln());
             gmm.precisions.push(chol.inverse());
         }
         Ok(gmm)
+    }
+
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
+
+    pub fn means(&self) -> &[SVector<f64, NUM_COORDINATES>] {
+        &self.means
+    }
+
+    pub fn covs(&self) -> &[SMatrix<f64, NUM_COORDINATES, NUM_COORDINATES>] {
+        &self.covs
+    }
+
+    /// Covariances [K, 19, 19] in the layout of the prior file
+    pub fn covs_array(&self) -> Array {
+        // Row-major per matrix, as Array::from_matrix
+        let data = self.covs.iter().flat_map(|c| c.transpose().as_slice().to_vec()).collect();
+        Array::new(&[self.covs.len(), NUM_COORDINATES, NUM_COORDINATES], data)
     }
 
     /// Log density and its gradient

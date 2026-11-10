@@ -4,6 +4,7 @@ pub mod batch;
 pub mod data;
 mod helmert;
 pub mod hmc;
+mod hyperprior;
 mod io;
 mod lbfgs;
 pub mod model;
