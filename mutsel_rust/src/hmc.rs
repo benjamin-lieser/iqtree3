@@ -1056,7 +1056,18 @@ fn fit_with_em(
     // Hierarchical prior: the prior file is the hyperprior, the per-alignment prior starts at its low-rank
     // approximation after the first E-step (which, like the MAP estimate, uses the prior file)
     let hyperprior = learn.map(|settings| Hyperprior::new(prior, settings.strength));
-    let mut learned_gmm = learn.map(|settings| LowRankGmm::from_gmm(&prior.site_frequencies, settings.rank));
+    let mut learned_gmm = learn.map(|settings| {
+        let (gmm, rotation_fit) = LowRankGmm::initial(&prior.site_frequencies, &settings);
+        if let Some(fit) = rotation_fit {
+            if verbosity.should_print(Verbosity::Min) {
+                println!(
+                    "MUTSEL HMC: rotation of the diagonal part fitted to the prior file in {:.1}s ({} evaluations): KL of the rank {} approximation to the prior file {:.4} nats per site in the Helmert basis, {:.4} rotated",
+                    fit.seconds, fit.num_evaluations, settings.rank, fit.kl_helmert, fit.kl_rotated
+                );
+            }
+        }
+        gmm
+    });
     let mut current_prior = Arc::clone(prior);
     let columns = alignment_columns(alignment, num_leaves);
     // The joint MAP estimate of Mu, the site frequencies and the branch lengths
@@ -1302,7 +1313,8 @@ fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -
 /// With MUTSEL_PRIOR_LEARN=1 the prior is hierarchical (see hyperprior.rs): every M-step also fits the prior of the
 /// site frequencies (and the sd of the site rates) to the posterior samples, regularized by the prior file as
 /// hyperprior, and the next E-step and the final sampling use the fitted prior, which is written to
-/// <out_prefix>.prior.npz.
+/// <out_prefix>.prior.npz. MUTSEL_PRIOR_ROTATION=1 makes the diagonal part of its covariances diagonal in a basis
+/// fitted to the prior file instead of the Helmert basis.
 pub fn sample_internal(
     parents: &[i32],
     branch_lengths: &[f64],
@@ -1354,8 +1366,9 @@ pub fn sample_internal(
     );
     if let Some(learn) = learn {
         println!(
-            "MUTSEL HMC: hierarchical prior: the Gaussian mixture (low-rank plus diagonal covariances of rank {}){} fitted per alignment in every M-step (at most {} L-BFGS iterations), with the prior file as hyperprior of strength {} pseudo-sites",
+            "MUTSEL HMC: hierarchical prior: the Gaussian mixture (low-rank plus diagonal covariances of rank {}{}){} fitted per alignment in every M-step (at most {} L-BFGS iterations), with the prior file as hyperprior of strength {} pseudo-sites",
             learn.rank,
+            if learn.rotate && learn.rank < NUM_COORDINATES { ", diagonal in a rotated basis fitted to the prior file" } else { "" },
             if prior.site_rate.is_some() { " and the sd of the site rates" } else { "" },
             learn.max_iterations,
             learn.strength
@@ -1390,14 +1403,16 @@ pub fn sample_internal(
         let prior_path = format!("{}.prior.npz", out_prefix);
         let (factors, psi) = gmm.factor_data();
         let num_components = gmm.weights().len();
-        fitted_prior.write(
-            Path::new(&prior_path),
-            &[
-                ("factors", &Array::new(&[num_components, NUM_COORDINATES, gmm.rank()], factors)),
-                ("psi", &Array::new(&[num_components, NUM_COORDINATES], psi)),
-                ("strength", &Array::scalar(learn.map_or(0.0, |l| l.strength))),
-            ],
-        )?;
+        let factors = Array::new(&[num_components, NUM_COORDINATES, gmm.rank()], factors);
+        let psi = Array::new(&[num_components, NUM_COORDINATES], psi);
+        let strength = Array::scalar(learn.map_or(0.0, |l| l.strength));
+        // covs = factors factors^T + rotation diag(psi) rotation^T, rotation row-major and only if there is one
+        let rotation = gmm.rotation().map(|r| Array::new(&[NUM_COORDINATES, NUM_COORDINATES], r.transpose().as_slice().to_vec()));
+        let mut extra = vec![("factors", &factors), ("psi", &psi), ("strength", &strength)];
+        if let Some(rotation) = &rotation {
+            extra.push(("rotation", rotation));
+        }
+        fitted_prior.write(Path::new(&prior_path), &extra)?;
         println!("MUTSEL HMC: learned prior written to {} (usable as MUTSEL_PRIOR)", prior_path);
     }
     drop(prior);
