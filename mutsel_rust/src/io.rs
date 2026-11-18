@@ -1,411 +1,211 @@
-use candle_core::Tensor;
-use lazy_static::lazy_static;
-use seq_io::fasta::Record;
-use std::{collections::HashMap, io::Read, path::Path, vec};
+use std::io::Write;
 
-use anyhow::{Context, Result};
 
-lazy_static! {
-    static ref AMINO_MAPPING: HashMap<u8, u8> = {
-        let mut m = HashMap::new();
-        m.insert(b'A', 0);
-        m.insert(b'R', 1);
-        m.insert(b'N', 2);
-        m.insert(b'D', 3);
-        m.insert(b'C', 4);
-        m.insert(b'Q', 5);
-        m.insert(b'E', 6);
-        m.insert(b'G', 7);
-        m.insert(b'H', 8);
-        m.insert(b'I', 9);
-        m.insert(b'L', 10);
-        m.insert(b'K', 11);
-        m.insert(b'M', 12);
-        m.insert(b'F', 13);
-        m.insert(b'P', 14);
-        m.insert(b'S', 15);
-        m.insert(b'T', 16);
-        m.insert(b'W', 17);
-        m.insert(b'Y', 18);
-        m.insert(b'V', 19);
-        m.insert(b'-', 20);
-        m.insert(b'X', 20);
-        m.insert(b'?', 20);
-        m.insert(b'.', 20);
-        m
-    };
+const STDOUT_FD: libc::c_int = 1;
+const STDERR_FD: libc::c_int = 2;
+
+unsafe fn os_dup(fd: libc::c_int) -> libc::c_int {
+    unsafe { libc::dup(fd) }
 }
 
-fn normalize_residue(residue: u8) -> u8 {
-    residue.to_ascii_uppercase()
+unsafe fn os_dup2(src: libc::c_int, dst: libc::c_int) -> libc::c_int {
+    unsafe { libc::dup2(src, dst) }
 }
 
-fn seq2pll(
-    seq: impl Iterator<Item = u8>,
-) -> Vec<phylo_grad::nalgebra::SVector<f64, 20>> {
-    seq.map(|c| *AMINO_MAPPING.get(&normalize_residue(c)).unwrap_or(&20))
-        .map(|idx| {
-            let mut v = phylo_grad::nalgebra::SVector::<f64, 20>::zeros();
-                
-            if idx < 20 {
-                v[idx as usize] = 1.0;
-            } else {
-                for i in 0..20 {
-                    v[i] = 1.0;
-                }
-            }
-            v
-        })
-        .collect()
+
+unsafe fn os_close(fd: libc::c_int) -> libc::c_int {
+    unsafe { libc::close(fd) }
 }
 
-pub fn read_alignment(fasta_file: &Path) -> HashMap<String, Vec<u8>> {
-    let mut alignment = seq_io::fasta::Reader::new(
-        std::fs::File::open(fasta_file).expect("Could not open fasta file"),
-    );
-    let mut sequences = HashMap::new();
-    while let Some(result) = alignment.next() {
-        let record = result.expect("Error reading fasta record");
-        let seq: Vec<u8> = record.seq().iter().copied().collect();
-        sequences.insert(record.id().unwrap().to_string(), seq);
+#[cfg(unix)]
+unsafe fn os_read(fd: libc::c_int, buf: &mut [u8]) -> isize {
+    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) as isize }
+}
+
+#[cfg(windows)]
+unsafe fn os_read(fd: libc::c_int, buf: &mut [u8]) -> isize {
+    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as libc::c_uint) as isize }
+}
+
+#[cfg(unix)]
+unsafe fn os_write(fd: libc::c_int, buf: &[u8]) -> isize {
+    unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) as isize }
+}
+
+#[cfg(windows)]
+unsafe fn os_write(fd: libc::c_int, buf: &[u8]) -> isize {
+    unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len() as libc::c_uint) as isize }
+}
+
+#[cfg(unix)]
+fn create_pipe() -> std::io::Result<[libc::c_int; 2]> {
+    let mut fds = [0; 2];
+    let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if ret != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(fds)
     }
-    sequences
 }
 
-pub fn get_site_specific_aa_distribution(sequences: &HashMap<String, Vec<u8>>) -> Tensor {
-    let num_sites = sequences.values().next().unwrap().len();
+#[cfg(windows)]
+fn create_pipe() -> std::io::Result<[libc::c_int; 2]> {
+    let mut fds = [0; 2];
+    // libc::pipe on Windows maps to the CRT signature (fds, psize, textmode).
+    let ret = unsafe { libc::pipe(fds.as_mut_ptr(), 4096, 0) };
+    if ret != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(fds)
+    }
+}
 
-    let mut data = vec![0f64; num_sites * 20];
-
-    for seq in sequences.values() {
-        for (site_idx, &residue) in seq.iter().enumerate() {
-            let aa_idx = *AMINO_MAPPING.get(&normalize_residue(residue)).unwrap_or(&20);
-            if aa_idx == 20 {
+fn write_all_fd(fd: libc::c_int, mut buf: &[u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let n = unsafe { os_write(fd, buf) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            data[site_idx * 20 + aa_idx as usize] += 1.0;
+            return Err(err);
         }
+        let n = n as usize;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write to redirected stdout returned 0",
+            ));
+        }
+        buf = &buf[n..];
     }
-
-    Tensor::from_vec(data, &[num_sites, 20], &candle_core::Device::Cpu).unwrap()
+    Ok(())
 }
 
-pub fn get_site_specific_aa_distribution_iqtree(alignment: &[u8], L: usize, N: usize) -> Tensor {
-    let mut data = vec![0f64; L * 20];
+pub fn tee_to_file(path: &str) -> (i32, i32, std::thread::JoinHandle<()>) {
+    let fds = create_pipe().unwrap_or_else(|e| panic!("tee_to_file: pipe() failed: {}", e));
 
-    for site_idx in 0..L {
-        for seq_idx in 0..N {
-            let residue = alignment[site_idx * N + seq_idx];
-            if residue == 20 {
-                continue;
+    // Save original stdout
+    let saved_stdout = unsafe { os_dup(STDOUT_FD) };
+    if saved_stdout < 0 {
+        panic!(
+            "tee_to_file: dup(STDOUT_FILENO) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let saved_stderr = unsafe { os_dup(STDERR_FD) };
+    if saved_stderr < 0 {
+        panic!(
+            "tee_to_file: dup(STDERR_FILENO) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Dedicated copy for tee thread so saved_stdout can be restored/closed independently.
+    let tee_stdout = unsafe { os_dup(saved_stdout) };
+    if tee_stdout < 0 {
+        panic!(
+            "tee_to_file: dup(saved_stdout) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Redirect stdout to pipe write end
+    let ret = unsafe { os_dup2(fds[1], STDOUT_FD) };
+    if ret < 0 {
+        panic!(
+            "tee_to_file: dup2(STDOUT_FILENO) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let ret = unsafe { os_dup2(fds[1], STDERR_FD) };
+    if ret < 0 {
+        panic!(
+            "tee_to_file: dup2(STDERR_FILENO) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Close the original write end — stdout/stderr now hold the only references
+    let ret = unsafe { os_close(fds[1]) };
+    if ret != 0 {
+        panic!(
+            "tee_to_file: close(pipe write end) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Open log file
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("tee_to_file: failed to open '{}': {}", path, e));
+
+    // Spawn thread to read from pipe and write to both
+    let handle = std::thread::spawn(move || {
+        let mut buffer = [0u8; 1024];
+
+        loop {
+            let n = unsafe { os_read(fds[0], &mut buffer) };
+            if n == 0 {
+                break; // EOF
             }
-            data[site_idx * 20 + residue as usize] += 1.0;
-        }
-    }
-
-    Tensor::from_vec(data, &[L, 20], &candle_core::Device::Cpu).unwrap()
-}
-
-pub fn create_felsenstein_tree(
-    parents: &[i32],
-    distances: &[f64],
-    alignment: &[u8],
-    L : usize,
-    N : usize,
-) -> phylo_grad::FelsensteinTree<20> {
-    let mut felsenstein = phylo_grad::FelsensteinTree::<20>::new(parents, distances);
-
-    let mut sites = vec![];
-    sites.resize(L, vec![]);
-    for site_idx in 0..L {
-        sites[site_idx].resize(N, phylo_grad::nalgebra::SVector::<f64, 20>::zeros());
-        for seq_idx in 0..N {
-            let residue = alignment[site_idx * N + seq_idx];
-            if residue < 20 {
-                sites[site_idx][seq_idx][residue as usize] = 1.0;
-            } else {
-                for i in 0..20 {
-                    sites[site_idx][seq_idx][i] = 1.0;
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
+                panic!("tee_to_file: read from pipe failed: {}", err);
             }
-        }
-    }
-    felsenstein.bind_leaf_pl(sites);
-    felsenstein
-}
 
-pub fn process_newick_alignment(
-    newick: &str,
-    sequences: &HashMap<String, Vec<u8>>,
-) -> (phylo_grad::FelsensteinTree<20>, Vec<f64>) {
-    let tree = phylotree::tree::Tree::from_newick(newick).unwrap();
-
-    let num_sides = sequences.values().next().unwrap().len();
-    let level_order = tree.levelorder(&tree.get_root().unwrap()).unwrap();
-
-    let mut parents = vec![i32::MAX; level_order.len()];
-    let mut distances = vec![f64::NAN; level_order.len()];
-
-    let num_leaves = tree.n_leaves();
-
-    // idx_mapping[tree_idx] = new_idx
-    let mut idx_mapping = vec![i32::MAX; level_order.len()];
-
-    let mut leaf_idx = 0usize;
-    let mut internal_idx = level_order.len() - 1;
-
-    for node_idx in &level_order {
-        let node = tree.get(node_idx).unwrap();
-        if node.is_tip() {
-            idx_mapping[*node_idx] = leaf_idx as i32;
-            parents[leaf_idx] = idx_mapping[node.parent.unwrap()];
-            distances[leaf_idx] = node.parent_edge.unwrap();
-            leaf_idx += 1;
-        } else {
-            idx_mapping[*node_idx] = internal_idx as i32;
-            if let Some(parent_idx) = node.parent {
-                parents[internal_idx] = idx_mapping[parent_idx];
-                distances[internal_idx] = node.parent_edge.unwrap();
-            } else {
-                parents[internal_idx] = -1;
-            }
-            internal_idx -= 1;
-        }
-    }
-
-    let mut leaf_pll = vec![];
-
-    for i in 0..num_sides {
-        let mut column_seq = vec![b'x'; num_leaves];
-
-        for node_idx in level_order.iter() {
-            let node = tree.get(&node_idx).unwrap();
-            if node.is_tip() {
-                let new_idx = idx_mapping[*node_idx];
-                assert!(new_idx < num_leaves as i32);
-                let seq = sequences.get(node.name.as_ref().unwrap()).unwrap();
-                column_seq[new_idx as usize] = seq[i];
-            }
-        }
-        leaf_pll.push(seq2pll(column_seq.into_iter()));
-    }
-
-    let mut felsenstein = phylo_grad::FelsensteinTree::<20>::new(&parents, &distances);
-    felsenstein.bind_leaf_pl(leaf_pll);
-    (felsenstein, distances)
-}
-
-pub fn write_sitefreq_file(pi: &Tensor, path: &Path) {
-    use std::io::Write;
-    let pi_data: Vec<Vec<f64>> = pi.to_vec2().unwrap();
-    let mut file = std::fs::File::create(path).expect("Could not create sitefreq file");
-    for (idx, chunk) in pi_data.iter().enumerate() {
-        let line = chunk
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<String>>()
-            .join("\t");
-        writeln!(file, "{}\t{}", idx + 1, line).expect("Could not write to sitefreq file");
-    }
-}
-
-pub fn write_pam_file(R: &Tensor, path: &Path) {
-    use std::io::Write;
-    let R_data: Vec<Vec<f64>> = R.to_vec2().unwrap();
-    let mut file = std::fs::File::create(path).expect("Could not create pam file");
-    for i in 1..20 {
-        for j in 0..i {
-            write!(file, "{}\t", R_data[i][j]).expect("Could not write to pam file");
-        }
-        write!(file, "\n").expect("Could not write to pam file");
-    }
-    let equi: Vec<&str> = vec!["0.05"; 20];
-    writeln!(file, "{}", equi.join("\t")).expect("Could not write to pam file");
-}
-
-/// Ignores the first column (site index)
-pub fn read_sitefreq_file(path: &Path) -> Tensor {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path).expect("Could not open sitefreq file");
-    let reader = std::io::BufReader::new(file);
-    let mut data = vec![];
-    for line in reader.lines() {
-        let line = line.expect("Could not read line from sitefreq file");
-        line.split_whitespace().skip(1).for_each(|v| {
-            data.push(
-                v.parse::<f64>()
-                    .expect("Could not parse float from sitefreq file"),
-            )
-        });
-    }
-    let L = data.len() / 20;
-    return Tensor::from_vec(data, &[L, 20], &candle_core::Device::Cpu).unwrap();
-}
-
-pub fn read_pam_file(path: &Path) -> Tensor {
-    let file_content = std::fs::read_to_string(path).expect("Could not read pam file");
-    return crate::data::load_lower_R(&file_content);
-}
-
-pub fn write_nexus_file(S: &Tensor, sqrt_pi: &Tensor, alpha : &Tensor, path: &Path) {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path).expect("Could not create nexus file");
-
-    file.write(b"#nexus\n")
-        .expect("Could not write to nexus file");
-    file.write(b"begin sets;\n")
-        .expect("Could not write to nexus file");
-
-    let (R, pi) = crate::model::phylograd2iqtree_parametrization(S, sqrt_pi).unwrap();
-
-    let L = R.dims()[0];
-
-    for i in 0..L {
-        file.write(format!("    charset p{} = AA, {}-{};\n", i + 1, i + 1, i + 1).as_bytes())
-            .expect("Could not write to nexus file");
-    }
-
-    file.write(b"charpartition mine = ").expect("Could not write to nexus file");
-
-    let mut charpart_elems = vec![];
-
-    let alpha : f64 = alpha.to_scalar().unwrap();
-
-    for i in 0..L {
-        let freq_str = pi
-            .get(i)
-            .unwrap()
-            .to_vec1::<f64>()
-            .unwrap()
-            .iter()
-            .map(|v| format!("{:.6}", v))
-            .collect::<Vec<String>>()
-            .join("/");
-
-        let R_data: Vec<Vec<f64>> = R.get(i).unwrap().to_vec2().unwrap();
-
-        let mut rate_elems = vec![];
-        for a in 1..20 {
-            for b in 0..a {
-                rate_elems.push(format!("{:.6}", R_data[a][b]));
-            }
+            let n = n as usize;
+            // Write to original stdout
+            write_all_fd(tee_stdout, &buffer[..n])
+                .unwrap_or_else(|e| panic!("tee_to_file: write to stdout failed: {}", e));
+            // Write to file
+            file.write_all(&buffer[..n])
+                .unwrap_or_else(|e| panic!("tee_to_file: write to log file failed: {}", e));
         }
 
-        let rate_str = rate_elems.join("/");
-
-        charpart_elems.push(format!(
-            "GTR{{{}}}+F{{{}}}+G4{{{}}} : p{}",
-            rate_str,
-            freq_str,
-            format!("{:.6}", alpha),
-            i + 1
-        ));
-    }
-
-    file.write(charpart_elems.join(", ").as_bytes())
-        .expect("Could not write to nexus file");
-    file.write(b";\nend;\n").expect("Could not write to nexus file");
-}
-
-pub struct BinarySiteModelData {
-    pub rate_model_string: String,
-    pub site_freq: Tensor,
-    pub rate_matrices: Tensor,
-}
-
-fn read_u64_le(reader: &mut impl Read, field_name: &str) -> Result<u64> {
-    let mut buf = [0u8; 8];
-    reader
-        .read_exact(&mut buf)
-        .with_context(|| format!("Failed to read {} from binary site model file", field_name))?;
-    Ok(u64::from_le_bytes(buf))
-}
-
-fn read_f64_vec_le(reader: &mut impl Read, len: usize, field_name: &str) -> Result<Vec<f64>> {
-    let byte_len = len
-        .checked_mul(8)
-        .context("Binary site model file field is too large")?;
-    let mut bytes = vec![0u8; byte_len];
-    reader
-        .read_exact(&mut bytes)
-        .with_context(|| format!("Failed to read {} from binary site model file", field_name))?;
-
-    let mut out = Vec::with_capacity(len);
-    for chunk in bytes.chunks_exact(8) {
-        out.push(f64::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    Ok(out)
-}
-
-/// Read IQ-TREE binary site model format.
-///
-/// Format:
-/// - uint64 little-endian: byte length of rate-model string
-/// - [len] bytes: rate-model string
-/// - uint64 little-endian: number of sites
-/// - num_sites * 20 little-endian f64: per-site frequencies
-/// - num_sites * 190 little-endian f64: per-site upper-triangular rates
-pub fn read_binary_site_model_file(path: &Path) -> Result<BinarySiteModelData> {
-    if cfg!(target_endian = "big") {
-        anyhow::bail!("Only little-endian machine is supported for reading binary site model file");
-    }
-
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open binary site model file: {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-
-    let rate_model_string_len = usize::try_from(read_u64_le(&mut reader, "rate model string length")?)
-        .context("Rate model string length does not fit in usize")?;
-    let mut rate_model_string_buf = vec![0u8; rate_model_string_len];
-    if rate_model_string_len > 0 {
-        reader
-            .read_exact(&mut rate_model_string_buf)
-            .context("Failed to read rate model string from binary site model file")?;
-    }
-    let rate_model_string = String::from_utf8(rate_model_string_buf)
-        .context("Rate model string is not valid UTF-8")?;
-
-    let num_sites = usize::try_from(read_u64_le(&mut reader, "number of sites")?)
-        .context("Number of sites does not fit in usize")?;
-
-    let freq_len = num_sites
-        .checked_mul(20)
-        .context("Number of frequency values overflows usize")?;
-    let site_freq_data = read_f64_vec_le(&mut reader, freq_len, "site frequencies")?;
-
-    let rate_len = num_sites
-        .checked_mul(190)
-        .context("Number of rate values overflows usize")?;
-    let rate_matrices_data = read_f64_vec_le(&mut reader, rate_len, "rate matrices")?;
-
-    let site_freq = Tensor::from_vec(site_freq_data, &[num_sites, 20], &candle_core::Device::Cpu)
-        .context("Failed to create site frequency tensor")?;
-
-    let mut rate_matrices = Vec::with_capacity(num_sites * 20 * 20);
-
-    for i in 0..num_sites {
-        let mut full_matrix = vec![0f64; 20 * 20];
-        let mut idx = 0;
-        for a in 0..20 {
-            for b in (a+1)..20 {
-                let rate = rate_matrices_data[i * 190 + idx];
-                full_matrix[a * 20 + b] = rate;
-                full_matrix[b * 20 + a] = rate;
-                idx += 1;
-            }
+        let ret = unsafe { os_close(fds[0]) };
+        if ret != 0 {
+            panic!(
+                "tee_to_file: close(pipe read end) failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
-        rate_matrices.extend(full_matrix);
+        let ret = unsafe { os_close(tee_stdout) };
+        if ret != 0 {
+            panic!(
+                "tee_to_file: close(tee stdout) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        file.flush()
+            .unwrap_or_else(|e| panic!("tee_to_file: flush log file failed: {}", e));
+    });
+
+    (saved_stdout, saved_stderr, handle)
+}
+
+pub fn restore_stdout_stderr(
+    saved_stdout: i32,
+    saved_stderr: i32,
+    handle: std::thread::JoinHandle<()>,
+) {
+    unsafe {
+        // Restoring stdout/stderr drops the last write-end references to the pipe,
+        // causing EOF on the read end so the tee thread can exit cleanly.
+        os_dup2(saved_stdout, STDOUT_FD);
+        os_dup2(saved_stderr, STDERR_FD);
     }
-
-    let rate_matrices = Tensor::from_vec(rate_matrices, &[num_sites, 20, 20], &candle_core::Device::Cpu)
-        .context("Failed to create rate matrices tensor")?;
-
-    // Convert the upper diagonal rate matrices to full R matrices
-    
-
-    Ok(BinarySiteModelData {
-        rate_model_string,
-        site_freq,
-        rate_matrices,
-    })
+    // Wait for the tee thread to drain and flush all remaining output.
+    handle
+        .join()
+        .unwrap_or_else(|_| panic!("restore_stdout_stderr: tee thread panicked"));
+    unsafe {
+        os_close(saved_stdout);
+        os_close(saved_stderr);
+    }
 }

@@ -2934,16 +2934,14 @@ public:
     std::string site_model_file;
 
     /**
-     *  the file containing the prior state frequencies for the mutsel model, in the format of "site_ID state1_freq state2_freq ... state20_freq"
-     *  by default MUTSEL will calculate these priors by an approximated PMSF method.
+     *  tau, the strength of the MUTSEL prior as hyperprior of the prior learned per alignment, in pseudo-sites
      */
-    std::string mutsel_prior_freq_file;
+    double mutsel_prior_strength = 1000.0;
 
     /**
-     *  the prior for the shared rates in PAML format.
-     *  by default MUTSEL will use the CODON model (A matrix derived for this purpose, for more information see the paper).
+     *  rank of the low-rank part of the covariances of the MUTSEL prior learned per alignment (0 to 19)
      */
-    std::string mutsel_prior_rate_file;
+    int mutsel_prior_rank = 3;
 };
 
 /**

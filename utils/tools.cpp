@@ -4639,21 +4639,26 @@ void parseArg(int argc, char *argv[], Params &params) {
                 continue;
             }
 
-            if (strcmp(argv[cnt], "--mutsel-prior-freq-file") == 0 || strcmp(argv[cnt], "-mutsel-prior-freq-file") == 0) {
+            if (strcmp(argv[cnt], "--mutsel-tau") == 0 || strcmp(argv[cnt], "-mutsel-tau") == 0) {
                 cnt++;
                 if (cnt >= argc)
-                    throw "Use --mutsel-prior-freq-file <mutsel_prior_freq_file>";
-                params.mutsel_prior_freq_file = argv[cnt];
+                    throw "Use --mutsel-tau <strength of the MUTSEL hyperprior>";
+                params.mutsel_prior_strength = convert_double(argv[cnt]);
+                if (!(params.mutsel_prior_strength > 0.0) || !std::isfinite(params.mutsel_prior_strength))
+                    throw "--mutsel-tau must be positive";
                 continue;
             }
 
-            if (strcmp(argv[cnt], "--mutsel-prior-rate-file") == 0 || strcmp(argv[cnt], "-mutsel-prior-rate-file") == 0) {
+            if (strcmp(argv[cnt], "--mutsel-rank") == 0 || strcmp(argv[cnt], "-mutsel-rank") == 0) {
                 cnt++;
                 if (cnt >= argc)
-                    throw "Use --mutsel-prior-rate-file <mutsel_prior_rate_file>";
-                params.mutsel_prior_rate_file = argv[cnt];
+                    throw "Use --mutsel-rank <rank of the MUTSEL prior covariances, 0 to 19>";
+                params.mutsel_prior_rank = convert_int(argv[cnt]);
+                if (params.mutsel_prior_rank < 0 || params.mutsel_prior_rank > 19)
+                    throw "--mutsel-rank must be between 0 and 19";
                 continue;
             }
+
 //			if (strcmp(argv[cnt], "-rootstate") == 0) {
 //                cnt++;
 //                if (cnt >= argc)
@@ -6049,6 +6054,10 @@ void usage_iqtree(char* argv[], bool full_command) {
     << "  --tree-freq FILE     Input tree to infer site frequency model" << endl
     << "  --site-freq FILE     Input site frequency model file" << endl
     << "  --freq-max           Posterior maximum instead of mean approximation" << endl
+    << "  -m MUTSEL --tree-freq FILE  Mutation-selection site model, estimated on the guide tree FILE" << endl
+    << "  --mutsel-tau NUM     MUTSEL: strength of the prior as hyperprior in pseudo-sites (default: 1000)" << endl
+    << "  --mutsel-rank NUM    MUTSEL: rank of the learned prior covariances, 0 to 19 (default: 3)" << endl
+    << "  --site-model-file FILE  MUTSEL: site model from an earlier run (.sitemodel)" << endl
 
     << endl << "TREE TOPOLOGY TEST:" << endl
     << "  --trees FILE         Set of trees to evaluate log-likelihoods" << endl
