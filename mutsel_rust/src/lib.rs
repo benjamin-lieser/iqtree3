@@ -32,8 +32,9 @@ pub extern "C" fn rust_set_rayon_threads(num_threads: u32) {
 /// parents: [num_nodes]
 /// branch_lengths: [num_nodes]
 /// alignment: [num_sites * num_leaves] (row-major)
-/// prior_strength: tau of the hierarchical prior, the strength of the prior file as hyperprior in pseudo-sites (> 0)
-/// prior_rank: rank of the low-rank part of the covariances of the hierarchical prior (0 to 19)
+/// model_str: MUTSEL, MUTSEL{tau} or MUTSEL{tau/rank} (or with a comma): tau is the strength of the prior file as hyperprior of the
+/// hierarchical prior in pseudo-sites (0 learns the prior from the alignment alone, inf keeps it fixed), rank that of the low-rank part of its
+/// covariances (0 to 19), defaults 1000 and 3
 /// out_site_freq: [num_sites * 20] (row-major), the posterior mean site frequencies
 /// out_rate_matrix: [num_sites * 190] (row-major), the upper triangle of the rate matrices at these frequencies
 /// out variables do not need to be initialized
@@ -47,8 +48,6 @@ pub unsafe extern "C" fn rust_mutsel(
     num_nodes: u32,
     model_str: *const std::os::raw::c_char,
     verbose: u8,
-    prior_strength: f64,
-    prior_rank: u32,
     out_site_freq: *mut f64,
     out_rate_matrix: *mut f64,
     output_prefix: *const std::os::raw::c_char,
@@ -91,12 +90,8 @@ pub unsafe extern "C" fn rust_mutsel(
     let model_str = model_cstr.to_str().unwrap();
 
     // The prior is the default prior or the file in MUTSEL_PRIOR (see prior.rs), the hierarchical prior is set
-    // by prior_strength and prior_rank
-    assert!(
-        model_str.trim().eq_ignore_ascii_case("MUTSEL"),
-        "Invalid model {}: the MUTSEL model has no parameters (see --mutsel-tau and --mutsel-rank)",
-        model_str
-    );
+    // by tau and rank in the model string
+    let (prior_strength, prior_rank) = hyperprior::LearnSettings::parse_model(model_str).unwrap_or_else(|e| panic!("{}", e));
     println!("Starting mutsel optimization");
 
     // Posterior sampling of the site frequencies (their Helmert coordinates) with Mu and the branch lengths from EM
@@ -109,7 +104,7 @@ pub unsafe extern "C" fn rust_mutsel(
         crate::Verbosity::from_u8(verbose),
         out_prefix,
         prior_strength,
-        prior_rank as usize,
+        prior_rank,
     )
     .unwrap();
 

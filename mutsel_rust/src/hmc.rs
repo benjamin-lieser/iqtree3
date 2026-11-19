@@ -1297,7 +1297,7 @@ fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -
 /// afterwards reset to an average substitution rate of 1 over the posterior samples, rescaling the
 /// branch lengths so that the likelihood stays the same.
 ///
-/// The prior is hierarchical (see hyperprior.rs, unless MUTSEL_PRIOR_LEARN=0): every M-step also fits the prior of
+/// The prior is hierarchical (see hyperprior.rs, unless prior_strength is inf or MUTSEL_PRIOR_LEARN=0): every M-step also fits the prior of
 /// the site frequencies (covariances of rank prior_rank plus diagonal) and the sd of the site rates to the posterior
 /// samples, regularized by the prior file as hyperprior of strength prior_strength (tau, in pseudo-sites), and the
 /// next E-step and the final sampling use the fitted prior, which is written to <out_prefix>.prior.npz.
@@ -1362,6 +1362,8 @@ pub fn sample_internal(
         if fit_site_rate_sd {
             println!("MUTSEL HMC: MUTSEL_SITE_RATE_FIT is replaced by the regularized fit of the hierarchical prior");
         }
+    } else {
+        println!("MUTSEL HMC: the prior is fixed (tau = inf or MUTSEL_PRIOR_LEARN=0)");
     }
     assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
 
@@ -1520,6 +1522,46 @@ mod tests {
 
     fn test_point() -> Vec<f64> {
         (0..NUM_COORDINATES).map(|i| 0.3 * ((i as f64) * 1.7).sin()).collect()
+    }
+
+    /// The draws of every site only depend on the seed and the site (each chain has its own RNG seeded from
+    /// both), not on the number of threads or the scheduling, also when the chains continue in a second E-step
+    #[test]
+    fn draws_do_not_depend_on_the_threads() {
+        let num_sites = 16;
+        let alignment: Vec<u8> = (0..num_sites * 5).map(|i| ((i * 7 + i / 5) % 21) as u8).collect();
+        let shared = Arc::new(test_shared(RATE_SCALING));
+        let tree = Arc::new(test_tree());
+        let init = vec![test_point(); num_sites];
+        let settings = HmcSettings {
+            num_tune: 50,
+            num_draws: 30,
+            target_ess: 10,
+            max_draws: 200,
+            num_output_samples: 5,
+            seed: 7,
+            marginal: true,
+        };
+        let run = |num_threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().unwrap();
+            pool.install(|| {
+                let fresh = sample_sites(&shared, &tree, &alignment, 5, &init, &settings, Verbosity::Quiet, "test");
+                let mut chains = Vec::new();
+                let first = sample_sites_persistent(&mut chains, &shared, &tree, &alignment, 5, &init, &settings, 0, Verbosity::Quiet, "test");
+                let second = sample_sites_persistent(&mut chains, &shared, &tree, &alignment, 5, &init, &settings, 10, Verbosity::Quiet, "test");
+                [fresh, first, second]
+                    .iter()
+                    .flatten()
+                    .map(|s| (s.thinned_draws.clone(), s.num_draws, s.log_marginal.to_bits()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let single = run(1);
+        for num_threads in [2, 8] {
+            for _ in 0..3 {
+                assert!(run(num_threads) == single, "draws differ with {} threads", num_threads);
+            }
+        }
     }
 
     #[test]

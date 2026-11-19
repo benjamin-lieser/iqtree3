@@ -11,8 +11,6 @@ void rust_mutsel(int32_t *parents,
                  uint32_t node_num,
                  const char *model_string,
                  uint8_t verbose,
-                 double prior_strength,
-                 uint32_t prior_rank,
                  double *out_site_freq,
                  double *out_R_matrices,
                  const char *output_prefix)
@@ -484,8 +482,6 @@ void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
                 parent_indices.size(),
                 params.model_name.c_str(),
                 verbose_mode,
-                params.mutsel_prior_strength,
-                params.mutsel_prior_rank,
                 site_freq,
                 site_rate,
                 ((string)params.out_prefix).c_str());

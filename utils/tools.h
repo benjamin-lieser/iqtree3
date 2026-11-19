@@ -2932,16 +2932,6 @@ public:
      *  The file is not intended to be human-readable.
      */
     std::string site_model_file;
-
-    /**
-     *  tau, the strength of the MUTSEL prior as hyperprior of the prior learned per alignment, in pseudo-sites
-     */
-    double mutsel_prior_strength = 1000.0;
-
-    /**
-     *  rank of the low-rank part of the covariances of the MUTSEL prior learned per alignment (0 to 19)
-     */
-    int mutsel_prior_rank = 3;
 };
 
 /**

@@ -34,7 +34,7 @@ const DIM: usize = NUM_COORDINATES;
 type Matrix = SMatrix<f64, DIM, DIM>;
 type Coordinates = SVector<f64, DIM>;
 
-/// Settings of the hierarchical prior, None (MUTSEL_PRIOR_LEARN=0) keeps the prior file fixed
+/// Settings of the hierarchical prior, None (tau = inf or MUTSEL_PRIOR_LEARN=0) keeps the prior file fixed
 #[derive(Debug, Clone, Copy)]
 pub struct LearnSettings {
     /// tau, the number of pseudo-sites of the hyperprior
@@ -46,21 +46,51 @@ pub struct LearnSettings {
 }
 
 impl LearnSettings {
-    /// Default strength tau of the hyperprior (IQ-TREE --mutsel-tau)
+    /// Default strength tau of the hyperprior (MUTSEL{tau})
     pub const DEFAULT_STRENGTH: f64 = 1000.0;
-    /// Default rank of the covariances (IQ-TREE --mutsel-rank)
+    /// Default rank of the covariances (MUTSEL{tau,rank})
     pub const DEFAULT_RANK: usize = 3;
 
-    /// The hierarchical prior with strength tau and rank, unless MUTSEL_PRIOR_LEARN=0 (default 1) keeps the prior
-    /// file fixed; MUTSEL_PRIOR_MSTEP_ITERATIONS sets the L-BFGS iterations of its M-step
+    /// The hierarchical prior with strength tau and rank. tau = 0 fits it to the alignment alone (maximum
+    /// likelihood, the prior file only as the start); nothing then regularizes the fit, so components can empty
+    /// out or their covariances collapse, which is left to the user. tau = inf, the limit in which the prior stays the prior
+    /// file, or MUTSEL_PRIOR_LEARN=0 (default 1) keep the prior file fixed. MUTSEL_PRIOR_MSTEP_ITERATIONS sets the
+    /// L-BFGS iterations of its M-step.
     pub fn new(strength: f64, rank: usize) -> Option<LearnSettings> {
-        if env_or("MUTSEL_PRIOR_LEARN", 1u8) == 0 {
+        assert!(strength >= 0.0, "the strength tau of the MUTSEL hyperprior must be at least 0 or inf, not {}", strength);
+        assert!(rank <= DIM, "the rank of the MUTSEL prior must be at most {}, not {}", DIM, rank);
+        if strength.is_infinite() || env_or("MUTSEL_PRIOR_LEARN", 1u8) == 0 {
             return None;
         }
-        let settings = LearnSettings { strength, rank, max_iterations: env_or("MUTSEL_PRIOR_MSTEP_ITERATIONS", 200) };
-        assert!(settings.strength > 0.0 && settings.strength.is_finite(), "the strength tau of the MUTSEL hyperprior must be positive");
-        assert!(settings.rank <= DIM, "the rank of the MUTSEL prior must be at most {}", DIM);
-        Some(settings)
+        Some(LearnSettings { strength, rank, max_iterations: env_or("MUTSEL_PRIOR_MSTEP_ITERATIONS", 200) })
+    }
+
+    /// tau and rank from the model string MUTSEL, MUTSEL{tau} or MUTSEL{tau/rank} (or MUTSEL{tau,rank}, which needs
+    /// quotes in a shell), case-insensitive name, tau >= 0 or inf, the defaults for the missing ones
+    pub fn parse_model(model: &str) -> std::result::Result<(f64, usize), String> {
+        let model = model.trim();
+        let usage = || format!("invalid model {}: use MUTSEL, MUTSEL{{tau}} or MUTSEL{{tau/rank}}, e.g. MUTSEL{{1000/3}} (tau >= 0, 0 to learn the prior from the alignment alone, inf to keep it fixed, rank 0 to {})", model, DIM);
+        if model.len() < 6 || !model[..6].eq_ignore_ascii_case("MUTSEL") {
+            return Err(usage());
+        }
+        let rest = &model[6..];
+        if rest.is_empty() {
+            return Ok((Self::DEFAULT_STRENGTH, Self::DEFAULT_RANK));
+        }
+        let params = rest.strip_prefix('{').and_then(|r| r.strip_suffix('}')).ok_or_else(usage)?;
+        let params: Vec<&str> = params.split([',', '/']).map(str::trim).collect();
+        if params.len() > 2 {
+            return Err(usage());
+        }
+        let strength: f64 = params[0].parse().map_err(|_| usage())?;
+        let rank = match params.get(1) {
+            Some(rank) => rank.parse().map_err(|_| usage())?,
+            None => Self::DEFAULT_RANK,
+        };
+        if !(strength >= 0.0) || rank > DIM {
+            return Err(usage());
+        }
+        Ok((strength, rank))
     }
 }
 
@@ -285,8 +315,11 @@ impl LowRankGmm {
             let a = hyper.pseudo_sites(k);
             let (n, s1, mu, precision) = (stats.n[k], &stats.s1[k], &self.means[k], &precisions[k]);
             let d = mu - hyper.means[k];
-            log_hyperprior += a * weights[k].ln()
-                - 0.5 * a * (log_dets[k] + (precision * hyper.covs[k]).trace() + d.dot(&(precision * d)));
+            // Without pseudo-sites (tau = 0) the term is 0, also for a weight that underflowed to 0
+            if a > 0.0 {
+                log_hyperprior += a * weights[k].ln()
+                    - 0.5 * a * (log_dets[k] + (precision * hyper.covs[k]).trace() + d.dot(&(precision * d)));
+            }
 
             // Scatter of the points and the pseudo-sites around mu_k
             let scatter = stats.s2[k] - s1 * mu.transpose() - mu * s1.transpose() + mu * mu.transpose() * n
@@ -374,6 +407,26 @@ pub struct FitReport {
 mod tests {
     use super::*;
     use crate::prior::tests::isotropic_gmm;
+
+    #[test]
+    fn model_string() {
+        let parse = LearnSettings::parse_model;
+        assert_eq!(parse("MUTSEL"), Ok((1000.0, 3)));
+        assert_eq!(parse(" mutsel "), Ok((1000.0, 3)));
+        assert_eq!(parse("MUTSEL{100}"), Ok((100.0, 3)));
+        assert_eq!(parse("MUTSEL{2.5e3, 5}"), Ok((2500.0, 5)));
+        assert_eq!(parse("MUTSEL{inf}"), Ok((f64::INFINITY, 3)));
+        assert_eq!(parse("MUTSEL{1000,19}"), Ok((1000.0, 19)));
+        assert_eq!(parse("MUTSEL{300/0}"), Ok((300.0, 0)));
+        assert_eq!(parse("MUTSEL{0}"), Ok((0.0, 3)));
+        assert_eq!(parse("MUTSEL{inf/5}"), Ok((f64::INFINITY, 5)));
+        for bad in ["MUTSEL{}", "MUTSEL{-1}", "MUTSEL{-inf}", "MUTSEL{nan}", "MUTSEL{1000,20}", "MUTSEL{1000,3,1}", "MUTSEL{1000/3/1}",
+                    "MUTSEL{1000,-3}", "MUTSEL{1000", "MUTSEL+G4", "LG"] {
+            assert!(parse(bad).is_err(), "{} parsed", bad);
+        }
+        assert!(LearnSettings::new(f64::INFINITY, 3).is_none());
+        assert!(LearnSettings::new(0.0, 3).is_some());
+    }
 
     /// Two component hyperprior with full covariances, and points drawn around shifted means
     fn setup() -> (Prior, Vec<Coordinates>) {
