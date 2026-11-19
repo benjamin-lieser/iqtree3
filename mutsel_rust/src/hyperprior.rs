@@ -46,9 +46,9 @@ pub struct LearnSettings {
 }
 
 impl LearnSettings {
-    /// Default strength tau of the hyperprior (MUTSEL{tau})
+    /// Default strength tau of the hyperprior (MUTSEL{tau}, see ModelParameters)
     pub const DEFAULT_STRENGTH: f64 = 1000.0;
-    /// Default rank of the covariances (MUTSEL{tau,rank})
+    /// Default rank of the covariances (MUTSEL{tau/rank})
     pub const DEFAULT_RANK: usize = 3;
 
     /// The hierarchical prior with strength tau and rank. tau = 0 fits it to the alignment alone (maximum
@@ -63,34 +63,6 @@ impl LearnSettings {
             return None;
         }
         Some(LearnSettings { strength, rank, max_iterations: env_or("MUTSEL_PRIOR_MSTEP_ITERATIONS", 200) })
-    }
-
-    /// tau and rank from the model string MUTSEL, MUTSEL{tau} or MUTSEL{tau/rank} (or MUTSEL{tau,rank}, which needs
-    /// quotes in a shell), case-insensitive name, tau >= 0 or inf, the defaults for the missing ones
-    pub fn parse_model(model: &str) -> std::result::Result<(f64, usize), String> {
-        let model = model.trim();
-        let usage = || format!("invalid model {}: use MUTSEL, MUTSEL{{tau}} or MUTSEL{{tau/rank}}, e.g. MUTSEL{{1000/3}} (tau >= 0, 0 to learn the prior from the alignment alone, inf to keep it fixed, rank 0 to {})", model, DIM);
-        if model.len() < 6 || !model[..6].eq_ignore_ascii_case("MUTSEL") {
-            return Err(usage());
-        }
-        let rest = &model[6..];
-        if rest.is_empty() {
-            return Ok((Self::DEFAULT_STRENGTH, Self::DEFAULT_RANK));
-        }
-        let params = rest.strip_prefix('{').and_then(|r| r.strip_suffix('}')).ok_or_else(usage)?;
-        let params: Vec<&str> = params.split([',', '/']).map(str::trim).collect();
-        if params.len() > 2 {
-            return Err(usage());
-        }
-        let strength: f64 = params[0].parse().map_err(|_| usage())?;
-        let rank = match params.get(1) {
-            Some(rank) => rank.parse().map_err(|_| usage())?,
-            None => Self::DEFAULT_RANK,
-        };
-        if !(strength >= 0.0) || rank > DIM {
-            return Err(usage());
-        }
-        Ok((strength, rank))
     }
 }
 
@@ -409,21 +381,7 @@ mod tests {
     use crate::prior::tests::isotropic_gmm;
 
     #[test]
-    fn model_string() {
-        let parse = LearnSettings::parse_model;
-        assert_eq!(parse("MUTSEL"), Ok((1000.0, 3)));
-        assert_eq!(parse(" mutsel "), Ok((1000.0, 3)));
-        assert_eq!(parse("MUTSEL{100}"), Ok((100.0, 3)));
-        assert_eq!(parse("MUTSEL{2.5e3, 5}"), Ok((2500.0, 5)));
-        assert_eq!(parse("MUTSEL{inf}"), Ok((f64::INFINITY, 3)));
-        assert_eq!(parse("MUTSEL{1000,19}"), Ok((1000.0, 19)));
-        assert_eq!(parse("MUTSEL{300/0}"), Ok((300.0, 0)));
-        assert_eq!(parse("MUTSEL{0}"), Ok((0.0, 3)));
-        assert_eq!(parse("MUTSEL{inf/5}"), Ok((f64::INFINITY, 5)));
-        for bad in ["MUTSEL{}", "MUTSEL{-1}", "MUTSEL{-inf}", "MUTSEL{nan}", "MUTSEL{1000,20}", "MUTSEL{1000,3,1}", "MUTSEL{1000/3/1}",
-                    "MUTSEL{1000,-3}", "MUTSEL{1000", "MUTSEL+G4", "LG"] {
-            assert!(parse(bad).is_err(), "{} parsed", bad);
-        }
+    fn infinite_strength_keeps_the_prior() {
         assert!(LearnSettings::new(f64::INFINITY, 3).is_none());
         assert!(LearnSettings::new(0.0, 3).is_some());
     }

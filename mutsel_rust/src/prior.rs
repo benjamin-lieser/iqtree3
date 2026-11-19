@@ -28,9 +28,20 @@ pub struct Prior {
     pub site_frequencies: Gmm,
     /// None if the site rates are all 1
     pub site_rate: Option<SiteRatePrior>,
+    /// lambda: the posterior of every site uses the site-frequency prior to the power lambda (its log density times
+    /// lambda, 1 by default, from the model string). The M-step of the hierarchical prior fits the untempered
+    /// mixture, and the marginal likelihoods (MUTSEL_HMC_MARGINAL) are only normalized for lambda = 1.
+    pub site_frequency_weight: f64,
 }
 
 impl Prior {
+    /// lambda times the log density of the site-frequency prior and its gradient, the prior term of the posterior
+    /// of a site (see site_frequency_weight)
+    pub fn evaluate_site_frequencies(&self, x: &SVector<f64, NUM_COORDINATES>) -> (f64, SVector<f64, NUM_COORDINATES>) {
+        let (log_density, grad) = self.site_frequencies.evaluate(x);
+        (self.site_frequency_weight * log_density, grad * self.site_frequency_weight)
+    }
+
     /// Log prior of the log exchangeabilities log_S and its gradient
     pub fn evaluate_exchangeabilities(&self, log_S: &[f64]) -> (f64, Vec<f64>) {
         let difference: Vec<f64> = log_S.iter().zip(&self.log_exchangeabilities).map(|(l, l0)| l - l0).collect();
@@ -103,6 +114,7 @@ impl Prior {
             exchangeability_reg: npz.get("exchangeability_reg")?.to_scalar()?,
             site_frequencies: Gmm::new(&npz.get("weights")?.data, &npz.get("means")?.rows()?, &npz.get("covs")?.data)?,
             site_rate: (site_rate_sd > 0.0).then_some(SiteRatePrior { sd: site_rate_sd }),
+            site_frequency_weight: 1.0,
         })
     }
 }
@@ -243,7 +255,19 @@ pub(crate) mod tests {
                 &[1.0, 1.4],
             ),
             site_rate: None,
+            site_frequency_weight: 1.0,
         }
+    }
+
+    #[test]
+    fn site_frequency_weight_tempers_the_prior() {
+        let x = SVector::from_fn(|i, _| 0.1 * (i as f64).sin());
+        let prior = test_prior();
+        let (log_p, grad) = prior.evaluate_site_frequencies(&x);
+        assert_eq!((log_p, grad), prior.site_frequencies.evaluate(&x));
+        let tempered = Prior { site_frequency_weight: 0.3, ..test_prior() };
+        let (log_t, grad_t) = tempered.evaluate_site_frequencies(&x);
+        assert!((log_t - 0.3 * log_p).abs() < 1e-12 && (grad_t - grad * 0.3).norm() < 1e-12);
     }
 
     #[test]

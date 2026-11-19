@@ -211,7 +211,7 @@ impl SharedModel {
 
     /// Log prior, S and sqrt_pi for the Helmert coordinates x
     fn evaluate(&self, x: &SVector<f64, NUM_COORDINATES>) -> SiteModelEval {
-        let (log_prior, grad_log_prior) = self.prior.site_frequencies.evaluate(x);
+        let (log_prior, grad_log_prior) = self.prior.evaluate_site_frequencies(x);
         // log_pi up to an additive constant
         let log_pi = self.basis.transpose() * x;
         let (S, sqrt_pi) = self.rate_matrix(&log_pi);
@@ -1297,10 +1297,11 @@ fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -
 /// afterwards reset to an average substitution rate of 1 over the posterior samples, rescaling the
 /// branch lengths so that the likelihood stays the same.
 ///
-/// The prior is hierarchical (see hyperprior.rs, unless prior_strength is inf or MUTSEL_PRIOR_LEARN=0): every M-step also fits the prior of
-/// the site frequencies (covariances of rank prior_rank plus diagonal) and the sd of the site rates to the posterior
-/// samples, regularized by the prior file as hyperprior of strength prior_strength (tau, in pseudo-sites), and the
-/// next E-step and the final sampling use the fitted prior, which is written to <out_prefix>.prior.npz.
+/// The prior is hierarchical (see hyperprior.rs, unless tau is inf or MUTSEL_PRIOR_LEARN=0): every M-step also fits the prior of
+/// the site frequencies (covariances of rank model.prior_rank plus diagonal) and the sd of the site rates to the posterior
+/// samples, regularized by the prior file as hyperprior of strength model.prior_strength (tau, in pseudo-sites), and the
+/// next E-step and the final sampling use the fitted prior, which is written to <out_prefix>.prior.npz. The
+/// posterior of every site uses the site-frequency prior to the power model.site_frequency_weight (lambda).
 pub fn sample_internal(
     parents: &[i32],
     branch_lengths: &[f64],
@@ -1309,14 +1310,13 @@ pub fn sample_internal(
     num_leaves: usize,
     verbosity: Verbosity,
     out_prefix: &str,
-    prior_strength: f64,
-    prior_rank: usize,
+    model: crate::ModelParameters,
 ) -> Result<(Vec<SMatrix<f64, 20, 20>>, Vec<SVector<f64, 20>>)> {
     let settings = HmcSettings::from_env();
     let em = EmSettings::from_env();
-    let prior = Arc::new(Prior::from_env());
+    let prior = Arc::new(Prior { site_frequency_weight: model.site_frequency_weight, ..Prior::from_env() });
     let fit_site_rate_sd = env_or("MUTSEL_SITE_RATE_FIT", 0u8) != 0;
-    let learn = LearnSettings::new(prior_strength, prior_rank);
+    let learn = LearnSettings::new(model.prior_strength, model.prior_rank);
     assert!(
         !fit_site_rate_sd || prior.site_rate.is_some(),
         "MUTSEL_SITE_RATE_FIT needs a starting site_rate_sd > 0 in the prior"
@@ -1364,6 +1364,12 @@ pub fn sample_internal(
         }
     } else {
         println!("MUTSEL HMC: the prior is fixed (tau = inf or MUTSEL_PRIOR_LEARN=0)");
+    }
+    if prior.site_frequency_weight != 1.0 {
+        println!(
+            "MUTSEL HMC: the site-frequency prior enters the posterior of every site to the power lambda = {}",
+            prior.site_frequency_weight
+        );
     }
     assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
 

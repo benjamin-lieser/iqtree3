@@ -6034,14 +6034,16 @@ void usage_iqtree(char* argv[], bool full_command) {
     << "  --tree-freq FILE     Input tree to infer site frequency model" << endl
     << "  --site-freq FILE     Input site frequency model file" << endl
     << "  --freq-max           Posterior maximum instead of mean approximation" << endl
-    << "  -m MUTSEL{TAU/RANK} --tree-freq FILE" << endl
+    << "  -m MUTSEL{TAU/RANK/LAMBDA} --tree-freq FILE" << endl
     << "                       Mutation-selection site model, estimated on the guide tree FILE" << endl
     << "                       with a prior learned per alignment: TAU is the strength of the" << endl
     << "                       built-in prior as its hyperprior in pseudo-sites (default: 1000;" << endl
     << "                       inf keeps the built-in prior fixed; 0 learns the prior from the" << endl
     << "                       alignment alone, without regularization, so the fit can degenerate," << endl
     << "                       e.g. on short alignments), RANK that of its covariances, 0 to 19" << endl
-    << "                       (default: 3). MUTSEL{TAU} uses the default rank, MUTSEL both" << endl
+    << "                       (default: 3), LAMBDA > 0 the power of the site-frequency prior in" << endl
+    << "                       the posterior of every site (default: 1; below 1 weaker, above 1" << endl
+    << "                       stronger). Trailing ones can be left out, e.g. MUTSEL{TAU}" << endl
     << "  --site-model-file FILE  MUTSEL: site model from an earlier run (.sitemodel)" << endl
 
     << endl << "TREE TOPOLOGY TEST:" << endl

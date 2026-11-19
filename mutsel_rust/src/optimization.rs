@@ -186,7 +186,7 @@ fn map_objective(parents: &[i32], columns: &[&[u8]], prior: &Prior, x: &[f64]) -
         .par_chunks_exact(NUM_COORDINATES)
         .zip(result.grad_log_pi.par_iter())
         .map(|(c, grad_log_pi)| {
-            let (log_prior, grad_log_prior) = prior.site_frequencies.evaluate(&SVector::from_column_slice(c));
+            let (log_prior, grad_log_prior) = prior.evaluate_site_frequencies(&SVector::from_column_slice(c));
             (log_prior, basis * grad_log_pi + grad_log_prior)
         })
         .unzip();
