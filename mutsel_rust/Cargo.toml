@@ -15,6 +15,11 @@ zip = { version = "9.2.0", default-features = false, features = ["deflate"] }
 name = "mutsel_rust"
 crate-type = ["staticlib", "rlib"]
 
+# Standalone simulator under a fitted model (not part of the IQ-TREE build, which runs cargo build --lib)
+[[bin]]
+name = "mutsel_simulate"
+path = "src/simulate.rs"
+
 [profile.release]
 lto = false # There seems to be an issue with LLVM which makes the code slower when using lto
 panic = 'abort'
