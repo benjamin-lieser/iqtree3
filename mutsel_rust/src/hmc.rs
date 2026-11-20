@@ -1007,7 +1007,7 @@ struct FittedModel {
     site_rate_prior: Option<SiteRatePrior>,
     /// Prior of the site frequencies (and exchangeabilities): the prior file, or the prior learned by EM
     prior: Arc<Prior>,
-    /// The learned mixture of factor analyzers, if the prior is learned (MUTSEL_PRIOR_LEARN)
+    /// The learned mixture of factor analyzers, if the prior is learned
     learned_gmm: Option<LowRankGmm>,
 }
 
@@ -1297,8 +1297,7 @@ fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -
 /// afterwards reset to an average substitution rate of 1 over the posterior samples, rescaling the
 /// branch lengths so that the likelihood stays the same.
 ///
-/// The prior is hierarchical (see hyperprior.rs, unless tau is inf or MUTSEL_PRIOR_LEARN=0): every M-step also fits the prior of
-/// the site frequencies (covariances of rank model.prior_rank plus diagonal) and the sd of the site rates to the posterior
+/// The prior is hierarchical (see hyperprior.rs, unless tau is inf): every M-step also fits the prior of
 /// samples, regularized by the prior file as hyperprior of strength model.prior_strength (tau, in pseudo-sites), and the
 /// next E-step and the final sampling use the fitted prior, which is written to <out_prefix>.prior.npz. The
 /// posterior of every site uses the site-frequency prior to the power model.site_frequency_weight (lambda).
@@ -1363,7 +1362,7 @@ pub fn sample_internal(
             println!("MUTSEL HMC: MUTSEL_SITE_RATE_FIT is replaced by the regularized fit of the hierarchical prior");
         }
     } else {
-        println!("MUTSEL HMC: the prior is fixed (tau = inf or MUTSEL_PRIOR_LEARN=0)");
+        println!("MUTSEL HMC: the prior is fixed (tau = inf)");
     }
     if prior.site_frequency_weight != 1.0 {
         println!(

@@ -34,7 +34,7 @@ const DIM: usize = NUM_COORDINATES;
 type Matrix = SMatrix<f64, DIM, DIM>;
 type Coordinates = SVector<f64, DIM>;
 
-/// Settings of the hierarchical prior, None (tau = inf or MUTSEL_PRIOR_LEARN=0) keeps the prior file fixed
+/// Settings of the hierarchical prior, None (tau = inf) keeps the prior file fixed
 #[derive(Debug, Clone, Copy)]
 pub struct LearnSettings {
     /// tau, the number of pseudo-sites of the hyperprior
@@ -54,12 +54,11 @@ impl LearnSettings {
     /// The hierarchical prior with strength tau and rank. tau = 0 fits it to the alignment alone (maximum
     /// likelihood, the prior file only as the start); nothing then regularizes the fit, so components can empty
     /// out or their covariances collapse, which is left to the user. tau = inf, the limit in which the prior stays the prior
-    /// file, or MUTSEL_PRIOR_LEARN=0 (default 1) keep the prior file fixed. MUTSEL_PRIOR_MSTEP_ITERATIONS sets the
-    /// L-BFGS iterations of its M-step.
+    /// file fixed. MUTSEL_PRIOR_MSTEP_ITERATIONS sets the L-BFGS iterations of its M-step.
     pub fn new(strength: f64, rank: usize) -> Option<LearnSettings> {
         assert!(strength >= 0.0, "the strength tau of the MUTSEL hyperprior must be at least 0 or inf, not {}", strength);
-        assert!(rank <= DIM, "the rank of the MUTSEL prior must be at most {}, not {}", DIM, rank);
-        if strength.is_infinite() || env_or("MUTSEL_PRIOR_LEARN", 1u8) == 0 {
+        assert!(rank <= DIM, "the rank of the MUTSEL prior must be at most {}, not {}", rank, DIM);
+        if strength.is_infinite() {
             return None;
         }
         Some(LearnSettings { strength, rank, max_iterations: env_or("MUTSEL_PRIOR_MSTEP_ITERATIONS", 200) })
