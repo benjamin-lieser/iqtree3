@@ -318,6 +318,8 @@ struct SiteSamples {
     mean_pi: SVector<f64, 20>,
     /// Posterior mean of the site rate over all draws, 1 if site rates are not sampled
     mean_site_rate: f64,
+    /// Posterior mean of the equilibrium flux r pi_i Q_ij over all draws (upper triangle)
+    mean_flux: SMatrix<f64, 20, 20>,
     num_draws: usize,
     /// Minimum over the Helmert coordinates of the effective sample size of all draws
     ess: f64,
@@ -331,6 +333,28 @@ struct SiteSamples {
     /// Log marginal likelihood (log likelihood and log prior integrated over the Helmert coordinates and the log
     /// site rate), NaN if not estimated
     log_marginal: f64,
+}
+
+/// Posterior means over the draws [n * dim] of the site frequencies, the site rate and the equilibrium flux
+/// r pi_i Q_ij = r S_ij sqrt(pi_i pi_j) (symmetric in every draw, upper triangle)
+fn posterior_means(shared: &SharedModel, draws: &[f64], dim: usize) -> (SVector<f64, 20>, f64, SMatrix<f64, 20, 20>) {
+    let mut mean_pi = SVector::<f64, 20>::zeros();
+    let mut mean_site_rate = 0.0;
+    let mut mean_flux = SMatrix::<f64, 20, 20>::zeros();
+    for draw in draws.chunks_exact(dim) {
+        let (log_pi, pi) = shared.pi(&SVector::<f64, NUM_COORDINATES>::from_column_slice(&draw[..NUM_COORDINATES]));
+        let rate = shared.site_rate(draw);
+        mean_pi += pi;
+        mean_site_rate += rate;
+        let (S, sqrt_pi) = shared.rate_matrix(&log_pi);
+        for i in 0..20 {
+            for j in (i + 1)..20 {
+                mean_flux[(i, j)] += rate * S[(i, j)] * sqrt_pi[i] * sqrt_pi[j];
+            }
+        }
+    }
+    let n = (draws.len() / dim) as f64;
+    (mean_pi / n, mean_site_rate / n, mean_flux / n)
 }
 
 /// Effective sample size of a single chain with Geyer's initial monotone sequence estimator.
@@ -479,20 +503,14 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
         }
     }
 
-    let mut mean_pi = SVector::<f64, 20>::zeros();
-    let mut mean_site_rate = 0.0;
-    for draw in draws.chunks_exact(dim) {
-        mean_pi += shared.pi(&SVector::<f64, NUM_COORDINATES>::from_column_slice(&draw[..NUM_COORDINATES])).1;
-        mean_site_rate += shared.site_rate(draw);
-    }
-    mean_pi /= num_draws as f64;
-    mean_site_rate /= num_draws as f64;
+    let (mean_pi, mean_site_rate, mean_flux) = posterior_means(&shared, &draws, dim);
 
     SiteSamples {
         dim,
         thinned_draws,
         mean_pi,
         mean_site_rate,
+        mean_flux,
         num_draws,
         ess,
         num_divergences,
@@ -993,6 +1011,37 @@ fn rate_matrices(
         .unzip()
 }
 
+/// MUTSEL_MEAN: how the posterior is summarized into one site model, "flux" (default) or "arith"
+fn flux_matched_mean() -> bool {
+    match std::env::var("MUTSEL_MEAN").as_deref() {
+        Err(_) | Ok("flux") => true,
+        Ok("arith") => false,
+        Ok(other) => panic!("MUTSEL_MEAN={other}: use flux or arith"),
+    }
+}
+
+/// Flux-matched posterior mean site models: stationary frequencies E[pi] and S_ij = E[r pi_i Q_ij] / sqrt(E[pi_i]
+/// E[pi_j]), so the reversible model has the posterior mean equilibrium flux of every pair (the pair distribution
+/// E[diag(pi) P(t)] matches to first order in t) and the posterior mean frequencies (t to infinity)
+fn flux_matched_rate_matrices(site_samples: &[SiteSamples]) -> (Vec<SMatrix<f64, 20, 20>>, Vec<SVector<f64, 20>>) {
+    site_samples.iter().map(|s| flux_matched_rate_matrix(&s.mean_pi, &s.mean_flux)).unzip()
+}
+
+fn flux_matched_rate_matrix(
+    mean_pi: &SVector<f64, 20>,
+    mean_flux: &SMatrix<f64, 20, 20>,
+) -> (SMatrix<f64, 20, 20>, SVector<f64, 20>) {
+    let sqrt_pi = mean_pi.map(f64::sqrt);
+    let mut S = SMatrix::<f64, 20, 20>::zeros();
+    for i in 0..20 {
+        for j in (i + 1)..20 {
+            S[(i, j)] = mean_flux[(i, j)] / (sqrt_pi[i] * sqrt_pi[j]);
+            S[(j, i)] = S[(i, j)];
+        }
+    }
+    (S, sqrt_pi)
+}
+
 /// Mu, the global rate normalization and the branch lengths the final sampling is conditioned on
 struct FittedModel {
     log_S: Vec<f64>,
@@ -1445,12 +1494,17 @@ pub fn sample_internal(
     let mean_pi: Vec<SVector<f64, 20>> = site_samples.iter().map(|s| s.mean_pi).collect();
     let mean_site_rate: Vec<f64> = site_samples.iter().map(|s| s.mean_site_rate).collect();
 
-    let (S, sqrt_pi) = rate_matrices(&shared, &mean_pi, &mean_site_rate);
+    let (S, sqrt_pi) = if flux_matched_mean() {
+        flux_matched_rate_matrices(&site_samples)
+    } else {
+        rate_matrices(&shared, &mean_pi, &mean_site_rate)
+    };
     let average_rate_mean_pi =
         S.iter().zip(&sqrt_pi).map(|(S, sqrt_pi)| model::substitution_rate(S, sqrt_pi)).sum::<f64>() / num_sites as f64;
     if verbosity.should_print(Verbosity::Min) {
         println!(
-            "MUTSEL HMC: average substitution rate at posterior mean frequencies {:.4}",
+            "MUTSEL HMC: average substitution rate of the posterior mean site models ({}) {:.4}",
+            if flux_matched_mean() { "flux-matched: E[pi] and the posterior mean flux r pi_i Q_ij" } else { "E[pi] and E[r]" },
             average_rate_mean_pi
         );
     }
@@ -1632,6 +1686,32 @@ mod tests {
             let fd = (logp.logp(&xp, &mut dummy).unwrap() - logp.logp(&xm, &mut dummy).unwrap()) / (2.0 * eps);
             assert!((fd - grad[i]).abs() < 1e-5 * (1.0 + fd.abs()), "component {}: finite difference {} vs gradient {}", i, fd, grad[i]);
         }
+    }
+
+    #[test]
+    fn flux_matched_mean_site_model() {
+        let shared = test_shared(RATE_SCALING).with_site_rate_prior(Some(SiteRatePrior { sd: 0.5 }));
+        let a: Vec<f64> = test_point().into_iter().chain([0.3]).collect();
+        let b: Vec<f64> = (0..NUM_COORDINATES).map(|i| -0.8 * ((i as f64) * 0.9).cos()).chain([-0.6]).collect();
+        let dim = NUM_COORDINATES + 1;
+        let model_rate = |draw: &[f64]| {
+            let (S, sqrt_pi) = shared.rate_matrix(&shared.pi(&SVector::from_column_slice(&draw[..NUM_COORDINATES])).0);
+            (S * shared.site_rate(draw), sqrt_pi)
+        };
+        // a posterior concentrated on one point gives that point's model
+        let (pi, _, flux) = posterior_means(&shared, &[a.clone(), a.clone()].concat(), dim);
+        let (S, sqrt_pi) = flux_matched_rate_matrix(&pi, &flux);
+        let (S_a, sqrt_pi_a) = model_rate(&a);
+        assert!((S - S_a).abs().max() < 1e-12 * S_a.abs().max());
+        assert!((sqrt_pi - sqrt_pi_a).abs().max() < 1e-12);
+        // two points: the stationary frequencies are the mean, the total rate the mean of r times the rate
+        let (pi, _, flux) = posterior_means(&shared, &[a.clone(), b.clone()].concat(), dim);
+        let (S, sqrt_pi) = flux_matched_rate_matrix(&pi, &flux);
+        assert!((sqrt_pi.map(|x| x * x) - pi).abs().max() < 1e-14);
+        assert!((S - S.transpose()).abs().max() == 0.0);
+        let expected = 0.5 * [&a, &b].iter().map(|d| { let (S, p) = model_rate(d); model::substitution_rate(&S, &p) }).sum::<f64>();
+        let rate = model::substitution_rate(&S, &sqrt_pi);
+        assert!((rate - expected).abs() < 1e-12 * expected, "{rate} vs {expected}");
     }
 
     #[test]
