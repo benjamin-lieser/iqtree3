@@ -93,14 +93,14 @@ impl Hyperprior {
     }
 
     /// M-step of the sd of the site rates: maximizes the log prior of the log site rates log_rates, each with the
-    /// weight point_weight, plus that of the tau pseudo-sites with log rates from N(-sd0^2/2, sd0^2). As in
+    /// its weight (log_rates yields (log rate, weight)), plus that of the tau pseudo-sites with log rates from N(-sd0^2/2, sd0^2). As in
     /// SiteRatePrior::fit, only the mean of l^2 enters, sd^4 / 4 + sd^2 = mean(l^2), with the pseudo-sites
     /// contributing E[l^2] = sd0^2 + sd0^4 / 4.
-    pub fn fit_site_rate(&self, log_rates: impl Iterator<Item = f64>, point_weight: f64) -> Option<SiteRatePrior> {
+    pub fn fit_site_rate(&self, log_rates: impl Iterator<Item = (f64, f64)>) -> Option<SiteRatePrior> {
         let sd0 = self.site_rate_sd?;
-        let (sum, count) = log_rates.fold((0.0, 0usize), |(sum, count), l| (sum + l * l, count + 1));
+        let (sum, total) = log_rates.fold((0.0, 0.0), |(sum, total), (l, w)| (sum + w * l * l, total + w));
         let pseudo_mean_square = sd0 * sd0 + sd0.powi(4) / 4.0;
-        let mean_square = (point_weight * sum + self.strength * pseudo_mean_square) / (point_weight * count as f64 + self.strength);
+        let mean_square = (sum + self.strength * pseudo_mean_square) / (total + self.strength);
         Some(SiteRatePrior { sd: (2.0 * ((1.0 + mean_square).sqrt() - 1.0)).sqrt() })
     }
 }
@@ -202,16 +202,17 @@ impl LowRankGmm {
     }
 
     /// M-step: maximizes objective() over the parameters with L-BFGS, starting from the current ones
-    pub fn fit(&mut self, points: &[Coordinates], point_weight: f64, hyper: &Hyperprior, max_iterations: usize) -> FitReport {
+    /// point_weights [points.len()]: the weight of every point
+    pub fn fit(&mut self, points: &[Coordinates], point_weights: &[f64], hyper: &Hyperprior, max_iterations: usize) -> FitReport {
         // Relative improvement of the objective per L-BFGS iteration below which the M-step stops
         const REL_IMPROVEMENT: f64 = 1e-10;
         let start = std::time::Instant::now();
-        let before = self.objective(points, point_weight, hyper).expect("the starting covariances are positive definite");
+        let before = self.objective(points, point_weights, hyper).expect("the starting covariances are positive definite");
         let mut num_evaluations = 0;
         let optimum = lbfgs(
             |params| {
                 num_evaluations += 1;
-                let (value, gradient) = self.from_params(params.as_slice()).objective_and_gradient(points, point_weight, hyper)?;
+                let (value, gradient) = self.from_params(params.as_slice()).objective_and_gradient(points, point_weights, hyper)?;
                 value.total().is_finite().then(|| (value.total(), DVector::from_vec(gradient)))
             },
             self.to_params(),
@@ -220,17 +221,18 @@ impl LowRankGmm {
             REL_IMPROVEMENT,
         );
         *self = self.from_params(optimum.as_slice());
-        let after = self.objective(points, point_weight, hyper).expect("L-BFGS only accepts finite points");
+        let after = self.objective(points, point_weights, hyper).expect("L-BFGS only accepts finite points");
         FitReport { before, after, num_evaluations, seconds: start.elapsed().as_secs_f64() }
     }
 
-    pub fn objective(&self, points: &[Coordinates], point_weight: f64, hyper: &Hyperprior) -> Option<Objective> {
-        self.objective_and_gradient(points, point_weight, hyper).map(|(value, _)| value)
+    pub fn objective(&self, points: &[Coordinates], point_weights: &[f64], hyper: &Hyperprior) -> Option<Objective> {
+        self.objective_and_gradient(points, point_weights, hyper).map(|(value, _)| value)
     }
 
-    /// Weighted log density of the points (each with point_weight) plus the log hyperprior (up to constants), and
+    /// Weighted log density of the points (each with its point_weights entry) plus the log hyperprior (up to constants), and
     /// its gradient in the layout of to_params. None if a covariance is not positive definite.
-    fn objective_and_gradient(&self, points: &[Coordinates], point_weight: f64, hyper: &Hyperprior) -> Option<(Objective, Vec<f64>)> {
+    fn objective_and_gradient(&self, points: &[Coordinates], point_weights: &[f64], hyper: &Hyperprior) -> Option<(Objective, Vec<f64>)> {
+        assert_eq!(points.len(), point_weights.len());
         let num_components = self.num_components();
         let weights = self.weights();
         let mut precisions = Vec::with_capacity(num_components);
@@ -250,11 +252,12 @@ impl LowRankGmm {
         // the log density of the mixture is that of sum_k sum_n gamma_nk log(w_k N(x_n; mu_k, Sigma_k)) with gamma fixed.
         let stats = points
             .par_chunks(256)
-            .fold(
-                || Statistics::new(num_components),
-                |mut stats, chunk| {
+            .zip(point_weights.par_chunks(256))
+            .map(
+                |(chunk, chunk_weights)| {
+                    let mut stats = Statistics::new(num_components);
                     let mut log_densities = vec![0.0; num_components];
-                    for x in chunk {
+                    for (x, &point_weight) in chunk.iter().zip(chunk_weights) {
                         for k in 0..num_components {
                             let d = x - self.means[k];
                             log_densities[k] = log_norms[k] - 0.5 * d.dot(&(precisions[k] * d));
@@ -276,7 +279,10 @@ impl LowRankGmm {
                     stats
                 },
             )
-            .reduce(|| Statistics::new(num_components), Statistics::add);
+            // Chunks of fixed size summed in order: the result does not depend on the threads (reproducible)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .fold(Statistics::new(num_components), Statistics::add);
 
         let total_points: f64 = stats.n.iter().sum();
         let size = self.component_size();
@@ -416,14 +422,14 @@ mod tests {
             *p += 0.05 * ((i as f64) * 1.3).sin();
         }
         model = model.from_params(params.as_slice());
-        let (_, gradient) = model.objective_and_gradient(&points, 0.25, &hyper).unwrap();
+        let (_, gradient) = model.objective_and_gradient(&points, &vec![0.25; points.len()], &hyper).unwrap();
         let h = 1e-5;
         for i in 0..params.len() {
             let mut plus = params.clone();
             plus[i] += h;
             let mut minus = params.clone();
             minus[i] -= h;
-            let f = |p: &DVector<f64>| model.from_params(p.as_slice()).objective(&points, 0.25, &hyper).unwrap().total();
+            let f = |p: &DVector<f64>| model.from_params(p.as_slice()).objective(&points, &vec![0.25; points.len()], &hyper).unwrap().total();
             let fd = (f(&plus) - f(&minus)) / (2.0 * h);
             assert!((fd - gradient[i]).abs() < 1e-5 * (1.0 + gradient[i].abs()), "{}: {} vs {}", i, fd, gradient[i]);
         }
@@ -447,7 +453,7 @@ mod tests {
         for strength in [1.0, 1e7] {
             let hyper = Hyperprior::new(&prior, strength);
             let mut model = LowRankGmm::from_gmm(&prior.site_frequencies, 3);
-            let report = model.fit(&points, 0.5, &hyper, 500);
+            let report = model.fit(&points, &vec![0.5; points.len()], &hyper, 500);
             assert!(report.after.total() >= report.before.total());
             let shift: f64 = (0..2).map(|k| (model.means[k] - prior.site_frequencies.means()[k]).norm()).sum();
             moved.push(shift);
@@ -466,7 +472,7 @@ mod tests {
         let hyper = Hyperprior::new(&prior, 1e8);
         let mut model = LowRankGmm::from_gmm(&prior.site_frequencies, 2);
         let points: Vec<Coordinates> = (0..50).map(|n| SVector::from_fn(|i, _| ((n + 3 * i) as f64).sin())).collect();
-        model.fit(&points, 1.0, &hyper, 500);
+        model.fit(&points, &vec![1.0; points.len()], &hyper, 500);
         for k in 0..2 {
             assert!((model.covariance(k) - prior.site_frequencies.covs()[k]).abs().max() < 1e-4);
         }
@@ -479,8 +485,8 @@ mod tests {
         let (prior, points) = setup();
         let hyper = Hyperprior::new(&prior, 1e-9);
         let mut model = LowRankGmm::from_gmm(&prior.site_frequencies, 3);
-        model.fit(&points, 1.0, &hyper, 1000);
-        let (_, gradient) = model.objective_and_gradient(&points, 1.0, &hyper).unwrap();
+        model.fit(&points, &vec![1.0; points.len()], &hyper, 1000);
+        let (_, gradient) = model.objective_and_gradient(&points, &vec![1.0; points.len()], &hyper).unwrap();
         for k in 0..2 {
             assert!(gradient[k * model.component_size()].abs() < 1e-3 * points.len() as f64, "{}", gradient[k * model.component_size()]);
         }
@@ -492,11 +498,27 @@ mod tests {
         // Log rates with mean square 4 alone give sd about 1.287, the hyperprior sd is 0.8
         let log_rates = vec![2.0, -2.0];
         let free = SiteRatePrior::fit(log_rates.iter().copied()).sd;
-        let weak = Hyperprior::new(&prior, 1e-9).fit_site_rate(log_rates.iter().copied(), 1.0).unwrap().sd;
-        let strong = Hyperprior::new(&prior, 1e9).fit_site_rate(log_rates.iter().copied(), 1.0).unwrap().sd;
-        let half = Hyperprior::new(&prior, 2.0).fit_site_rate(log_rates.iter().copied(), 1.0).unwrap().sd;
+        let weak = Hyperprior::new(&prior, 1e-9).fit_site_rate(log_rates.iter().map(|&l| (l, 1.0))).unwrap().sd;
+        let strong = Hyperprior::new(&prior, 1e9).fit_site_rate(log_rates.iter().map(|&l| (l, 1.0))).unwrap().sd;
+        let half = Hyperprior::new(&prior, 2.0).fit_site_rate(log_rates.iter().map(|&l| (l, 1.0))).unwrap().sd;
         assert!((weak - free).abs() < 1e-8);
         assert!((strong - 0.8).abs() < 1e-8);
         assert!(half > 0.8 && half < free);
+    }
+
+    #[test]
+    fn point_weights_count_duplicated_points() {
+        let (prior, points) = setup();
+        let hyper = Hyperprior::new(&prior, 3.0);
+        let model = LowRankGmm::from_gmm(&prior.site_frequencies, 3);
+        let weights: Vec<f64> = (0..points.len()).map(|n| (1 + n % 3) as f64).collect();
+        let duplicated: Vec<Coordinates> =
+            points.iter().zip(&weights).flat_map(|(x, &w)| std::iter::repeat(*x).take(w as usize)).collect();
+        let (a, ga) = model.objective_and_gradient(&points, &weights, &hyper).unwrap();
+        let (b, gb) = model.objective_and_gradient(&duplicated, &vec![1.0; duplicated.len()], &hyper).unwrap();
+        assert!((a.total() - b.total()).abs() < 1e-9 * b.total().abs());
+        for (x, y) in ga.iter().zip(&gb) {
+            assert!((x - y).abs() < 1e-8 * (1.0 + y.abs()), "{} vs {}", x, y);
+        }
     }
 }

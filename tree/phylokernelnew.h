@@ -1321,6 +1321,11 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
 	}
     
     size_t ncat = site_rate->getNRate();
+    // site-specific model with posterior draws (RateSiteDraws): one model and tip vector per pattern and category,
+    // stored like the partial likelihoods, eval_step/evec_step advance them per category in VectorClass units
+    const size_t ndraws = SITE_MODEL ? model->getNSiteDraws() : 1;
+    const size_t eval_step = (ndraws > 1) ? nstates : 0;
+    const size_t evec_step = eval_step*nstates;
     size_t ncat_mix = (model_factory->fused_mix_rate) ? ncat : ncat*model->getNMixtures();
     size_t mix_addr_nstates_malign[ncat_mix], mix_addr_malign[ncat_mix];
     size_t denom = (model_factory->fused_mix_rate) ? 1 : ncat;
@@ -1330,7 +1335,7 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
         mix_addr_malign[c] = mix_addr_nstates_malign[c]*nstates;
     }
     size_t block = nstates * ncat_mix;
-    size_t tip_mem_size = max_orig_nptn * nstates;
+    size_t tip_mem_size = max_orig_nptn * nstates * ndraws;
     size_t scale_size = SAFE_NUMERIC ? (ptn_upper-ptn_lower) * ncat_mix : (ptn_upper-ptn_lower);
 
 	double *evec = model->getEigenvectors();
@@ -1425,8 +1430,8 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
 
             // SITE_MODEL variables
             VectorClass *expchild = partial_lh_all + block;
-            const VectorClass *eval_ptr = (VectorClass*) &eval[ptn*nstates];
-            VectorClass *evec_ptr = (VectorClass*) &evec[ptn*states_square];
+            const VectorClass *eval_ptr = (VectorClass*) &eval[ptn*ndraws*nstates];
+            VectorClass *evec_ptr = (VectorClass*) &evec[ptn*ndraws*states_square];
             double *len_child = len_children;
             VectorClass vchild;
 
@@ -1441,13 +1446,13 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
                     VectorClass *partial_lh = partial_lh_all;
                     if (child->node->isLeaf()) {
                         // external node
-                        const VectorClass *tip_partial_lh_child = (VectorClass*) &tip_partial_lh[(child->node->id*tip_mem_size) + (ptn*nstates)];
+                        const VectorClass *tip_partial_lh_child = (VectorClass*) &tip_partial_lh[(child->node->id*tip_mem_size) + (ptn*ndraws*nstates)];
                         for (size_t c = 0; c < ncat; c++) {
                             for (size_t i = 0; i < nstates; i++) {
-                                expchild[i] = exp(eval_ptr[i]*len_child[c]) * tip_partial_lh_child[i];
+                                expchild[i] = exp(eval_ptr[c*eval_step+i]*len_child[c]) * tip_partial_lh_child[c*eval_step+i];
                             }
                             for (size_t x = 0; x < nstates; x++) {
-                                VectorClass *this_evec = &evec_ptr[x*nstates];
+                                VectorClass *this_evec = &evec_ptr[c*evec_step+x*nstates];
 #ifdef KERNEL_FIX_STATES
                                 dotProductVec<VectorClass, VectorClass, nstates, FMA>(expchild, this_evec, vchild);
 #else
@@ -1472,9 +1477,9 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
                             }
                             // compute real partial likelihood vector
                             for (size_t i = 0; i < nstates; i++)
-                                expchild[i] = exp(eval_ptr[i]*len_child[c]) * partial_lh_child[i];
+                                expchild[i] = exp(eval_ptr[c*eval_step+i]*len_child[c]) * partial_lh_child[i];
                             for (size_t x = 0; x < nstates; x++) {
-                                VectorClass *this_evec = &evec_ptr[x*nstates];
+                                VectorClass *this_evec = &evec_ptr[c*evec_step+x*nstates];
 #ifdef KERNEL_FIX_STATES
                                 dotProductVec<VectorClass, VectorClass, nstates, FMA>(expchild, this_evec, vchild);
 #else
@@ -1606,14 +1611,14 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
             VectorClass *partial_lh_tmp = partial_lh_all;
             VectorClass *partial_lh = (VectorClass*)(dad_branch->partial_lh + (ptn*block));
             VectorClass lh_max = 0.0;
-            double *inv_evec_ptr = SITE_MODEL ? &inv_evec[ptn*states_square] : nullptr;
+            double *inv_evec_ptr = SITE_MODEL ? &inv_evec[ptn*ndraws*states_square] : nullptr;
             for (size_t c = 0; c < ncat_mix; c++) {
                 if (SITE_MODEL) {
                     // compute dot-product with inv_eigenvector
 #ifdef KERNEL_FIX_STATES
-                    productVecMat<VectorClass, VectorClass, nstates, FMA>(partial_lh_tmp, (VectorClass*)inv_evec_ptr, partial_lh);
+                    productVecMat<VectorClass, VectorClass, nstates, FMA>(partial_lh_tmp, (VectorClass*)inv_evec_ptr + c*evec_step, partial_lh);
 #else
-                    productVecMat<VectorClass, VectorClass, FMA> (partial_lh_tmp, (VectorClass*)inv_evec_ptr, partial_lh, nstates);
+                    productVecMat<VectorClass, VectorClass, FMA> (partial_lh_tmp, (VectorClass*)inv_evec_ptr + c*evec_step, partial_lh, nstates);
 #endif
                 } else {
                     inv_evec_ptr = inv_evec + mix_addr_malign[c];
@@ -1654,20 +1659,20 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
             if (SITE_MODEL) {
                 VectorClass* expleft = (VectorClass*) vec_left;
                 VectorClass* expright = (VectorClass*) vec_right;
-                const VectorClass *vleft = (VectorClass*) &partial_lh_left[ptn*nstates];
-                const VectorClass *vright = (VectorClass*) &partial_lh_right[ptn*nstates];
-                const VectorClass *eval_ptr = (VectorClass*) &eval[ptn*nstates];
-                VectorClass *evec_ptr = (VectorClass*) &evec[ptn*states_square];
-                VectorClass *inv_evec_ptr = (VectorClass*) &inv_evec[ptn*states_square];
+                const VectorClass *vleft = (VectorClass*) &partial_lh_left[ptn*ndraws*nstates];
+                const VectorClass *vright = (VectorClass*) &partial_lh_right[ptn*ndraws*nstates];
+                const VectorClass *eval_ptr = (VectorClass*) &eval[ptn*ndraws*nstates];
+                VectorClass *evec_ptr = (VectorClass*) &evec[ptn*ndraws*states_square];
+                VectorClass *inv_evec_ptr = (VectorClass*) &inv_evec[ptn*ndraws*states_square];
                 for (size_t c = 0; c < ncat; c++) {
                     for (size_t i = 0; i < nstates; i++) {
-                        expleft[i] = exp(eval_ptr[i]*len_left[c]) * vleft[i];
-                        expright[i] = exp(eval_ptr[i]*len_right[c]) * vright[i];
+                        expleft[i] = exp(eval_ptr[c*eval_step+i]*len_left[c]) * vleft[c*eval_step+i];
+                        expright[i] = exp(eval_ptr[c*eval_step+i]*len_right[c]) * vright[c*eval_step+i];
 
                     }
                     // compute real partial likelihood vector
                     for (size_t x = 0; x < nstates; x++) {
-                        VectorClass *this_evec = evec_ptr + x*nstates;
+                        VectorClass *this_evec = evec_ptr + c*evec_step + x*nstates;
 #ifdef KERNEL_FIX_STATES
                         dotProductDualVec<VectorClass, VectorClass, nstates, FMA>(this_evec, expleft, this_evec, expright, partial_lh_tmp[x]);
 #else
@@ -1676,9 +1681,9 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
                     }
                     // compute dot-product with inv_eigenvector
 #ifdef KERNEL_FIX_STATES
-                    productVecMat<VectorClass, VectorClass, nstates, FMA>(partial_lh_tmp, inv_evec_ptr, partial_lh);
+                    productVecMat<VectorClass, VectorClass, nstates, FMA>(partial_lh_tmp, inv_evec_ptr + c*evec_step, partial_lh);
 #else
-                    productVecMat<VectorClass, VectorClass, FMA> (partial_lh_tmp, inv_evec_ptr, partial_lh, nstates);
+                    productVecMat<VectorClass, VectorClass, FMA> (partial_lh_tmp, inv_evec_ptr + c*evec_step, partial_lh, nstates);
 #endif
                     partial_lh += nstates;
                 } // FOR category
@@ -1773,18 +1778,18 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
             if (SITE_MODEL) {
                 VectorClass *expleft = (VectorClass*)vec_left;
                 VectorClass *expright = expleft+nstates;
-                const VectorClass *vleft = (VectorClass*)&partial_lh_left[ptn*nstates];
-                const VectorClass *eval_ptr = (VectorClass*) &eval[ptn*nstates];
-                VectorClass *evec_ptr = (VectorClass*) &evec[ptn*states_square];
-                VectorClass *inv_evec_ptr = (VectorClass*) &inv_evec[ptn*states_square];
+                const VectorClass *vleft = (VectorClass*)&partial_lh_left[ptn*ndraws*nstates];
+                const VectorClass *eval_ptr = (VectorClass*) &eval[ptn*ndraws*nstates];
+                VectorClass *evec_ptr = (VectorClass*) &evec[ptn*ndraws*states_square];
+                VectorClass *inv_evec_ptr = (VectorClass*) &inv_evec[ptn*ndraws*states_square];
                 for (size_t c = 0; c < ncat; c++) {
                     for (size_t i = 0; i < nstates; i++) {
-                        expleft[i] = exp(eval_ptr[i]*len_left[c]) * vleft[i];
-                        expright[i] = exp(eval_ptr[i]*len_right[c]) * partial_lh_right[i];
+                        expleft[i] = exp(eval_ptr[c*eval_step+i]*len_left[c]) * vleft[c*eval_step+i];
+                        expright[i] = exp(eval_ptr[c*eval_step+i]*len_right[c]) * partial_lh_right[i];
                     }
                     // compute real partial likelihood vector
                     for (size_t x = 0; x < nstates; x++) {
-                        VectorClass *this_evec = evec_ptr + x*nstates;
+                        VectorClass *this_evec = evec_ptr + c*evec_step + x*nstates;
 #ifdef KERNEL_FIX_STATES
                         dotProductDualVec<VectorClass, VectorClass, nstates, FMA>(this_evec, expleft, this_evec, expright, partial_lh_tmp[x]);
 #else
@@ -1793,9 +1798,9 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
                     }
                     // compute dot-product with inv_eigenvector
 #ifdef KERNEL_FIX_STATES
-                    productVecMat<VectorClass, VectorClass, nstates, FMA>(partial_lh_tmp, inv_evec_ptr, partial_lh, lh_max);
+                    productVecMat<VectorClass, VectorClass, nstates, FMA>(partial_lh_tmp, inv_evec_ptr + c*evec_step, partial_lh, lh_max);
 #else
-                    productVecMat<VectorClass, VectorClass, FMA> (partial_lh_tmp, inv_evec_ptr, partial_lh, lh_max, nstates);
+                    productVecMat<VectorClass, VectorClass, FMA> (partial_lh_tmp, inv_evec_ptr + c*evec_step, partial_lh, lh_max, nstates);
 #endif
                     // check if one should scale partial likelihoods
                     if (SAFE_NUMERIC) {
@@ -1938,9 +1943,9 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
             if (SITE_MODEL) {
                 expleft = partial_lh_tmp + nstates;
                 expright = expleft + nstates;
-                eval_ptr = (VectorClass*) &eval[ptn*nstates];
-                evec_ptr = (VectorClass*) &evec[ptn*states_square];
-                inv_evec_ptr = (VectorClass*) &inv_evec[ptn*states_square];
+                eval_ptr = (VectorClass*) &eval[ptn*ndraws*nstates];
+                evec_ptr = (VectorClass*) &evec[ptn*ndraws*states_square];
+                inv_evec_ptr = (VectorClass*) &inv_evec[ptn*ndraws*states_square];
             }
 
 			for (size_t c = 0; c < ncat_mix; c++) {
@@ -1953,11 +1958,11 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
                 if (SITE_MODEL) {
                     // site-specific model
                     for (size_t i = 0; i < nstates; i++) {
-                        expleft[i] = exp(eval_ptr[i]*len_left[c]) * partial_lh_left[i];
-                        expright[i] = exp(eval_ptr[i]*len_right[c]) * partial_lh_right[i];
+                        expleft[i] = exp(eval_ptr[c*eval_step+i]*len_left[c]) * partial_lh_left[i];
+                        expright[i] = exp(eval_ptr[c*eval_step+i]*len_right[c]) * partial_lh_right[i];
                     }
                     for (size_t x = 0; x < nstates; x++) {
-                        VectorClass *this_evec = evec_ptr + x*nstates;
+                        VectorClass *this_evec = evec_ptr + c*evec_step + x*nstates;
 #ifdef KERNEL_FIX_STATES
                         dotProductDualVec<VectorClass, VectorClass, nstates, FMA>(this_evec, expleft, this_evec, expright, partial_lh_tmp[x]);
 #else
@@ -1965,9 +1970,9 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
 #endif
                     }
 #ifdef KERNEL_FIX_STATES
-                    productVecMat<VectorClass, VectorClass, nstates, FMA>(partial_lh_tmp, inv_evec_ptr, partial_lh, lh_max);
+                    productVecMat<VectorClass, VectorClass, nstates, FMA>(partial_lh_tmp, inv_evec_ptr + c*evec_step, partial_lh, lh_max);
 #else
-                    productVecMat<VectorClass, VectorClass, FMA> (partial_lh_tmp, inv_evec_ptr, partial_lh, lh_max, nstates);
+                    productVecMat<VectorClass, VectorClass, FMA> (partial_lh_tmp, inv_evec_ptr + c*evec_step, partial_lh, lh_max, nstates);
 #endif
                 } else {
                     // normal model
@@ -2068,6 +2073,10 @@ void PhyloTree::computeLikelihoodBufferGenericSIMD(PhyloNeighbor *dad_branch, Ph
     size_t max_orig_nptn = roundUpToMultiple(orig_nptn,VectorClass::size());
     size_t nptn = max_orig_nptn+model_factory->unobserved_ptns.size();
     size_t ncat = site_rate->getNRate();
+    // site-specific model with posterior draws (RateSiteDraws): one model and tip vector per pattern and category,
+    // stored like the partial likelihoods, eval_step advances them per category in VectorClass units
+    const size_t ndraws = SITE_MODEL ? model->getNSiteDraws() : 1;
+    const size_t eval_step = (ndraws > 1) ? nstates : 0;
     size_t ncat_mix = (model_factory->fused_mix_rate) ? ncat : ncat*model->getNMixtures();
     size_t block = ncat_mix * nstates;
     size_t tip_block = nstates * model->getNMixtures();
@@ -2093,7 +2102,7 @@ void PhyloTree::computeLikelihoodBufferGenericSIMD(PhyloNeighbor *dad_branch, Ph
 
     if (dad->isLeaf()) {
         // special treatment for TIP-INTERNAL NODE case
-        double *tip_partial_lh_node = &tip_partial_lh[dad->id * max_orig_nptn * nstates];
+        double *tip_partial_lh_node = &tip_partial_lh[dad->id * max_orig_nptn * nstates * ndraws];
         double *vec_tip = buffer_partial_lh_ptr + tip_block * VectorClass::size() * packet_id;
         auto stateRow = this->getConvertedSequenceByNumber(dad->id);
         auto unknown  = aln->STATE_UNKNOWN;
@@ -2130,14 +2139,14 @@ void PhyloTree::computeLikelihoodBufferGenericSIMD(PhyloNeighbor *dad_branch, Ph
             }
             VectorClass *lh_tip;
             if (SITE_MODEL) {
-                lh_tip = (VectorClass*)&tip_partial_lh_node[ptn*nstates];
+                lh_tip = (VectorClass*)&tip_partial_lh_node[ptn*ndraws*nstates];
             }
             for (size_t c = 0; c < ncat_mix; c++) {
                 if (!SITE_MODEL) {
                     lh_tip = (VectorClass*)(vec_tip + mix_addr_nstates[c]*VectorClass::size());
                 }
                 for (size_t i = 0; i < nstates; i++) {
-                    theta[i] = lh_tip[i] * partial_lh_dad[i];
+                    theta[i] = lh_tip[c*eval_step+i] * partial_lh_dad[i];
                 }
                 partial_lh_dad += nstates;
                 theta += nstates;
@@ -2267,6 +2276,10 @@ void PhyloTree::computeLikelihoodDervGenericSIMD(PhyloNeighbor *dad_branch, Phyl
     size_t nstates = aln->num_states;
 #endif
     size_t ncat = site_rate->getNRate();
+    // site-specific model with posterior draws (RateSiteDraws): one model and tip vector per pattern and category,
+    // stored like the partial likelihoods, eval_step advances them per category in VectorClass units
+    const size_t ndraws = SITE_MODEL ? model->getNSiteDraws() : 1;
+    const size_t eval_step = (ndraws > 1) ? nstates : 0;
     size_t ncat_mix = (model_factory->fused_mix_rate) ? ncat : ncat*model->getNMixtures();
     size_t block = ncat_mix * nstates;
 
@@ -2412,7 +2425,7 @@ void PhyloTree::computeLikelihoodDervGenericSIMD(PhyloNeighbor *dad_branch, Phyl
                 }
                 VectorClass *theta = (VectorClass*)(theta_all + (ptn*block));
                 if (SITE_MODEL) {
-                    const VectorClass* eval_ptr = (VectorClass*) &eval[ptn*nstates];
+                    const VectorClass* eval_ptr = (VectorClass*) &eval[ptn*ndraws*nstates];
                     for (size_t i = 0; i < nmixlen; i++) {
                         double len = dad_branch->getLength(i);
                         VectorClass lh_cat(0.0), df_cat(0.0), ddf_cat(0.0);
@@ -2493,12 +2506,12 @@ void PhyloTree::computeLikelihoodDervGenericSIMD(PhyloNeighbor *dad_branch, Phyl
                 lh_ptn = df_ptn = ddf_ptn = 0.0;
                 VectorClass *theta = (VectorClass*)(theta_all + (ptn*block));
                 if (SITE_MODEL) {
-                    const VectorClass* eval_ptr = (VectorClass*) &eval[ptn*nstates];
+                    const VectorClass* eval_ptr = (VectorClass*) &eval[ptn*ndraws*nstates];
                     for (size_t c = 0; c < ncat; c++) {
                         double len = dad_branch->length;
                         VectorClass lh_cat(0.0), df_cat(0.0), ddf_cat(0.0);
                         for (size_t x = 0; x < nstates; x++) {
-                            VectorClass cof = eval_ptr[x] * cat_rate[c];
+                            VectorClass cof = eval_ptr[c*eval_step+x] * cat_rate[c];
                             VectorClass lh = exp(cof*len)*theta[x];
                             VectorClass df = cof*lh;
                             lh_cat += lh;
@@ -2699,6 +2712,10 @@ double PhyloTree::computeLikelihoodBranchGenericSIMD(PhyloNeighbor *dad_branch, 
     size_t nstates = aln->num_states;
 #endif
     size_t ncat = site_rate->getNRate();
+    // site-specific model with posterior draws (RateSiteDraws): one model and tip vector per pattern and category,
+    // stored like the partial likelihoods, eval_step advances them per category in VectorClass units
+    const size_t ndraws = SITE_MODEL ? model->getNSiteDraws() : 1;
+    const size_t eval_step = (ndraws > 1) ? nstates : 0;
     size_t ncat_mix = (model_factory->fused_mix_rate) ? ncat : ncat*model->getNMixtures();
 
     size_t block = ncat_mix * nstates;
@@ -2706,7 +2723,7 @@ double PhyloTree::computeLikelihoodBranchGenericSIMD(PhyloNeighbor *dad_branch, 
     size_t orig_nptn = aln->size();
     size_t max_orig_nptn = roundUpToMultiple(orig_nptn, VectorClass::size());
     size_t nptn = max_orig_nptn+model_factory->unobserved_ptns.size();
-    size_t tip_mem_size = max_orig_nptn * nstates;
+    size_t tip_mem_size = max_orig_nptn * nstates * ndraws;
     ASCType ASC_type = model_factory->getASC();
     bool ASC_Holder = (ASC_type == ASC_VARIANT_MISSING || ASC_type == ASC_INFORMATIVE_MISSING);
     bool ASC_Lewis = (ASC_type == ASC_VARIANT || ASC_type == ASC_INFORMATIVE);
@@ -2869,16 +2886,16 @@ double PhyloTree::computeLikelihoodBranchGenericSIMD(PhyloNeighbor *dad_branch, 
                 VectorClass lh_ptn(0.0);
                 VectorClass *lh_cat = (VectorClass*)(_pattern_lh_cat + (ptn*ncat_mix));
                 VectorClass *partial_lh_dad = (VectorClass*)(dad_branch->partial_lh + (ptn*block));
-                VectorClass *lh_node = SITE_MODEL ? (VectorClass*)&partial_lh_node[ptn*nstates] : (VectorClass*)vec_tip;
+                VectorClass *lh_node = SITE_MODEL ? (VectorClass*)&partial_lh_node[ptn*ndraws*nstates] : (VectorClass*)vec_tip;
 
                 if (SITE_MODEL) {
                     // site-specific model
-                    VectorClass* eval_ptr = (VectorClass*) &eval[ptn*nstates];
+                    VectorClass* eval_ptr = (VectorClass*) &eval[ptn*ndraws*nstates];
                     for (size_t c = 0; c < ncat; c++) {
     #ifdef KERNEL_FIX_STATES
-                        dotProductExp<VectorClass, double, nstates, FMA>(eval_ptr, lh_node, partial_lh_dad, cat_length[c], lh_cat[c]);
+                        dotProductExp<VectorClass, double, nstates, FMA>(eval_ptr + c*eval_step, lh_node + c*eval_step, partial_lh_dad, cat_length[c], lh_cat[c]);
     #else
-                        dotProductExp<VectorClass, double, FMA>(eval_ptr, lh_node, partial_lh_dad, cat_length[c], lh_cat[c], nstates);
+                        dotProductExp<VectorClass, double, FMA>(eval_ptr + c*eval_step, lh_node + c*eval_step, partial_lh_dad, cat_length[c], lh_cat[c], nstates);
     #endif
                         if (SAFE_NUMERIC) {
                             lh_cat[c] *= cat_prop[c];
@@ -3038,12 +3055,12 @@ double PhyloTree::computeLikelihoodBranchGenericSIMD(PhyloNeighbor *dad_branch, 
 
                 // compute likelihood per category
                 if (SITE_MODEL) {
-                    VectorClass* eval_ptr = (VectorClass*) &eval[ptn*nstates];
+                    VectorClass* eval_ptr = (VectorClass*) &eval[ptn*ndraws*nstates];
                     for (size_t c = 0; c < ncat; c++) {
     #ifdef KERNEL_FIX_STATES
-                        dotProductExp<VectorClass, double, nstates, FMA>(eval_ptr, partial_lh_node, partial_lh_dad, cat_length[c], lh_cat[c]);
+                        dotProductExp<VectorClass, double, nstates, FMA>(eval_ptr + c*eval_step, partial_lh_node, partial_lh_dad, cat_length[c], lh_cat[c]);
     #else
-                        dotProductExp<VectorClass, double, FMA>(eval_ptr, partial_lh_node, partial_lh_dad, cat_length[c], lh_cat[c], nstates);
+                        dotProductExp<VectorClass, double, FMA>(eval_ptr + c*eval_step, partial_lh_node, partial_lh_dad, cat_length[c], lh_cat[c], nstates);
     #endif
                         if (SAFE_NUMERIC) {
                             lh_cat[c] *= cat_prop[c];
@@ -3307,6 +3324,10 @@ double PhyloTree::computeLikelihoodFromBufferGenericSIMD()
     size_t nstates = aln->num_states;
 #endif
     size_t ncat = site_rate->getNRate();
+    // site-specific model with posterior draws (RateSiteDraws): one model and tip vector per pattern and category,
+    // stored like the partial likelihoods, eval_step advances them per category in VectorClass units
+    const size_t ndraws = SITE_MODEL ? model->getNSiteDraws() : 1;
+    const size_t eval_step = (ndraws > 1) ? nstates : 0;
     size_t ncat_mix = (model_factory->fused_mix_rate) ? ncat : ncat*model->getNMixtures();
 
     size_t block = ncat_mix * nstates;
@@ -3386,13 +3407,13 @@ double PhyloTree::computeLikelihoodFromBufferGenericSIMD()
         VectorClass lh_ptn(0.0);
         VectorClass *theta = (VectorClass*)(theta_all + (ptn*block));
         if (SITE_MODEL) {
-            VectorClass *eval_ptr = (VectorClass*)&eval[ptn*nstates];
+            VectorClass *eval_ptr = (VectorClass*)&eval[ptn*ndraws*nstates];
             for (size_t c = 0; c < ncat; c++) {
                 VectorClass lh_cat;
 #ifdef KERNEL_FIX_STATES
-                dotProductExp<VectorClass, double, nstates, FMA>(eval_ptr, theta, cat_length[c], lh_cat);
+                dotProductExp<VectorClass, double, nstates, FMA>(eval_ptr + c*eval_step, theta, cat_length[c], lh_cat);
 #else
-                dotProductExp<VectorClass, double, FMA>(eval_ptr, theta, cat_length[c], lh_cat, nstates);
+                dotProductExp<VectorClass, double, FMA>(eval_ptr + c*eval_step, theta, cat_length[c], lh_cat, nstates);
 #endif
                 lh_ptn = mul_add(lh_cat, cat_prop[c], lh_ptn);
                 theta += nstates;

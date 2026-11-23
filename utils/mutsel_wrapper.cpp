@@ -11,8 +11,11 @@ void rust_mutsel(int32_t *parents,
                  uint32_t node_num,
                  const char *model_string,
                  uint8_t verbose,
+                 uint32_t num_tree_draws,
+                 uint64_t seed,
                  double *out_site_freq,
                  double *out_R_matrices,
+                 double *out_draw_weights,
                  const char *output_prefix)
 {
     std::cout << "Mutsel support not compiled in!" << std::endl;
@@ -128,7 +131,7 @@ std::tuple<std::vector<uint8_t>, int32_t, int32_t> prepare_mutsel_alignment(Alig
     return std::make_tuple(std::move(sequences), static_cast<int32_t>(L), static_cast<int32_t>(N));
 }
 
-std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model)
+std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model, std::vector<double> *draw_weights)
 {
     cout << endl
          << "Reading site-specific model file " << filename << " ..." << endl;
@@ -192,6 +195,15 @@ std::string read_binary_site_model_file_internal(std::string &filename, std::vec
                    static_cast<std::streamsize>(num_sites * 190 * sizeof(double)),
                    "rate matrices");
 
+        // a weighted mixture of posterior draws ("DRAWS K WEIGHTED") ends with the weight of every model
+        if (draw_weights != nullptr && rate_model_string.find(" WEIGHTED") != std::string::npos)
+        {
+            draw_weights->resize(num_sites);
+            read_exact(reinterpret_cast<char *>(draw_weights->data()),
+                       static_cast<std::streamsize>(num_sites * sizeof(double)),
+                       "draw weights");
+        }
+
         for (size_t i = 0; i < num_sites; ++i)
         {
             site_model.push_back(i);
@@ -228,7 +240,7 @@ std::string read_binary_site_model_file_internal(std::string &filename, std::vec
     return rate_model_string;
 }
 
-void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len)
+void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len, int num_draws, const double *draw_weights)
 {
     ASSERT(alignment.ptn_rate_mat.empty() &&
            alignment.ptn_state_freq.empty());
@@ -237,6 +249,14 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
     // so this function should only be called for protein alignments
     ASSERT(alignment.num_states == 20);
     //alignment.num_rates = 190;
+
+    ASSERT(num_draws >= 1);
+    alignment.site_model_draws = num_draws;
+    alignment.site_model_weighted = num_draws > 1 && draw_weights != nullptr;
+    // per pattern: the frequencies of all draws, then (if weighted) the weight of every draw
+    const size_t draw_freq_size = 20 * num_draws;
+    const size_t freq_size = alignment.getSiteModelFreqSize();
+    const size_t rate_size = 190 * num_draws;
 
     size_t nsite = alignment.getNSite();
     if (len != static_cast<int>(nsite))
@@ -262,8 +282,12 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
     {
         site_model[site] = models_freq.size();
 
-        const double *state_freq_ptr = site_freq + site * 20;
-        const double *rate_mat_ptr = rate_matrices + site * 190;
+        std::vector<double> state_freq_buf(freq_size);
+        std::copy(site_freq + site * draw_freq_size, site_freq + (site + 1) * draw_freq_size, state_freq_buf.begin());
+        if (alignment.site_model_weighted)
+            std::copy(draw_weights + site * num_draws, draw_weights + (site + 1) * num_draws, state_freq_buf.begin() + draw_freq_size);
+        const double *state_freq_ptr = state_freq_buf.data();
+        const double *rate_mat_ptr = rate_matrices + site * rate_size;
 
         bool add = true;
         int first_site = pattern_first_site[alignment.getPatternID(site)];
@@ -271,7 +295,7 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
         {
             int first_model = site_model[first_site];
             bool matched_freq_and_rate = true;
-            for (int i = 0; i < 20; ++i)
+            for (size_t i = 0; i < freq_size; ++i)
             {
                 if (state_freq_ptr[i] != models_freq[first_model][i])
                 {
@@ -281,7 +305,7 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
             }
             if (matched_freq_and_rate)
             {
-                for (int i = 0; i < 190; ++i)
+                for (size_t i = 0; i < rate_size; ++i)
                 {
                     if (rate_mat_ptr[i] != models_rate[first_model][i])
                     {
@@ -304,11 +328,11 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
 
         if (add)
         {
-            double *site_freq_entry = new double[20];
-            memcpy(site_freq_entry, state_freq_ptr, sizeof(double) * 20);
+            double *site_freq_entry = new double[freq_size];
+            memcpy(site_freq_entry, state_freq_ptr, sizeof(double) * freq_size);
             models_freq.push_back(site_freq_entry);
-            double *site_rate_entry = new double[190];
-            memcpy(site_rate_entry, rate_mat_ptr, sizeof(double) * 190);
+            double *site_rate_entry = new double[rate_size];
+            memcpy(site_rate_entry, rate_mat_ptr, sizeof(double) * rate_size);
             models_rate.push_back(site_rate_entry);
         }
     }
@@ -348,7 +372,10 @@ void write_site_models_to_alignment(Alignment &alignment, const double *site_fre
         }
     }
 
-    cout << used_models << " distinct per-site models detected" << endl;
+    cout << used_models << " distinct per-site models detected";
+    if (num_draws > 1)
+        cout << ", each a " << (alignment.site_model_weighted ? "weighted" : "equally weighted") << " mixture of " << num_draws << " posterior draws";
+    cout << endl;
 }
 
 void read_site_model_file(const std::string &filename, Alignment &alignment)
@@ -356,8 +383,20 @@ void read_site_model_file(const std::string &filename, Alignment &alignment)
     auto site_freq = std::vector<double>();
     auto rate_matrices = std::vector<double>();
     auto site_model = std::vector<int>();
-    auto _custom_str = read_binary_site_model_file_internal(const_cast<std::string &>(filename), site_freq, rate_matrices, site_model);
-    write_site_models_to_alignment(alignment, site_freq.data(), rate_matrices.data(), site_model.size());
+    auto draw_weights = std::vector<double>();
+    auto custom_str = read_binary_site_model_file_internal(const_cast<std::string &>(filename), site_freq, rate_matrices, site_model, &draw_weights);
+    // A mixture of posterior draws per site is stored as num_draws consecutive models per site
+    int num_draws = 1;
+    if (custom_str.rfind("DRAWS ", 0) == 0)
+    {
+        num_draws = std::stoi(custom_str.substr(6));
+    }
+    if (num_draws < 1 || site_model.size() % num_draws != 0)
+    {
+        throw std::runtime_error("Invalid number of posterior draws in site model file " + filename);
+    }
+    write_site_models_to_alignment(alignment, site_freq.data(), rate_matrices.data(), site_model.size() / num_draws, num_draws,
+                                   draw_weights.empty() ? nullptr : draw_weights.data());
     return;
 }
 
@@ -366,6 +405,7 @@ void write_binary_site_model_file(const std::string &filename, Alignment &alignm
     size_t nsites = alignment.getNSite();
     size_t nstates = alignment.num_states;
     size_t nrates = alignment.getNumRates();
+    size_t num_draws = alignment.site_model_draws;
     ASSERT(nstates == 20);
     ASSERT(nrates == 190);
     try
@@ -376,23 +416,34 @@ void write_binary_site_model_file(const std::string &filename, Alignment &alignm
         IntVector pattern_index;
         alignment.getSitePatternIndex(pattern_index);
 
-        uint64_t custom_string_length = 6; // length of "UNUSED"
+        std::string custom_string = (num_draws == 1) ? "UNUSED" : "DRAWS " + std::to_string(num_draws) + (alignment.site_model_weighted ? " WEIGHTED" : "");
+        uint64_t custom_string_length = custom_string.size();
         out.write(reinterpret_cast<const char *>(&custom_string_length), sizeof(uint64_t));
-        out.write("UNUSED", custom_string_length);
+        out.write(custom_string.data(), custom_string_length);
 
-        uint64_t num_sites = nsites;
+        // With posterior draws every site has num_draws consecutive models
+        uint64_t num_sites = nsites * num_draws;
         out.write(reinterpret_cast<const char *>(&num_sites), sizeof(uint64_t));
 
         for (size_t i = 0; i < nsites; ++i)
         {
             double *state_freq = alignment.ptn_state_freq[pattern_index[i]];
-            out.write(reinterpret_cast<const char *>(state_freq), nstates * sizeof(double));
+            out.write(reinterpret_cast<const char *>(state_freq), num_draws * nstates * sizeof(double));
         }
 
         for (size_t i = 0; i < nsites; ++i)
         {
             double *rate_mat = alignment.ptn_rate_mat[pattern_index[i]];
-            out.write(reinterpret_cast<const char *>(rate_mat), nrates * sizeof(double));
+            out.write(reinterpret_cast<const char *>(rate_mat), num_draws * nrates * sizeof(double));
+        }
+
+        if (alignment.site_model_weighted)
+        {
+            for (size_t i = 0; i < nsites; ++i)
+            {
+                double *weights = alignment.ptn_state_freq[pattern_index[i]] + num_draws * nstates;
+                out.write(reinterpret_cast<const char *>(weights), num_draws * sizeof(double));
+            }
         }
 
         cout << "Site mutsel model printed to " << filename << endl;
@@ -410,22 +461,28 @@ DoubleVector computeMutselSiteRates(Alignment &alignment)
     ASSERT(alignment.ptn_state_freq.size() == alignment.getNPattern());
 
     size_t npattern = alignment.getNPattern();
+    int num_draws = alignment.site_model_draws;
     DoubleVector pattern_rates(npattern);
     for (size_t ptn = 0; ptn < npattern; ++ptn)
     {
-        double *R = alignment.ptn_rate_mat[ptn];
-        double *pi = alignment.ptn_state_freq[ptn];
+        // average over the posterior draws of the pattern (with their weights, if weighted)
         double rate = 0.0;
-        int idx = 0;
-        for (int i = 0; i < 20; ++i)
+        for (int k = 0; k < num_draws; ++k)
         {
-            for (int j = i + 1; j < 20; ++j)
+            double weight = alignment.site_model_weighted ? num_draws * alignment.ptn_state_freq[ptn][num_draws * 20 + k] : 1.0;
+            double *R = alignment.ptn_rate_mat[ptn] + k * 190;
+            double *pi = alignment.ptn_state_freq[ptn] + k * 20;
+            int idx = 0;
+            for (int i = 0; i < 20; ++i)
             {
-                rate += R[idx] * pi[i] * pi[j];
-                idx++;
+                for (int j = i + 1; j < 20; ++j)
+                {
+                    rate += weight * R[idx] * pi[i] * pi[j];
+                    idx++;
+                }
             }
         }
-        pattern_rates[ptn] = 2.0 * rate;
+        pattern_rates[ptn] = 2.0 * rate / num_draws;
     }
 
     size_t nsite = alignment.getNSite();
@@ -456,9 +513,21 @@ void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
     auto [branch_lengths, parent_indices] = prepare_mutsel_tree(tree);
     auto [sequences, L, N] = prepare_mutsel_alignment(alignment);
 
-    double *site_freq = new double[L * 20];
+    // MUTSEL_TREE_DRAWS > 1 uses that many posterior draws per site as a mixture instead of the posterior mean site
+    // model, with the weights from the Rust library (MUTSEL_TREE_DRAWS_MODE: importance weights or equal)
+    int num_draws = 1;
+    if (const char *env = std::getenv("MUTSEL_TREE_DRAWS"))
+    {
+        num_draws = std::atoi(env);
+        if (num_draws < 1)
+            outError("MUTSEL_TREE_DRAWS must be a positive integer");
+    }
 
-    double *site_rate = new double[L * 190];
+    double *site_freq = new double[(size_t)L * num_draws * 20];
+
+    double *site_rate = new double[(size_t)L * num_draws * 190];
+
+    double *draw_weights = new double[(size_t)L * num_draws];
 
     // Close log file, so we can append in the mutsel library without messing up the order of log messages from IQ-TREE and mutsel library
     std::cout << std::flush;
@@ -482,13 +551,16 @@ void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
                 parent_indices.size(),
                 params.model_name.c_str(),
                 verbose_mode,
+                num_draws,
+                static_cast<uint64_t>(params.ran_seed),
                 site_freq,
                 site_rate,
+                draw_weights,
                 ((string)params.out_prefix).c_str());
 
     outstream->open(((string)params.out_prefix + ".log").c_str(), std::ios::app); // reopen log file
 
-    write_site_models_to_alignment(*alignment, site_freq, site_rate, L);
+    write_site_models_to_alignment(*alignment, site_freq, site_rate, L, num_draws, num_draws > 1 ? draw_weights : nullptr);
 
     write_binary_site_model_file(((string)params.out_prefix + ".sitemodel").c_str(), *alignment);
 
@@ -496,6 +568,7 @@ void computeMutselSiteFrequencyModel(Params &params, Alignment *alignment)
 
     delete[] site_freq;
     delete[] site_rate;
+    delete[] draw_weights;
     delete tree;
 
     cout << endl

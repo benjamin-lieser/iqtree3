@@ -33,8 +33,11 @@ extern "C" void rust_mutsel(int32_t *parents,
                             uint32_t node_num,
                             const char *model_string,
                             uint8_t verbose,
+                            uint32_t num_tree_draws,
+                            uint64_t seed,
                             double *out_site_freq,
                             double *out_R_matrices,
+                            double *out_draw_weights,
                             const char *output_prefix);
 
 extern "C" void rust_set_rayon_threads(int32_t num_threads);
@@ -47,8 +50,11 @@ void rust_mutsel(int32_t *parents,
                  uint32_t node_num,
                  const char *model_string,
                  uint8_t verbose,
+                 uint32_t num_tree_draws,
+                 uint64_t seed,
                  double *out_site_freq,
                  double *out_R_matrices,
+                 double *out_draw_weights,
                  const char *output_prefix);
 
 void rust_set_rayon_threads(int32_t num_threads);
@@ -58,13 +64,15 @@ void rust_set_rayon_threads(int32_t num_threads);
  * Simple read function which just puts the binary file into vectors. frequences get normalized, rates are checked to be positive. It returns the rate model string of the file.
  * Format is documented in the body of the function.
  */
-std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model);
+std::string read_binary_site_model_file_internal(std::string &filename, std::vector<double> &site_freq, std::vector<double> &rate_matrices, std::vector<int> &site_model, std::vector<double> *draw_weights = nullptr);
 
 /**
  * Takes the data from the file (or the rust_mutsel function) and updates the alignment object.
  * This deals with duplicated pattern and stuff.
+ * With num_draws > 1 every site has num_draws consecutive models (posterior draws), which form a mixture: with the
+ * weights draw_weights [len * num_draws] (summing to 1 per site), or equally weighted if draw_weights is null.
  */
-void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len);
+void write_site_models_to_alignment(Alignment &alignment, const double *site_freq, const double *rate_matrices, int len, int num_draws = 1, const double *draw_weights = nullptr);
 
 /**
  * Read a site model file and update the alignment object.

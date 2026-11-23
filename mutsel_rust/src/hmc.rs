@@ -60,6 +60,56 @@ fn alignment_columns(alignment: &[u8], num_leaves: usize) -> Vec<&[u8]> {
     alignment.chunks_exact(num_leaves).collect()
 }
 
+/// The distinct columns (patterns) of an alignment: identical columns have the same posterior, so every pattern
+/// is sampled once and counts as many times as it occurs in the EM and the prior fit.
+struct Patterns {
+    /// [num_patterns * num_leaves], in the order of their first column
+    alignment: Vec<u8>,
+    /// Number of columns of every pattern
+    counts: Vec<f64>,
+    /// Pattern of every column
+    site_to_pattern: Vec<usize>,
+    /// First column of every pattern
+    first_site: Vec<usize>,
+}
+
+impl Patterns {
+    fn new(alignment: &[u8], num_leaves: usize) -> Patterns {
+        let mut index: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
+        let mut patterns = Patterns { alignment: Vec::new(), counts: Vec::new(), site_to_pattern: Vec::new(), first_site: Vec::new() };
+        for (site, column) in alignment.chunks_exact(num_leaves).enumerate() {
+            let pattern = *index.entry(column).or_insert_with(|| {
+                patterns.alignment.extend_from_slice(column);
+                patterns.counts.push(0.0);
+                patterns.first_site.push(site);
+                patterns.counts.len() - 1
+            });
+            patterns.counts[pattern] += 1.0;
+            patterns.site_to_pattern.push(pattern);
+        }
+        patterns
+    }
+
+    fn num_patterns(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// Per-pattern values for every column
+    fn expand<T: Clone>(&self, values: &[T]) -> Vec<T> {
+        self.site_to_pattern.iter().map(|&p| values[p].clone()).collect()
+    }
+
+    /// Per-pattern rows of `width` values for every column
+    fn expand_rows<T: Clone>(&self, values: &[T], width: usize) -> Vec<T> {
+        self.site_to_pattern.iter().flat_map(|&p| values[p * width..(p + 1) * width].iter().cloned()).collect()
+    }
+}
+
+/// Values of every pattern, each repeated as often as the pattern occurs (for summaries over the columns)
+fn repeat_by_counts<'a>(values: &'a [f64], counts: &'a [f64]) -> impl Iterator<Item = f64> + 'a {
+    values.iter().zip(counts).flat_map(|(&x, &c)| std::iter::repeat(x).take(c as usize))
+}
+
 pub(crate) fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     match std::env::var(name) {
         Ok(value) => value
@@ -1107,8 +1157,9 @@ fn thinned_site_rates(site_samples: &[SiteSamples], num_samples: usize) -> Optio
 
 /// Average substitution rate over all sites and samples, without normalization. Only the site frequencies
 /// enter, the site rates have prior mean 1 and are a correction on top of the normalized MutSel rates.
-fn mean_substitution_rate(Mu: &SMatrix<f64, 20, 20>, log_pi_samples: &[Vec<SVector<f64, 20>>]) -> f64 {
-    log_pi_samples.iter().map(|log_pi| batch::mean_substitution_rate(Mu, log_pi)).sum::<f64>() / log_pi_samples.len() as f64
+fn mean_substitution_rate(Mu: &SMatrix<f64, 20, 20>, log_pi_samples: &[Vec<SVector<f64, 20>>], site_weights: &[f64]) -> f64 {
+    log_pi_samples.iter().map(|log_pi| batch::mean_substitution_rate(Mu, log_pi, Some(site_weights))).sum::<f64>()
+        / log_pi_samples.len() as f64
 }
 
 /// M-step: maximizes the log likelihood averaged over the posterior samples of the site frequencies (and site
@@ -1126,6 +1177,7 @@ fn m_step(
     prior: &Prior,
     max_iterations: usize,
     verbosity: Verbosity,
+    site_weights: &[f64],
 ) -> f64 {
     // L-BFGS on the deterministic objective (given the samples), stopped once an iteration improves it by less
     // than this relative to its value. It starts at the previous Mu and branch lengths and never ends worse.
@@ -1153,6 +1205,7 @@ fn m_step(
                 &branch_lengths,
                 batch::RateScaling::Fixed(rate_scaling),
                 site_rate_samples.map(|rates| rates[k].as_slice()),
+                Some(site_weights),
             );
             log_likelihood += result.log_likelihood / num_samples;
             grad_Mu += result.grad_Mu / num_samples;
@@ -1244,6 +1297,109 @@ fn flux_matched_rate_matrix(
     (S, sqrt_pi)
 }
 
+/// MUTSEL_TREE_DRAWS_MODE: marginal (default) gives the posterior draws for the tree search importance weights, so
+/// that their mixture estimates the marginal likelihood of every site; equal weights them equally (the posterior
+/// mean of the likelihood, which counts the data twice)
+fn tree_draws_marginal() -> bool {
+    match std::env::var("MUTSEL_TREE_DRAWS_MODE").as_deref() {
+        Err(_) | Ok("marginal") => true,
+        Ok("equal") => false,
+        Ok(other) => panic!("MUTSEL_TREE_DRAWS_MODE={other}: use marginal or equal"),
+    }
+}
+
+/// The posterior draws of a site for the tree search (indices into its thinned draws) and their masses P_j.
+/// marginal: the thinned draws sorted by the site rate (with site rates, else by the substitution rate of the draw)
+/// in num_tree_draws strata of equal size (up to one draw), the median draw of every stratum with the stratum's
+/// share of the draws as mass. equal: evenly spaced draws with mass 1 / num_tree_draws.
+fn tree_draw_selection(shared: &SharedModel, samples: &SiteSamples, num_tree_draws: usize, marginal: bool) -> Vec<(usize, f64)> {
+    let draws: Vec<&[f64]> = samples.thinned_draws.chunks_exact(samples.dim).collect();
+    let n = draws.len();
+    assert!(num_tree_draws <= n, "MUTSEL_TREE_DRAWS={} is more than the {} thinned draws per site", num_tree_draws, n);
+    if !marginal {
+        return (0..num_tree_draws).map(|j| (((j + 1) * n) / num_tree_draws - 1, 1.0 / num_tree_draws as f64)).collect();
+    }
+    let key = |draw: &[f64]| {
+        if shared.site_rate_prior.is_some() {
+            draw[NUM_COORDINATES]
+        } else {
+            let eval = shared.evaluate_position(draw);
+            model::substitution_rate(&eval.S, &eval.sqrt_pi).ln()
+        }
+    };
+    let keys: Vec<f64> = draws.iter().map(|d| key(d)).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| keys[a].total_cmp(&keys[b]));
+    (0..num_tree_draws)
+        .map(|j| {
+            let (lo, hi) = (j * n / num_tree_draws, (j + 1) * n / num_tree_draws);
+            (order[lo + (hi - lo) / 2], (hi - lo) as f64 / n as f64)
+        })
+        .collect()
+}
+
+/// Site models of the tree search with num_tree_draws posterior draws per site (site-major, see
+/// tree_draw_selection), their weights (summing to 1 per site) and their log likelihoods at the tree of the final
+/// sampling. With MUTSEL_TREE_DRAWS_MODE=marginal the weights are w_j proportional to P_j / L_j(b0), so that
+/// sum_j w_j L_j(b) estimates p(y | b) / p(y | b0) up to a constant per site (importance sampling with the posterior at
+/// b0 as proposal, exact at b0).
+fn tree_draw_models(
+    shared: &SharedModel,
+    tree: &Tree,
+    alignment: &[u8],
+    num_leaves: usize,
+    site_samples: &[SiteSamples],
+    num_tree_draws: usize,
+    marginal: bool,
+) -> (Vec<SMatrix<f64, 20, 20>>, Vec<SVector<f64, 20>>, Vec<f64>, Vec<usize>, Vec<f64>) {
+    let per_site: Vec<_> = site_samples
+        .par_iter()
+        .enumerate()
+        .map_init(
+            || Workspace::new(tree.num_nodes(), num_leaves),
+            |workspace, (site, samples)| {
+                let leaves = &alignment[site * num_leaves..(site + 1) * num_leaves];
+                let selection = tree_draw_selection(shared, samples, num_tree_draws, marginal);
+                let mut models = Vec::with_capacity(num_tree_draws);
+                let mut log_weights = Vec::with_capacity(num_tree_draws);
+                let mut log_liks = Vec::with_capacity(num_tree_draws);
+                for &(index, mass) in &selection {
+                    let eval = shared.evaluate_position(&samples.thinned_draws[index * samples.dim..(index + 1) * samples.dim]);
+                    let log_lik = phylo_grad::calculate_gradients_single_column(
+                        &tree.parents,
+                        leaves,
+                        &tree.branch_lengths,
+                        eval.S.as_view(),
+                        eval.sqrt_pi.as_view(),
+                        workspace,
+                        None,
+                    )
+                    .log_likelihood;
+                    log_weights.push(if marginal { mass.ln() - log_lik } else { mass.ln() });
+                    log_liks.push(log_lik);
+                    models.push((eval.S, eval.sqrt_pi));
+                }
+                let norm = log_sum_exp(log_weights.iter().copied());
+                let weights: Vec<f64> = log_weights.iter().map(|w| (w - norm).exp()).collect();
+                (models, weights, selection.iter().map(|s| s.0).collect::<Vec<_>>(), log_liks)
+            },
+        )
+        .collect();
+    let mut S = Vec::with_capacity(site_samples.len() * num_tree_draws);
+    let mut sqrt_pi = Vec::with_capacity(site_samples.len() * num_tree_draws);
+    let (mut weights, mut indices, mut log_liks) = (vec![], vec![], vec![]);
+    for (models, w, i, l) in per_site {
+        for (s, p) in models {
+            S.push(s);
+            sqrt_pi.push(p);
+        }
+        weights.extend(w);
+        indices.extend(i);
+        log_liks.extend(l);
+    }
+    (S, sqrt_pi, weights, indices, log_liks)
+}
+
 /// Mu, the global rate normalization and the branch lengths the final sampling is conditioned on
 struct FittedModel {
     log_S: Vec<f64>,
@@ -1300,8 +1456,10 @@ fn fit_with_em(
     prior: &Arc<Prior>,
     fit_site_rate_sd: bool,
     learn: Option<LearnSettings>,
+    site_weights: &[f64],
 ) -> FittedModel {
     let mut site_rate_prior = prior.site_rate;
+    let num_columns: f64 = site_weights.iter().sum();
     let shared_model = |Mu: &SMatrix<f64, 20, 20>, rate_scaling: f64, prior: &Arc<Prior>, site_rate_prior: Option<SiteRatePrior>| {
         Arc::new(
             SharedModel::new(Mu, rate_scaling, Arc::clone(prior)).with_site_rate_prior(site_rate_prior),
@@ -1315,7 +1473,7 @@ fn fit_with_em(
     let columns = alignment_columns(alignment, num_leaves);
     // The joint MAP estimate of Mu, the site frequencies and the branch lengths
     let map_start = std::time::Instant::now();
-    let map = map_estimate(parents, &columns, branch_lengths, prior, em.map_convergence, verbosity);
+    let map = map_estimate(parents, &columns, branch_lengths, prior, em.map_convergence, verbosity, Some(site_weights));
     if verbosity.should_print(Verbosity::Min) {
         println!("MUTSEL HMC: MAP estimate done in {:.1}s", map_start.elapsed().as_secs_f64());
     }
@@ -1325,7 +1483,7 @@ fn fit_with_em(
 
     // Initial normalization: average substitution rate 1 at the initial frequencies, the same as in the
     // MAP estimate, so the branch lengths stay valid.
-    let mut rate_scaling = 1.0 / mean_substitution_rate(&Mu(&log_S), &[init_log_pi]);
+    let mut rate_scaling = 1.0 / mean_substitution_rate(&Mu(&log_S), &[init_log_pi], site_weights);
     if verbosity.should_print(Verbosity::Min) {
         println!(
             "MUTSEL HMC: starting from the MAP estimate, tree length {:.4}, rate normalization 1/{:.5}",
@@ -1375,11 +1533,13 @@ fn fit_with_em(
         drop(site_samples);
         if let Some(rates) = &site_rate_samples {
             if verbosity.should_print(Verbosity::Min) {
-                print_site_rate_summary(&label, rates.iter().flatten().copied());
+                print_site_rate_summary(&label, rates.iter().flat_map(|r| repeat_by_counts(r, site_weights)));
             }
             if let Some(hyperprior) = &hyperprior {
                 let mstep_rates = &rates[em.num_samples - mstep_samples..];
-                let fitted = hyperprior.fit_site_rate(mstep_rates.iter().flatten().map(|r| r.ln()), 1.0 / mstep_samples as f64);
+                let fitted = hyperprior.fit_site_rate(
+                    mstep_rates.iter().flat_map(|r| r.iter().zip(site_weights).map(|(r, w)| (r.ln(), w / mstep_samples as f64))),
+                );
                 if verbosity.should_print(Verbosity::Min) {
                     println!(
                         "MUTSEL HMC prior M-step: sd of the log site rates {:.4} (was {:.4}, hyperprior {:.4})",
@@ -1390,7 +1550,7 @@ fn fit_with_em(
                 }
                 site_rate_prior = fitted;
             } else if fit_site_rate_sd {
-                let fitted = SiteRatePrior::fit(rates.iter().flatten().map(|r| r.ln()));
+                let fitted = SiteRatePrior::fit_weighted(rates.iter().flat_map(|r| r.iter().zip(site_weights).map(|(r, w)| (r.ln(), *w))));
                 if verbosity.should_print(Verbosity::Min) {
                     println!(
                         "MUTSEL HMC M-step: sd of the log site rates {:.4} (was {:.4})",
@@ -1404,14 +1564,19 @@ fn fit_with_em(
         if let (Some(gmm), Some(hyperprior), Some(points), Some(settings)) =
             (learned_gmm.as_mut(), &hyperprior, &coordinate_samples, learn)
         {
-            let report = gmm.fit(points, 1.0 / mstep_samples as f64, hyperprior, settings.max_iterations);
+            // points: mstep_samples per pattern, in the order of the patterns
+            let point_weights: Vec<f64> = site_weights
+                .iter()
+                .flat_map(|&w| std::iter::repeat(w / mstep_samples as f64).take(mstep_samples))
+                .collect();
+            let report = gmm.fit(points, &point_weights, hyperprior, settings.max_iterations);
             current_prior = Arc::new(Prior {
                 site_frequencies: gmm.to_gmm().expect("L-BFGS keeps the covariances positive definite"),
                 site_rate: site_rate_prior,
                 ..(**prior).clone()
             });
             if verbosity.should_print(Verbosity::Min) {
-                print_prior_mstep(&label, &report, gmm, prior, columns.len());
+                print_prior_mstep(&label, &report, gmm, prior, num_columns as usize);
             }
         }
         let log_likelihood = m_step(
@@ -1425,10 +1590,11 @@ fn fit_with_em(
             prior,
             mstep_iterations,
             verbosity,
+            site_weights,
         );
 
         let new_Mu = Mu(&log_S);
-        let new_rate_scaling = 1.0 / mean_substitution_rate(&new_Mu, &log_pi_samples);
+        let new_rate_scaling = 1.0 / mean_substitution_rate(&new_Mu, &log_pi_samples, site_weights);
         // Rescale the branch lengths so the likelihood is unchanged with the new normalization
         for b in branch_lengths.iter_mut() {
             *b *= rate_scaling / new_rate_scaling;
@@ -1510,7 +1676,8 @@ fn print_prior_mstep(label: &str, report: &crate::hyperprior::FitReport, gmm: &L
 /// Mu, the rate normalization and the branch lengths of an earlier run (its hmc.npz output) instead of fitting them,
 /// for MUTSEL_FIXED_SHARED. The tree must be the same (same parents). The chains start at the run's initial
 /// coordinates, and the site rate prior is the one of the current prior (MUTSEL_PRIOR).
-fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -> Result<FittedModel> {
+/// The model of an earlier run of the same alignment and tree; first_site: the first column of every pattern
+fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, first_site: &[usize], prior: &Prior) -> Result<FittedModel> {
     let npz = Npz::read(path)?;
     let run_parents = &npz.get("parents")?.data;
     if run_parents.len() != parents.len() || run_parents.iter().zip(parents).any(|(&a, &b)| a != b as f64) {
@@ -1520,6 +1687,7 @@ fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -
     if init_coordinates.len() != num_sites {
         return Err(format!("{} has {} sites, this alignment {}", path.display(), init_coordinates.len(), num_sites).into());
     }
+    let init_coordinates: Vec<_> = first_site.iter().map(|&site| init_coordinates[site]).collect();
     let fitted = FittedModel {
         log_S: npz.get("log_exchangeabilities")?.data.clone(),
         rate_scaling: npz.get("rate_scaling")?.to_scalar()?,
@@ -1566,8 +1734,13 @@ pub fn sample_internal(
     verbosity: Verbosity,
     out_prefix: &str,
     model: crate::ModelParameters,
-) -> Result<(Vec<SMatrix<f64, 20, 20>>, Vec<SVector<f64, 20>>)> {
-    let settings = HmcSettings::from_env();
+    num_tree_draws: usize,
+    seed: u64,
+) -> Result<(Vec<SMatrix<f64, 20, 20>>, Vec<SVector<f64, 20>>, Vec<f64>)> {
+    // The seed of IQ-TREE (-seed), unless MUTSEL_HMC_SEED is set. All random numbers derive from it per site and
+    // EM iteration and all sums over the sites are in a fixed order, so the results only depend on the seed (not on
+    // the number of threads).
+    let settings = HmcSettings { seed: env_or("MUTSEL_HMC_SEED", seed), ..HmcSettings::from_env() };
     let em = EmSettings::from_env();
     let prior = Arc::new(Prior { site_frequency_weight: model.site_frequency_weight, ..Prior::from_env() });
     let fit_site_rate_sd = env_or("MUTSEL_SITE_RATE_FIT", 0u8) != 0;
@@ -1631,9 +1804,21 @@ pub fn sample_internal(
     }
     assert!(settings.num_output_samples >= 1 && (em.iterations == 0 || em.num_samples >= 1));
 
+    // Identical columns have the same posterior: every distinct pattern is sampled once (one chain) and counts
+    // as often as it occurs in the EM and the prior fit; the outputs are per column again
+    assert_eq!(alignment.len(), num_sites * num_leaves);
+    let patterns = Patterns::new(alignment, num_leaves);
+    let num_patterns = patterns.num_patterns();
+    println!(
+        "MUTSEL HMC: {} sites, {} distinct patterns: one chain per pattern, counted as often as it occurs",
+        num_sites, num_patterns
+    );
+    let alignment = &patterns.alignment[..];
+    let counts = &patterns.counts[..];
+
     let fitted = match std::env::var("MUTSEL_FIXED_SHARED") {
-        Ok(path) => fixed_shared(Path::new(path.trim()), parents, num_sites, &prior)?,
-        Err(_) => fit_with_em(parents, branch_lengths, alignment, num_leaves, verbosity, &settings, &em, &prior, fit_site_rate_sd, learn),
+        Ok(path) => fixed_shared(Path::new(path.trim()), parents, num_sites, &patterns.first_site, &prior)?,
+        Err(_) => fit_with_em(parents, branch_lengths, alignment, num_leaves, verbosity, &settings, &em, &prior, fit_site_rate_sd, learn, counts),
     };
     let FittedModel {
         log_S,
@@ -1689,16 +1874,15 @@ pub fn sample_internal(
     if site_rate_prior.is_some() && verbosity.should_print(Verbosity::Min) {
         print_site_rate_summary(
             "final",
-            site_samples
-                .iter()
-                .flat_map(|s| s.thinned_draws.chunks_exact(dim).map(|draw| draw[NUM_COORDINATES].exp())),
+            patterns.site_to_pattern.iter().flat_map(|&p| site_samples[p].thinned_draws.chunks_exact(dim).map(|draw| draw[NUM_COORDINATES].exp())),
         );
     }
 
     let num_output_samples = settings.num_output_samples;
+    // The samples of every column (site), from its pattern
+    let column_samples = || patterns.site_to_pattern.iter().map(|&p| &site_samples[p]);
     // coordinate_samples [num_sites, num_output_samples, 19]
-    let coordinate_samples: Vec<f64> = site_samples
-        .iter()
+    let coordinate_samples: Vec<f64> = column_samples()
         .flat_map(|s| s.thinned_draws.chunks_exact(dim).flat_map(|draw| draw[..NUM_COORDINATES].iter().copied()))
         .collect();
     let pi_samples: Vec<f64> = coordinate_samples
@@ -1711,14 +1895,11 @@ pub fn sample_internal(
     let log_site_rates = site_rate_prior.map(|_| {
         Array::new(
             &[num_sites, num_output_samples],
-            site_samples
-                .iter()
-                .flat_map(|s| s.thinned_draws.chunks_exact(dim).map(|draw| draw[NUM_COORDINATES]))
-                .collect(),
+            column_samples().flat_map(|s| s.thinned_draws.chunks_exact(dim).map(|draw| draw[NUM_COORDINATES])).collect(),
         )
     });
 
-    // Posterior mean of the site frequencies and the site rates over all draws
+    // Posterior mean of the site frequencies and the site rates over all draws (per pattern)
     let mean_pi: Vec<SVector<f64, 20>> = site_samples.iter().map(|s| s.mean_pi).collect();
     let mean_site_rate: Vec<f64> = site_samples.iter().map(|s| s.mean_site_rate).collect();
 
@@ -1727,8 +1908,8 @@ pub fn sample_internal(
     } else {
         rate_matrices(&shared, &mean_pi, &mean_site_rate)
     };
-    let average_rate_mean_pi =
-        S.iter().zip(&sqrt_pi).map(|(S, sqrt_pi)| model::substitution_rate(S, sqrt_pi)).sum::<f64>() / num_sites as f64;
+    let site_model_rate: Vec<f64> = S.iter().zip(&sqrt_pi).map(|(S, sqrt_pi)| model::substitution_rate(S, sqrt_pi)).collect();
+    let average_rate_mean_pi = site_model_rate.iter().zip(counts).map(|(r, c)| r * c).sum::<f64>() / num_sites as f64;
     if verbosity.should_print(Verbosity::Min) {
         println!(
             "MUTSEL HMC: average substitution rate of the posterior mean site models ({}) {:.4}",
@@ -1737,15 +1918,55 @@ pub fn sample_internal(
         );
     }
 
+    // With MUTSEL_TREE_DRAWS > 1 the tree search uses that many posterior draws per site as a weighted mixture
+    // instead of the posterior mean site model
+    let tree_draws = (num_tree_draws > 1).then(|| {
+        let marginal = tree_draws_marginal();
+        let result = tree_draw_models(&shared, &tree, alignment, num_leaves, &site_samples, num_tree_draws, marginal);
+        if verbosity.should_print(Verbosity::Min) {
+            let (_, _, weights, _, log_liks) = &result;
+            if marginal {
+                // log sum_j w_j L_j(b0) per site, the log likelihood IQ-TREE reports at the tree of the final sampling
+                let log_lik: f64 = weights
+                    .chunks_exact(num_tree_draws)
+                    .zip(log_liks.chunks_exact(num_tree_draws))
+                    .zip(counts)
+                    .map(|((w, l), c)| c * log_sum_exp(w.iter().zip(l).map(|(w, l)| w.ln() + l)))
+                    .sum();
+                let ess: Vec<f64> = weights
+                    .chunks_exact(num_tree_draws)
+                    .map(|w| 1.0 / w.iter().map(|w| w * w).sum::<f64>() / num_tree_draws as f64)
+                    .collect();
+                let mut ess: Vec<f64> = repeat_by_counts(&ess, counts).collect();
+                ess.sort_by(|a, b| a.total_cmp(b));
+                println!(
+                    "MUTSEL HMC: tree search with {} posterior draws per site (the median draw of {} strata of the {}), importance weights P_j / L_j(b0) at the tree of the final sampling (MUTSEL_TREE_DRAWS_MODE=marginal): log likelihood there {:.4}, ESS of the weights / draws median {:.3}, 5% quantile {:.3}",
+                    num_tree_draws,
+                    num_tree_draws,
+                    if shared.site_rate_prior.is_some() { "site rates" } else { "substitution rates" },
+                    log_lik,
+                    ess[ess.len() / 2],
+                    ess[ess.len() / 20]
+                );
+            } else {
+                println!(
+                    "MUTSEL HMC: tree search with {} evenly spaced posterior draws per site, equally weighted (MUTSEL_TREE_DRAWS_MODE=equal)",
+                    num_tree_draws
+                );
+            }
+        }
+        result
+    });
+
     let npz_path = format!("{}.hmc.npz", out_prefix);
-    let per_site = |f: &dyn Fn(&SiteSamples) -> f64| Array::vector(site_samples.iter().map(f).collect());
+    let per_site = |f: &dyn Fn(&SiteSamples) -> f64| Array::vector(column_samples().map(f).collect());
     let mut arrays: Vec<(&str, Array)> = vec![
         ("coordinate_samples", coordinate_samples),
         ("pi_samples", Array::new(&[num_sites, num_output_samples, 20], pi_samples)),
-        ("init_coordinates", Array::from_rows(&init_coordinates)),
-        ("mean_pi", Array::from_rows(&mean_pi)),
+        ("init_coordinates", Array::from_rows(&patterns.expand(&init_coordinates))),
+        ("mean_pi", Array::from_rows(&patterns.expand(&mean_pi))),
         // substitution rate of the posterior mean site model of every site (the one IQ-TREE uses)
-        ("site_model_rate", Array::vector(S.iter().zip(&sqrt_pi).map(|(S, sqrt_pi)| model::substitution_rate(S, sqrt_pi)).collect())),
+        ("site_model_rate", Array::vector(patterns.expand(&site_model_rate))),
         ("Mu", Array::from_matrix(&Mu(&log_S))),
         ("log_exchangeabilities", Array::vector(log_S.clone())),
         ("rate_scaling", Array::scalar(rate_scaling)),
@@ -1762,17 +1983,45 @@ pub fn sample_internal(
     ];
     if let Some(log_site_rates) = log_site_rates {
         arrays.push(("log_site_rates", log_site_rates));
-        arrays.push(("mean_site_rate", Array::vector(mean_site_rate.clone())));
+        arrays.push(("mean_site_rate", Array::vector(patterns.expand(&mean_site_rate))));
         arrays.push(("site_rate_sd", Array::scalar(site_rate_prior.map_or(0.0, |p| p.sd))));
+    }
+    if let Some((_, _, weights, indices, log_liks)) = &tree_draws {
+        // the draws of the tree search: indices into the thinned draws, weights, log likelihoods at the final tree
+        let indices: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
+        arrays.push(("tree_draw_index", Array::new(&[num_sites, num_tree_draws], patterns.expand_rows(&indices, num_tree_draws))));
+        arrays.push(("tree_draw_weight", Array::new(&[num_sites, num_tree_draws], patterns.expand_rows(weights, num_tree_draws))));
+        arrays.push(("tree_draw_log_lik", Array::new(&[num_sites, num_tree_draws], patterns.expand_rows(log_liks, num_tree_draws))));
     }
     write_npz(Path::new(&npz_path), &arrays.iter().map(|(name, array)| (*name, array)).collect::<Vec<_>>())?;
     println!("MUTSEL HMC: samples written to {}", npz_path);
 
-    Ok((S, sqrt_pi))
+    // Identical columns get identical models, so IQ-TREE keeps them as one pattern
+    Ok(match tree_draws {
+        Some((S, sqrt_pi, weights, _, _)) => (
+            patterns.expand_rows(&S, num_tree_draws),
+            patterns.expand_rows(&sqrt_pi, num_tree_draws),
+            patterns.expand_rows(&weights, num_tree_draws),
+        ),
+        None => (patterns.expand(&S), patterns.expand(&sqrt_pi), vec![1.0; num_sites]),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn patterns_are_the_distinct_columns() {
+        // 4 leaves, columns 0 and 2 and 3 identical
+        let alignment: Vec<u8> = [[1u8, 2, 3, 20], [4, 4, 4, 4], [1, 2, 3, 20], [1, 2, 3, 20], [0, 0, 0, 1]].concat();
+        let patterns = Patterns::new(&alignment, 4);
+        assert_eq!(patterns.num_patterns(), 3);
+        assert_eq!(patterns.counts, vec![3.0, 1.0, 1.0]);
+        assert_eq!(patterns.site_to_pattern, vec![0, 1, 0, 0, 2]);
+        assert_eq!(patterns.first_site, vec![0, 1, 4]);
+        assert_eq!(patterns.expand_rows(&patterns.alignment, 4), alignment);
+        assert_eq!(repeat_by_counts(&[0.5, 2.0, 3.0], &patterns.counts).collect::<Vec<_>>(), vec![0.5, 0.5, 0.5, 2.0, 3.0]);
+    }
+
     use super::*;
     use crate::{
         data::LOG_M_EQUI,
@@ -2043,6 +2292,60 @@ mod tests {
         assert!((mean + 0.5 * sd * sd).abs() < 0.08, "mean log rate {} instead of {}", mean, -0.5 * sd * sd);
         assert!((std - sd).abs() < 0.06, "sd of the log rates {} instead of {}", std, sd);
         assert!((samples[0].mean_site_rate - 1.0).abs() < 0.1, "mean rate {}", samples[0].mean_site_rate);
+    }
+
+    /// Rate-stratified tree draws: one draw per stratum of increasing site rate, importance weights P_j / L_j(b0)
+    /// normalized per site, so that log sum_j w_j L_j(b0) = -log sum_j P_j / L_j(b0); equal weights in the equal mode
+    #[test]
+    fn tree_draws_are_rate_strata_with_importance_weights() {
+        let sd = 0.6;
+        let shared = Arc::new(test_shared(RATE_SCALING).with_site_rate_prior(Some(SiteRatePrior { sd })));
+        let tree = Arc::new(test_tree());
+        // two columns of the five leaves: a variable and a constant one
+        let alignment = [0u8, 0, 3, 7, 12, 5, 5, 5, 5, 5];
+        let settings = HmcSettings {
+            num_tune: 200,
+            num_draws: 300,
+            target_ess: 50,
+            max_draws: 2000,
+            num_output_samples: 100,
+            seed: 5,
+            marginal: false,
+            map_metric: false,
+            ess_on_flux: false,
+            continue_chains: false,
+        };
+        let init = vec![with_initial_log_rate(test_point(), Some(SiteRatePrior { sd })); 2];
+        let samples = sample_sites(&shared, &tree, &alignment, 5, &init, &settings, Verbosity::Quiet, "test");
+        let k = 8;
+        let (S, sqrt_pi, weights, indices, log_liks) = tree_draw_models(&shared, &tree, &alignment, 5, &samples, k, true);
+        assert_eq!((S.len(), sqrt_pi.len(), weights.len(), indices.len(), log_liks.len()), (2 * k, 2 * k, 2 * k, 2 * k, 2 * k));
+        let dim = NUM_COORDINATES + 1;
+        for site in 0..2 {
+            let w = &weights[site * k..(site + 1) * k];
+            let l = &log_liks[site * k..(site + 1) * k];
+            assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+            let log_rates: Vec<f64> =
+                indices[site * k..(site + 1) * k].iter().map(|&i| samples[site].thinned_draws[i * dim + NUM_COORDINATES]).collect();
+            assert!(log_rates.windows(2).all(|p| p[0] <= p[1]), "strata not ordered by the site rate: {:?}", log_rates);
+            // strata of 12 or 13 of the 100 draws
+            let log_mix = log_sum_exp(w.iter().zip(l).map(|(w, l)| w.ln() + l));
+            let masses: Vec<f64> = (0..k).map(|j| ((j + 1) * 100 / k - j * 100 / k) as f64 / 100.0).collect();
+            let harmonic = -log_sum_exp(masses.iter().zip(l).map(|(m, l)| m.ln() - l));
+            assert!((log_mix - harmonic).abs() < 1e-9, "{} vs {}", log_mix, harmonic);
+            // the log likelihoods are those of the selected draws
+            for (j, &i) in indices[site * k..(site + 1) * k].iter().enumerate() {
+                let eval = shared.evaluate_position(&samples[site].thinned_draws[i * dim..(i + 1) * dim]);
+                assert_eq!(S[site * k + j], eval.S);
+                let mut logp = new_site_logp(&shared, &tree, &alignment, 5, site);
+                let mut gradient = vec![0.0; dim];
+                let log_post = logp.logp_x(&samples[site].thinned_draws[i * dim..(i + 1) * dim], &mut gradient).unwrap();
+                assert!((log_post - eval.log_prior - l[j]).abs() < 1e-9);
+            }
+        }
+        let (_, _, weights, indices, _) = tree_draw_models(&shared, &tree, &alignment, 5, &samples, k, false);
+        assert!(weights.iter().all(|&w| (w - 1.0 / k as f64).abs() < 1e-15));
+        assert_eq!(&indices[..k], &[11, 24, 36, 49, 61, 74, 86, 99]);
     }
 
     #[test]

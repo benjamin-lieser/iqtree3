@@ -212,8 +212,13 @@ impl SiteRatePrior {
     /// M-step of the sd given draws of the log site rates: maximizes the mean of log N(l; -sd^2/2, sd^2)
     /// = -l^2 / (2 sd^2) - l / 2 - sd^2 / 8 - log sd + const, which is at sd^4 / 4 + sd^2 = mean(l^2)
     pub fn fit(log_rates: impl Iterator<Item = f64>) -> SiteRatePrior {
-        let (sum, count) = log_rates.fold((0.0, 0usize), |(sum, count), l| (sum + l * l, count + 1));
-        let mean_square = sum / count as f64;
+        SiteRatePrior::fit_weighted(log_rates.map(|l| (l, 1.0)))
+    }
+
+    /// The same with a weight per draw, log_rates yields (log rate, weight)
+    pub fn fit_weighted(log_rates: impl Iterator<Item = (f64, f64)>) -> SiteRatePrior {
+        let (sum, total) = log_rates.fold((0.0, 0.0), |(sum, total), (l, w)| (sum + w * l * l, total + w));
+        let mean_square = sum / total;
         SiteRatePrior { sd: (2.0 * ((1.0 + mean_square).sqrt() - 1.0)).sqrt() }
     }
 

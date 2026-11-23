@@ -33,8 +33,12 @@ pub extern "C" fn rust_set_rayon_threads(num_threads: u32) {
 /// branch_lengths: [num_nodes]
 /// alignment: [num_sites * num_leaves] (row-major)
 /// model_str: MUTSEL{tau/rank/lambda}, see ModelParameters
-/// out_site_freq: [num_sites * 20] (row-major), the posterior mean site frequencies
-/// out_rate_matrix: [num_sites * 190] (row-major), the upper triangle of the rate matrices at these frequencies
+/// num_tree_draws: 1 returns the posterior mean site model of every site, more returns that many posterior draws
+/// per site (MUTSEL_TREE_DRAWS_MODE, see hmc::tree_draw_selection), which IQ-TREE uses as a weighted mixture
+/// out_site_freq: [num_sites * num_tree_draws * 20] (row-major), the site frequencies of the models
+/// out_rate_matrix: [num_sites * num_tree_draws * 190] (row-major), the upper triangle of their rate matrices
+/// seed: the random seed of the sampling (IQ-TREE's -seed), overridden by MUTSEL_HMC_SEED
+/// out_draw_weights: [num_sites * num_tree_draws], the weights of the draws of every site (summing to 1)
 /// out variables do not need to be initialized
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_mutsel(
@@ -46,8 +50,11 @@ pub unsafe extern "C" fn rust_mutsel(
     num_nodes: u32,
     model_str: *const std::os::raw::c_char,
     verbose: u8,
+    num_tree_draws: u32,
+    seed: u64,
     out_site_freq: *mut f64,
     out_rate_matrix: *mut f64,
+    out_draw_weights: *mut f64,
     output_prefix: *const std::os::raw::c_char,
 ) {
     let out_prefix = unsafe { std::ffi::CStr::from_ptr(output_prefix) }
@@ -68,7 +75,8 @@ pub unsafe extern "C" fn rust_mutsel(
     let branch_lengths = unsafe { std::slice::from_raw_parts(branch_lengths, num_nodes as usize) };
     let alignment =
         unsafe { std::slice::from_raw_parts(alignment, (num_sites * num_leaves) as usize) };
-    let num_models = num_sites as usize;
+    assert!(num_tree_draws >= 1);
+    let num_models = (num_sites * num_tree_draws) as usize;
 
     let out_site_freq = unsafe {
         std::slice::from_raw_parts_mut(
@@ -84,6 +92,9 @@ pub unsafe extern "C" fn rust_mutsel(
         )
     };
 
+    let out_draw_weights =
+        unsafe { std::slice::from_raw_parts_mut(out_draw_weights as *mut MaybeUninit<f64>, num_models) };
+
     let model_cstr = unsafe { std::ffi::CStr::from_ptr(model_str) };
     let model_str = model_cstr.to_str().unwrap();
 
@@ -93,7 +104,7 @@ pub unsafe extern "C" fn rust_mutsel(
     println!("Starting mutsel optimization");
 
     // Posterior sampling of the site frequencies (their Helmert coordinates) with Mu and the branch lengths from EM
-    let (S, sqrt_pi) = hmc::sample_internal(
+    let (S, sqrt_pi, weights) = hmc::sample_internal(
         parents,
         branch_lengths,
         alignment,
@@ -102,10 +113,16 @@ pub unsafe extern "C" fn rust_mutsel(
         crate::Verbosity::from_u8(verbose),
         out_prefix,
         model,
+        num_tree_draws as usize,
+        seed,
     )
     .unwrap();
 
     assert_eq!(S.len(), num_models);
+    assert_eq!(weights.len(), num_models);
+    for (out, weight) in out_draw_weights.iter_mut().zip(&weights) {
+        out.write(*weight);
+    }
     for (site_index, (S, sqrt_pi)) in S.iter().zip(&sqrt_pi).enumerate() {
         let (R, pi) = model::phylograd2iqtree_parametrization(S, sqrt_pi);
         for aa_index in 0..20 {

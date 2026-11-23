@@ -115,6 +115,7 @@ fn optimize_branch_lengths(
     log_pi: &[SVector<f64, 20>],
     branch_lengths: &[f64],
     convergence: Convergence,
+    site_weights: Option<&[f64]>,
 ) -> Vec<f64> {
     let mut log_branch_lengths: Vec<f64> = branch_lengths.iter().map(|b| b.ln()).collect();
     maximize_finite(
@@ -128,6 +129,7 @@ fn optimize_branch_lengths(
                 &branch_lengths,
                 batch::RateScaling::MeanRate,
                 None,
+                site_weights,
             );
             let gradient = branch_lengths.iter().zip(&result.grad_branch_lengths).map(|(b, g)| g * b).collect();
             Some((result.log_likelihood, gradient))
@@ -158,7 +160,8 @@ impl Convergence {
 /// Log posterior of the MAP estimate (log likelihood with the rate matrices normalized to a mean substitution rate
 /// of 1 plus the log priors of the exchangeabilities and the site frequencies) and its gradient at
 /// x = [log exchangeabilities, Helmert coordinates of every site, log branch lengths]
-fn map_objective(parents: &[i32], columns: &[&[u8]], prior: &Prior, x: &[f64]) -> (f64, Vec<f64>) {
+/// site_weights: the number of alignment columns of every site (pattern), None for 1
+fn map_objective(parents: &[i32], columns: &[&[u8]], prior: &Prior, x: &[f64], site_weights: Option<&[f64]>) -> (f64, Vec<f64>) {
     let num_coordinates = columns.len() * NUM_COORDINATES;
     let log_S = &x[..NUM_EXCHANGEABILITIES];
     let coordinates = &x[NUM_EXCHANGEABILITIES..NUM_EXCHANGEABILITIES + num_coordinates];
@@ -176,6 +179,7 @@ fn map_objective(parents: &[i32], columns: &[&[u8]], prior: &Prior, x: &[f64]) -
         &branch_lengths,
         batch::RateScaling::MeanRate,
         None,
+        site_weights,
     );
 
     let (log_prior_S, grad_log_prior_S) = prior.evaluate_exchangeabilities(log_S);
@@ -185,9 +189,11 @@ fn map_objective(parents: &[i32], columns: &[&[u8]], prior: &Prior, x: &[f64]) -
     let (log_prior_pi, grad_coordinates): (Vec<f64>, Vec<SVector<f64, NUM_COORDINATES>>) = coordinates
         .par_chunks_exact(NUM_COORDINATES)
         .zip(result.grad_log_pi.par_iter())
-        .map(|(c, grad_log_pi)| {
+        .enumerate()
+        .map(|(site, (c, grad_log_pi))| {
+            let w = site_weights.map_or(1.0, |w| w[site]);
             let (log_prior, grad_log_prior) = prior.evaluate_site_frequencies(&SVector::from_column_slice(c));
-            (log_prior, basis * grad_log_pi + grad_log_prior)
+            (w * log_prior, basis * grad_log_pi + grad_log_prior * w)
         })
         .unzip();
     gradient.extend(grad_coordinates.iter().flat_map(|g| g.iter().copied()));
@@ -213,13 +219,14 @@ pub fn map_estimate(
     prior: &Prior,
     convergence: Convergence,
     verbosity: Verbosity,
+    site_weights: Option<&[f64]>,
 ) -> MapEstimate {
     let num_sites = columns.len();
     let prior_Mu = Mu(&prior.log_exchangeabilities);
 
     let site_freq = light_pmsf(parents, columns, &prior_Mu, crate::data::UDM256, crate::data::UDM256_WEIGHTS, branch_lengths);
     let log_pi: Vec<SVector<f64, 20>> = site_freq.iter().map(|f| f.map(f64::ln)).collect();
-    let branch_lengths = optimize_branch_lengths(parents, columns, &prior_Mu, &log_pi, branch_lengths, convergence);
+    let branch_lengths = optimize_branch_lengths(parents, columns, &prior_Mu, &log_pi, branch_lengths, convergence, site_weights);
     let site_freq = light_pmsf(parents, columns, &prior_Mu, crate::data::UDM256, crate::data::UDM256_WEIGHTS, &branch_lengths);
 
     // x = [log exchangeabilities, Helmert coordinates of every site, log branch lengths]
@@ -230,7 +237,7 @@ pub fn map_estimate(
 
     let start = std::time::Instant::now();
     let num_evaluations = maximize_finite(
-        |x| Some(map_objective(parents, columns, prior, x)),
+        |x| Some(map_objective(parents, columns, prior, x, site_weights)),
         &mut x,
         convergence.max_iterations,
         convergence.min_rel_improvement,
@@ -318,8 +325,8 @@ mod tests {
         let mut x = perturbed_log_S();
         x.extend(log_pi().iter().flat_map(|lp| helmert::log_freq_to_coordinates(lp).iter().copied().collect::<Vec<_>>()));
         x.extend(branch_lengths().iter().map(|b| b.ln()));
-        let (_, gradient) = map_objective(&PARENTS, &columns, &prior, &x);
-        let fd = finite_differences(|x| map_objective(&PARENTS, &columns, &prior, x).0, &x, 1e-5);
+        let (_, gradient) = map_objective(&PARENTS, &columns, &prior, &x, None);
+        let fd = finite_differences(|x| map_objective(&PARENTS, &columns, &prior, x, None).0, &x, 1e-5);
         assert!(max_difference(&fd, &gradient) < 1e-5 * max_abs(&gradient), "{}", max_difference(&fd, &gradient));
     }
 }
