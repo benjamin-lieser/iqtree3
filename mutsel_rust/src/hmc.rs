@@ -75,7 +75,8 @@ pub struct HmcSettings {
     pub num_tune: u64,
     /// Draws after tuning before the effective sample size is checked for the first time
     pub num_draws: u64,
-    /// Sampling continues until every Helmert coordinate of a site reaches this effective sample size
+    /// Sampling continues until every Helmert coordinate of a site (or, with ess_on_flux, its equilibrium flux, see
+    /// flux_effective_sample_size) reaches this effective sample size
     pub target_ess: usize,
     /// Upper limit of draws per site, even if target_ess is not reached
     pub max_draws: u64,
@@ -84,11 +85,21 @@ pub struct HmcSettings {
     pub seed: u64,
     /// Estimate the marginal likelihood of every site (see site_log_marginal)
     pub marginal: bool,
+    /// Precondition every site at the mode of its posterior (Preconditioner, MUTSEL_HMC_METRIC=map)
+    pub map_metric: bool,
+    /// The effective sample size checked is the one of the equilibrium flux (flux_effective_sample_size), which is
+    /// what the flux-matched posterior mean site model averages, instead of the minimum over the Helmert coordinates
+    /// (MUTSEL_HMC_ESS_ON = flux, the default, or coordinates)
+    pub ess_on_flux: bool,
+    /// The final sampling continues the chains of the last E-step (after the EM burn-in) instead of starting tuned
+    /// new chains at their last draws (MUTSEL_HMC_CONTINUE, 1 by default)
+    pub continue_chains: bool,
 }
 
 impl HmcSettings {
     /// Reads MUTSEL_HMC_TUNE, MUTSEL_HMC_DRAWS, MUTSEL_HMC_ESS, MUTSEL_HMC_MAX_DRAWS,
-    /// MUTSEL_HMC_SAMPLES, MUTSEL_HMC_SEED and MUTSEL_HMC_MARGINAL (0 or 1) from the environment.
+    /// MUTSEL_HMC_SAMPLES, MUTSEL_HMC_SEED, MUTSEL_HMC_MARGINAL (0 or 1), MUTSEL_HMC_METRIC, MUTSEL_HMC_ESS_ON and
+    /// MUTSEL_HMC_CONTINUE (0 or 1) from the environment.
     pub fn from_env() -> HmcSettings {
         HmcSettings {
             num_tune: env_or("MUTSEL_HMC_TUNE", 400),
@@ -98,6 +109,13 @@ impl HmcSettings {
             num_output_samples: env_or("MUTSEL_HMC_SAMPLES", 100),
             seed: env_or("MUTSEL_HMC_SEED", 42),
             marginal: env_or("MUTSEL_HMC_MARGINAL", 0u8) != 0,
+            map_metric: use_map_metric(),
+            ess_on_flux: match std::env::var("MUTSEL_HMC_ESS_ON").as_deref() {
+                Err(_) | Ok("flux") => true,
+                Ok("coordinates") => false,
+                Ok(other) => panic!("MUTSEL_HMC_ESS_ON={other}: use flux or coordinates"),
+            },
+            continue_chains: env_or("MUTSEL_HMC_CONTINUE", 1u8) != 0,
         }
     }
 }
@@ -254,26 +272,51 @@ struct SiteLogp {
     /// Leaf states of the column
     leaves: Vec<u8>,
     workspace: Workspace<20>,
+    /// If set, the chain samples y with x = center + L y (see Preconditioner)
+    precond: Option<Arc<Preconditioner>>,
 }
 
-impl HasDims for SiteLogp {
-    fn dim_sizes(&self) -> std::collections::HashMap<String, u64> {
-        [("unconstrained_parameter".to_string(), self.shared.dim() as u64)]
-            .into_iter()
-            .collect()
+/// Affine reparameterization x = center + L y of a site, with L L^T the inverse of the negative Hessian of the log
+/// posterior at its mode center (the Laplace covariance). Sampling y with NUTS is NUTS on x with the dense metric
+/// L L^T: a fixed linear map, so the posterior of x is sampled exactly, and y is close to standard normal where the
+/// posterior is close to Gaussian, which the diagonal adaptation then only fine-tunes.
+struct Preconditioner {
+    center: DVector<f64>,
+    L: DMatrix<f64>,
+    L_inv: DMatrix<f64>,
+}
+
+impl Preconditioner {
+    fn to_x(&self, y: &[f64]) -> Vec<f64> {
+        (&self.center + &self.L * DVector::from_column_slice(y)).as_slice().to_vec()
+    }
+
+    fn to_y(&self, x: &[f64]) -> Vec<f64> {
+        (&self.L_inv * (DVector::from_column_slice(x) - &self.center)).as_slice().to_vec()
     }
 }
 
-impl CpuLogpFunc for SiteLogp {
-    type LogpError = SiteLogpError;
-    type FlowParameters = ();
-    type ExpandedVector = Vec<f64>;
+/// MUTSEL_HMC_METRIC: map (default, Preconditioner at every site, on top of the diagonal adaptation) or diag (only
+/// the adapted diagonal mass matrix of nuts-rs)
+fn use_map_metric() -> bool {
+    match std::env::var("MUTSEL_HMC_METRIC").as_deref() {
+        Ok("diag") => false,
+        Err(_) | Ok("map") => true,
+        Ok(other) => panic!("MUTSEL_HMC_METRIC must be diag or map, not {}", other),
+    }
+}
 
-    fn dim(&self) -> usize {
-        self.shared.dim()
+/// Smallest eigenvalue of the negative Hessian kept in the Preconditioner (sd at most 10 along any direction)
+const MIN_PRECISION: f64 = 1e-2;
+
+impl SiteLogp {
+    fn with_precond(mut self, precond: Option<Arc<Preconditioner>>) -> SiteLogp {
+        self.precond = precond;
+        self
     }
 
-    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> std::result::Result<f64, SiteLogpError> {
+    /// Log posterior and gradient at x (the Helmert coordinates and, if sampled, the log site rate)
+    fn logp_x(&mut self, position: &[f64], gradient: &mut [f64]) -> std::result::Result<f64, SiteLogpError> {
         let model = &*self.shared;
         let eval = model.evaluate_position(position);
 
@@ -300,6 +343,76 @@ impl CpuLogpFunc for SiteLogp {
         Ok(logp)
     }
 
+    /// Preconditioner at the mode of this site's log posterior, found by L-BFGS from init, with the Hessian from
+    /// central differences of the gradient. None (no preconditioning) if the log posterior is not finite there.
+    fn preconditioner(&mut self, init: &[f64]) -> Option<Arc<Preconditioner>> {
+        let dim = init.len();
+        let mut x = init.to_vec();
+        maximize_finite(
+            |x| {
+                let mut gradient = vec![0.0; dim];
+                self.logp_x(x, &mut gradient).ok().map(|logp| (logp, gradient))
+            },
+            &mut x,
+            200,
+            1e-10,
+        );
+        let h = 1e-4;
+        let mut hessian = DMatrix::<f64>::zeros(dim, dim);
+        for k in 0..dim {
+            let (mut plus, mut minus) = (x.clone(), x.clone());
+            plus[k] += h;
+            minus[k] -= h;
+            let (mut g_plus, mut g_minus) = (vec![0.0; dim], vec![0.0; dim]);
+            self.logp_x(&plus, &mut g_plus).ok()?;
+            self.logp_x(&minus, &mut g_minus).ok()?;
+            for i in 0..dim {
+                hessian[(i, k)] = (g_plus[i] - g_minus[i]) / (2.0 * h);
+            }
+        }
+        let precision = -(&hessian + hessian.transpose()) * 0.5;
+        let eigen = precision.symmetric_eigen();
+        if eigen.eigenvalues.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let scales = eigen.eigenvalues.map(|v| v.max(MIN_PRECISION).sqrt());
+        let L = &eigen.eigenvectors * DMatrix::from_diagonal(&scales.map(|s| 1.0 / s));
+        let L_inv = DMatrix::from_diagonal(&scales) * eigen.eigenvectors.transpose();
+        Some(Arc::new(Preconditioner { center: DVector::from_vec(x), L, L_inv }))
+    }
+}
+
+impl HasDims for SiteLogp {
+    fn dim_sizes(&self) -> std::collections::HashMap<String, u64> {
+        [("unconstrained_parameter".to_string(), self.shared.dim() as u64)]
+            .into_iter()
+            .collect()
+    }
+}
+
+impl CpuLogpFunc for SiteLogp {
+    type LogpError = SiteLogpError;
+    type FlowParameters = ();
+    type ExpandedVector = Vec<f64>;
+
+    fn dim(&self) -> usize {
+        self.shared.dim()
+    }
+
+    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> std::result::Result<f64, SiteLogpError> {
+        match self.precond.clone() {
+            None => self.logp_x(position, gradient),
+            Some(precond) => {
+                let x = precond.to_x(position);
+                let mut grad_x = vec![0.0; x.len()];
+                let logp = self.logp_x(&x, &mut grad_x)?;
+                let grad_y = precond.L.transpose() * DVector::from_vec(grad_x);
+                gradient.copy_from_slice(grad_y.as_slice());
+                Ok(logp)
+            }
+        }
+    }
+
     fn expand_vector<R: nuts_rs::rand::Rng + ?Sized>(
         &mut self,
         _rng: &mut R,
@@ -321,7 +434,8 @@ struct SiteSamples {
     /// Posterior mean of the equilibrium flux r pi_i Q_ij over all draws (upper triangle)
     mean_flux: SMatrix<f64, 20, 20>,
     num_draws: usize,
-    /// Minimum over the Helmert coordinates of the effective sample size of all draws
+    /// Effective sample size of all draws: the minimum over the Helmert coordinates, or with settings.ess_on_flux
+    /// the one of the flux (flux_effective_sample_size)
     ess: f64,
     num_divergences: usize,
     step_size: f64,
@@ -360,13 +474,18 @@ fn posterior_means(shared: &SharedModel, draws: &[f64], dim: usize) -> (SVector<
 /// Effective sample size of a single chain with Geyer's initial monotone sequence estimator.
 /// draws: [n * dim] row-major, returns the minimum over the dimensions.
 fn min_effective_sample_size(draws: &[f64], dim: usize) -> f64 {
+    min_effective_sample_size_of(draws, dim, 0..dim)
+}
+
+/// As min_effective_sample_size, the minimum over the given dimensions
+fn min_effective_sample_size_of(draws: &[f64], dim: usize, dims: impl Iterator<Item = usize>) -> f64 {
     let n = draws.len() / dim;
     if n < 4 {
         return 0.0;
     }
     let mut min_ess = f64::INFINITY;
     let mut centered = vec![0.0; n];
-    for d in 0..dim {
+    for d in dims {
         let mean = (0..n).map(|t| draws[t * dim + d]).sum::<f64>() / n as f64;
         for t in 0..n {
             centered[t] = draws[t * dim + d] - mean;
@@ -405,6 +524,49 @@ fn min_effective_sample_size(draws: &[f64], dim: usize) -> f64 {
     min_ess
 }
 
+/// Number of entries of a flux draw: the total flux and the upper triangle
+const FLUX_DIM: usize = 1 + 190;
+
+/// Smallest share of the posterior mean total flux for a pair to enter flux_effective_sample_size
+const MIN_FLUX_SHARE: f64 = 0.05;
+
+/// The total equilibrium flux sum_{i<j} r pi_i Q_ij of a draw followed by the flux of every pair i < j
+fn flux_of_draw(shared: &SharedModel, draw: &[f64], out: &mut Vec<f64>) {
+    let (log_pi, _) = shared.pi(&SVector::<f64, NUM_COORDINATES>::from_column_slice(&draw[..NUM_COORDINATES]));
+    let rate = shared.site_rate(draw);
+    let (S, sqrt_pi) = shared.rate_matrix(&log_pi);
+    let start = out.len();
+    out.push(0.0);
+    let mut total = 0.0;
+    for i in 0..20 {
+        for j in (i + 1)..20 {
+            let flux = rate * S[(i, j)] * sqrt_pi[i] * sqrt_pi[j];
+            out.push(flux);
+            total += flux;
+        }
+    }
+    out[start] = total;
+}
+
+/// Effective sample size of the flux draws [n * FLUX_DIM] (flux_of_draw): the minimum over the total flux and the
+/// pairs with at least MIN_FLUX_SHARE of the posterior mean total flux, so the pairs which dominate the flux-matched
+/// site model, and with it the substitution rate of the site, are estimated to the target precision
+fn flux_effective_sample_size(flux_draws: &[f64]) -> f64 {
+    let n = flux_draws.len() / FLUX_DIM;
+    if n == 0 {
+        return 0.0;
+    }
+    let mut mean = vec![0.0; FLUX_DIM];
+    for draw in flux_draws.chunks_exact(FLUX_DIM) {
+        for (m, f) in mean.iter_mut().zip(draw) {
+            *m += f;
+        }
+    }
+    let threshold = MIN_FLUX_SHARE * mean[0];
+    let dims = std::iter::once(0).chain((1..FLUX_DIM).filter(|&d| mean[d] >= threshold));
+    min_effective_sample_size_of(flux_draws, FLUX_DIM, dims)
+}
+
 type SiteChain = <DiagNutsSettings as Settings>::Chain<CpuMath<SiteLogp>>;
 
 fn new_site_chain(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index: usize) -> SiteChain {
@@ -418,10 +580,14 @@ fn new_site_chain(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_ind
         settings.seed ^ (site_index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
     );
 
+    let init = match &logp.precond {
+        Some(precond) => precond.to_y(init),
+        None => init.to_vec(),
+    };
     let math = CpuMath::new(logp);
     let mut chain = nuts_settings.new_chain(site_index as u64, math, &mut rng);
     chain
-        .set_position(init)
+        .set_position(&init)
         .unwrap_or_else(|e| panic!("Site {}: could not initialize HMC chain: {:?}", site_index, e));
     chain
 }
@@ -434,9 +600,11 @@ fn sample_site(logp: SiteLogp, init: &[f64], settings: &HmcSettings, site_index:
 /// Draws from a chain until the ESS target is reached, after its tuning draws and then burn_in further draws
 fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site_index: usize) -> SiteSamples {
     let shared = Arc::clone(&chain.math().logp_func().shared);
+    let precond = chain.math().logp_func().precond.clone();
     let dim = shared.dim();
     let mut num_burn_in = 0;
     let mut draws = Vec::with_capacity(settings.num_draws as usize * dim);
+    let mut flux_draws = Vec::with_capacity(if settings.ess_on_flux { settings.num_draws as usize * FLUX_DIM } else { 0 });
     let mut num_divergences = 0;
     let mut num_steps = 0u64;
     let mut step_size;
@@ -455,7 +623,13 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
             num_burn_in += 1;
             continue;
         }
-        draws.extend_from_slice(&draw);
+        match &precond {
+            Some(precond) => draws.extend_from_slice(&precond.to_x(&draw)),
+            None => draws.extend_from_slice(&draw),
+        }
+        if settings.ess_on_flux {
+            flux_of_draw(&shared, &draws[draws.len() - dim..], &mut flux_draws);
+        }
         num_divergences += progress.diverging as usize;
         num_steps += progress.num_steps;
         step_size = progress.step_size;
@@ -464,7 +638,7 @@ fn draw_site(chain: &mut SiteChain, settings: &HmcSettings, burn_in: usize, site
         if num_draws < next_check {
             continue;
         }
-        ess = min_effective_sample_size(&draws, dim);
+        ess = if settings.ess_on_flux { flux_effective_sample_size(&flux_draws) } else { min_effective_sample_size(&draws, dim) };
         if ess >= settings.target_ess as f64 || num_draws as u64 >= settings.max_draws {
             break;
         }
@@ -644,11 +818,16 @@ pub struct EmSettings {
     pub mstep_ramp: usize,
     /// Convergence of the MAP estimate EM starts from
     pub map_convergence: Convergence,
+    /// Draws per sample of the E-step: every E-step draws at least draws_per_sample * num_samples (and at least
+    /// 5 * draws_per_sample) per site before its ESS is checked. Default 10: with 3 the learned prior came out sharper
+    /// (smaller rate sd, more peaked site posteriors) and the LBA stem of microsporidia longer, presumably because the
+    /// persistent chains lag behind the posterior when they move too few steps between M-steps.
+    pub draws_per_sample: usize,
 }
 
 impl EmSettings {
     /// Reads MUTSEL_EM_ITERATIONS, MUTSEL_EM_TOL, MUTSEL_EM_WINDOW, MUTSEL_EM_SAMPLES, MUTSEL_EM_TUNE, MUTSEL_EM_BURNIN, MUTSEL_EM_MSTEP_ITERATIONS,
-    /// MUTSEL_MAP_MAX_ITERATIONS and MUTSEL_MAP_REL_IMPROVEMENT from the environment.
+    /// MUTSEL_MAP_MAX_ITERATIONS, MUTSEL_MAP_REL_IMPROVEMENT and MUTSEL_EM_DRAWS_PER_SAMPLE from the environment.
     pub fn from_env() -> EmSettings {
         EmSettings {
             iterations: env_or("MUTSEL_EM_ITERATIONS", 50),
@@ -663,6 +842,7 @@ impl EmSettings {
                 max_iterations: env_or("MUTSEL_MAP_MAX_ITERATIONS", Convergence::MAP.max_iterations),
                 min_rel_improvement: env_or("MUTSEL_MAP_REL_IMPROVEMENT", Convergence::MAP.min_rel_improvement),
             },
+            draws_per_sample: env_or("MUTSEL_EM_DRAWS_PER_SAMPLE", 10),
         }
     }
 
@@ -690,12 +870,16 @@ impl EmSettings {
     fn hmc_settings(&self, settings: &HmcSettings, iteration: usize) -> HmcSettings {
         HmcSettings {
             num_tune: self.num_tune,
-            num_draws: (10 * self.num_samples).max(50) as u64,
+            num_draws: (self.draws_per_sample * self.num_samples).max(5 * self.draws_per_sample).max(1) as u64,
             target_ess: self.num_samples,
             max_draws: settings.max_draws,
             num_output_samples: self.num_samples,
             seed: settings.seed.wrapping_add(iteration as u64 + 1),
             marginal: false,
+            map_metric: settings.map_metric,
+            // the M-steps use the coordinates of the samples
+            ess_on_flux: false,
+            continue_chains: false,
         }
     }
 }
@@ -712,6 +896,7 @@ fn new_site_logp(
         tree: Arc::clone(tree),
         leaves: alignment[site * num_leaves..(site + 1) * num_leaves].to_vec(),
         workspace: Workspace::new(tree.num_nodes(), num_leaves),
+        precond: None,
     }
 }
 
@@ -787,11 +972,16 @@ fn sample_sites(
 ) -> Vec<SiteSamples> {
     let num_sites = init.len();
     let progress = SamplingProgress::new(label, num_sites, verbosity);
+    let map_metric = settings.map_metric;
 
     let site_samples: Vec<SiteSamples> = (0..num_sites)
         .into_par_iter()
         .map(|site| {
-            let logp = new_site_logp(shared, tree, alignment, num_leaves, site);
+            let mut logp = new_site_logp(shared, tree, alignment, num_leaves, site);
+            if map_metric {
+                let precond = logp.preconditioner(&init[site]);
+                logp = logp.with_precond(precond);
+            }
             let mut samples = sample_site(logp, &init[site], settings, site);
             if settings.marginal {
                 let mut logp = new_site_logp(shared, tree, alignment, num_leaves, site);
@@ -824,6 +1014,7 @@ fn sample_sites_persistent(
 ) -> Vec<SiteSamples> {
     let num_sites = init.len();
     let progress = SamplingProgress::new(label, num_sites, verbosity);
+    let map_metric = settings.map_metric;
     // The workspace is only allocated while a site is sampled, so that the kept chains are small
     let free_buffers = |chain: &mut SiteChain| {
         let mut math = chain.math_mut();
@@ -835,7 +1026,12 @@ fn sample_sites_persistent(
         *chains = (0..num_sites)
             .into_par_iter()
             .map(|site| {
-                let mut chain = new_site_chain(new_site_logp(shared, tree, alignment, num_leaves, site), &init[site], settings, site);
+                let mut logp = new_site_logp(shared, tree, alignment, num_leaves, site);
+                if map_metric {
+                    let precond = logp.preconditioner(&init[site]);
+                    logp = logp.with_precond(precond);
+                }
+                let mut chain = new_site_chain(logp, &init[site], settings, site);
                 free_buffers(&mut chain);
                 chain
             })
@@ -851,11 +1047,17 @@ fn sample_sites_persistent(
         .par_iter_mut()
         .enumerate()
         .map(|(site, chain)| {
-            *chain.math_mut().logp_func_mut() = new_site_logp(shared, tree, alignment, num_leaves, site);
+            // The preconditioner of the chain stays fixed, so that the chain continues in the same coordinates
+            let precond = chain.math().logp_func().precond.clone();
+            *chain.math_mut().logp_func_mut() = new_site_logp(shared, tree, alignment, num_leaves, site).with_precond(precond);
             chain
                 .refresh_state()
                 .unwrap_or_else(|e| panic!("Site {}: could not continue HMC chain: {:?}", site, e));
-            let samples = draw_site(chain, settings, burn_in, site);
+            let mut samples = draw_site(chain, settings, burn_in, site);
+            if settings.marginal {
+                let mut logp = new_site_logp(shared, tree, alignment, num_leaves, site);
+                samples.log_marginal = site_log_marginal(&mut logp, &samples, settings.seed ^ (site as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+            }
             free_buffers(chain);
             progress.site_done();
             samples
@@ -1049,6 +1251,9 @@ struct FittedModel {
     branch_lengths: Vec<f64>,
     /// Initial position of the final chain of every site
     positions: Vec<Vec<f64>>,
+    /// The chains of the last E-step (empty without EM), which the final sampling continues if
+    /// settings.continue_chains
+    chains: Vec<SiteChain>,
     init_coordinates: Vec<SVector<f64, NUM_COORDINATES>>,
     em_log_likelihood: Vec<f64>,
     em_tree_length: Vec<f64>,
@@ -1268,6 +1473,7 @@ fn fit_with_em(
         rate_scaling,
         branch_lengths,
         positions,
+        chains,
         init_coordinates,
         em_log_likelihood,
         em_tree_length,
@@ -1319,6 +1525,7 @@ fn fixed_shared(path: &Path, parents: &[i32], num_sites: usize, prior: &Prior) -
         rate_scaling: npz.get("rate_scaling")?.to_scalar()?,
         branch_lengths: npz.get("branch_lengths")?.data.clone(),
         positions: init_coordinates.iter().map(|x| with_initial_log_rate(x.as_slice().to_vec(), prior.site_rate)).collect(),
+        chains: Vec::new(),
         init_coordinates,
         em_log_likelihood: vec![],
         em_tree_length: vec![],
@@ -1413,6 +1620,9 @@ pub fn sample_internal(
     } else {
         println!("MUTSEL HMC: the prior is fixed (tau = inf)");
     }
+    if settings.map_metric {
+        println!("MUTSEL HMC: every site sampled in the coordinates of the Laplace approximation at its mode (MUTSEL_HMC_METRIC=map, diag to turn off)");
+    }
     if prior.site_frequency_weight != 1.0 {
         println!(
             "MUTSEL HMC: the site-frequency prior enters the posterior of every site to the power lambda = {}",
@@ -1430,6 +1640,7 @@ pub fn sample_internal(
         rate_scaling,
         branch_lengths,
         positions,
+        mut chains,
         init_coordinates,
         em_log_likelihood,
         em_tree_length,
@@ -1456,7 +1667,24 @@ pub fn sample_internal(
         SharedModel::new(&Mu(&log_S), rate_scaling, fitted_prior).with_site_rate_prior(site_rate_prior),
     );
     let tree = Arc::new(Tree::new(parents, &branch_lengths));
-    let site_samples = sample_sites(&shared, &tree, alignment, num_leaves, &positions, &settings, verbosity, "final");
+    let site_samples = if settings.continue_chains && !chains.is_empty() {
+        if verbosity.should_print(Verbosity::Min) {
+            println!(
+                "MUTSEL HMC: the final sampling continues the chains of the last E-step after {} burn-in draws (MUTSEL_HMC_CONTINUE=0 for tuned new chains)",
+                em.num_burn_in
+            );
+        }
+        sample_sites_persistent(&mut chains, &shared, &tree, alignment, num_leaves, &positions, &settings, em.num_burn_in, verbosity, "final")
+    } else {
+        sample_sites(&shared, &tree, alignment, num_leaves, &positions, &settings, verbosity, "final")
+    };
+    drop(chains);
+    if settings.ess_on_flux && verbosity.should_print(Verbosity::Min) {
+        println!(
+            "MUTSEL HMC final: ESS of the equilibrium flux (total and the pairs with at least {}% of it, MUTSEL_HMC_ESS_ON=coordinates for the Helmert coordinates)",
+            100.0 * MIN_FLUX_SHARE
+        );
+    }
     let dim = shared.dim();
     if site_rate_prior.is_some() && verbosity.should_print(Verbosity::Min) {
         print_site_rate_summary(
@@ -1516,6 +1744,8 @@ pub fn sample_internal(
         ("pi_samples", Array::new(&[num_sites, num_output_samples, 20], pi_samples)),
         ("init_coordinates", Array::from_rows(&init_coordinates)),
         ("mean_pi", Array::from_rows(&mean_pi)),
+        // substitution rate of the posterior mean site model of every site (the one IQ-TREE uses)
+        ("site_model_rate", Array::vector(S.iter().zip(&sqrt_pi).map(|(S, sqrt_pi)| model::substitution_rate(S, sqrt_pi)).collect())),
         ("Mu", Array::from_matrix(&Mu(&log_S))),
         ("log_exchangeabilities", Array::vector(log_S.clone())),
         ("rate_scaling", Array::scalar(rate_scaling)),
@@ -1600,6 +1830,9 @@ mod tests {
             num_output_samples: 5,
             seed: 7,
             marginal: true,
+            map_metric: false,
+            ess_on_flux: false,
+            continue_chains: false,
         };
         let run = |num_threads: usize| {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().unwrap();
@@ -1688,6 +1921,36 @@ mod tests {
         }
     }
 
+    /// The flux ESS is the minimum over the total flux and the pairs with at least MIN_FLUX_SHARE of it: a slowly
+    /// mixing pair only counts if it carries enough of the flux
+    #[test]
+    fn flux_effective_sample_size_ignores_small_pairs() {
+        let n = 4000;
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let mut normal = || {
+            let u = |r: &mut ChaCha8Rng| ((nuts_rs::rand::Rng::next_u64(r) >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+            let (a, b) = (u(&mut rng), u(&mut rng));
+            (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+        };
+        let draws = |slow_mean: f64, normal: &mut dyn FnMut() -> f64| {
+            let mut slow = 0.0;
+            let mut out = Vec::with_capacity(n * FLUX_DIM);
+            for _ in 0..n {
+                slow = 0.99 * slow + 0.14 * normal();
+                let mut draw = vec![0.0; FLUX_DIM];
+                draw[1] = 5.0 + normal();
+                draw[2] = slow_mean * (1.0 + 0.1 * slow);
+                draw[0] = draw[1] + draw[2];
+                out.extend_from_slice(&draw);
+            }
+            out
+        };
+        let fast = flux_effective_sample_size(&draws(0.01, &mut normal));
+        assert!(fast > 0.5 * n as f64, "{fast}");
+        let slow = flux_effective_sample_size(&draws(2.0, &mut normal));
+        assert!(slow < 0.1 * n as f64, "{slow}");
+    }
+
     #[test]
     fn flux_matched_mean_site_model() {
         let shared = test_shared(RATE_SCALING).with_site_rate_prior(Some(SiteRatePrior { sd: 0.5 }));
@@ -1766,6 +2029,9 @@ mod tests {
             num_output_samples: 1000,
             seed: 3,
             marginal: false,
+            map_metric: false,
+            ess_on_flux: false,
+            continue_chains: false,
         };
         let init = vec![with_initial_log_rate(test_point(), Some(SiteRatePrior { sd }))];
         let samples = sample_sites(&shared, &tree, &alignment, 5, &init, &settings, Verbosity::Quiet, "prior");
@@ -1981,6 +2247,9 @@ mod tests {
             num_output_samples: 100,
             seed: 3,
             marginal: true,
+            map_metric: false,
+            ess_on_flux: false,
+            continue_chains: false,
         };
         let init = with_initial_log_rate(mean.as_slice().to_vec(), site_rate_prior);
         // A single estimate has a standard deviation of about 0.1, so the bias is checked with the average of several chains
@@ -2177,6 +2446,9 @@ mod tests {
             num_output_samples: 100,
             seed: 5,
             marginal: false,
+            map_metric: false,
+            ess_on_flux: false,
+            continue_chains: false,
         };
         let mean_draw = |samples: &SiteSamples| {
             samples
@@ -2198,5 +2470,91 @@ mod tests {
             let difference = (mean_draw(&after[site]) - mean_draw(&fresh[site])).abs().max();
             assert!(difference < 0.15, "site {}: continued and fresh chains differ by {}", site, difference);
         }
+    }
+
+    /// The preconditioned log posterior is the log posterior at x = center + L y, its gradient the chain rule, and L
+    /// is the Laplace covariance: L^T (-H) L = I at the mode
+    #[test]
+    fn preconditioner_is_the_laplace_covariance() {
+        let mut logp = test_logp_with_site_rates(RATE_SCALING, 0.5);
+        let mut init = test_point();
+        init.push(0.3);
+        let precond = logp.preconditioner(&init).unwrap();
+        let dim = init.len();
+        let y: Vec<f64> = (0..dim).map(|i| 0.4 * ((i as f64) * 0.9).cos()).collect();
+        let x = precond.to_x(&y);
+        assert!(precond.to_y(&x).iter().zip(&y).all(|(a, b)| (a - b).abs() < 1e-10));
+        let mut grad_x = vec![0.0; dim];
+        let value_x = logp.logp_x(&x, &mut grad_x).unwrap();
+        let mut preconditioned = test_logp_with_site_rates(RATE_SCALING, 0.5).with_precond(Some(Arc::clone(&precond)));
+        let mut grad_y = vec![0.0; dim];
+        assert!((preconditioned.logp(&y, &mut grad_y).unwrap() - value_x).abs() < 1e-10);
+        let eps = 1e-6;
+        let mut dummy = vec![0.0; dim];
+        for i in 0..dim {
+            let (mut yp, mut ym) = (y.clone(), y.clone());
+            yp[i] += eps;
+            ym[i] -= eps;
+            let fd = (preconditioned.logp(&yp, &mut dummy).unwrap() - preconditioned.logp(&ym, &mut dummy).unwrap()) / (2.0 * eps);
+            assert!((fd - grad_y[i]).abs() < 1e-5 * (1.0 + fd.abs()), "component {}: {} vs {}", i, fd, grad_y[i]);
+        }
+        // At the mode the gradient vanishes and the Hessian in y is -I (all eigenvalues are above MIN_PRECISION here)
+        let mode = vec![0.0; dim];
+        let mut g0 = vec![0.0; dim];
+        preconditioned.logp(&mode, &mut g0).unwrap();
+        assert!(g0.iter().all(|g| g.abs() < 1e-3), "{:?}", g0);
+        let h = 1e-4;
+        for k in 0..dim {
+            let (mut yp, mut ym) = (mode.clone(), mode.clone());
+            yp[k] += h;
+            ym[k] -= h;
+            let (mut gp, mut gm) = (vec![0.0; dim], vec![0.0; dim]);
+            preconditioned.logp(&yp, &mut gp).unwrap();
+            preconditioned.logp(&ym, &mut gm).unwrap();
+            for i in 0..dim {
+                let expected = if i == k { -1.0 } else { 0.0 };
+                assert!(((gp[i] - gm[i]) / (2.0 * h) - expected).abs() < 1e-3, "({}, {})", i, k);
+            }
+        }
+    }
+
+    /// The posterior means with the MAP metric agree with those of the diagonal metric
+    #[test]
+    fn map_metric_samples_the_same_posterior() {
+        let num_sites = 6;
+        let alignment: Vec<u8> = (0..num_sites * 5).map(|i| ((i * 7 + i / 5) % 21) as u8).collect();
+        let shared = Arc::new(test_shared(RATE_SCALING));
+        let tree = Arc::new(test_tree());
+        let init = vec![test_point(); num_sites];
+        let settings = HmcSettings {
+            num_tune: 300,
+            num_draws: 2000,
+            target_ess: 1000,
+            max_draws: 20000,
+            num_output_samples: 5,
+            seed: 3,
+            marginal: false,
+            map_metric: false,
+            ess_on_flux: false,
+            continue_chains: false,
+        };
+        let diag = sample_sites(&shared, &tree, &alignment, 5, &init, &settings, Verbosity::Quiet, "diag");
+        let map = sample_sites(&shared, &tree, &alignment, 5, &init, &HmcSettings { map_metric: true, ..settings }, Verbosity::Quiet, "map");
+        for (d, m) in diag.iter().zip(&map) {
+            assert!((d.mean_pi - m.mean_pi).abs().max() < 0.02, "{} vs {}", d.mean_pi, m.mean_pi);
+        }
+    }
+
+    /// draws_per_sample * samples E-step draws, at least 5 * draws_per_sample (10 gives the former max(10 * samples, 50))
+    #[test]
+    fn e_step_draws_per_sample() {
+        let settings = HmcSettings::from_env();
+        let draws = |num_samples: usize, draws_per_sample: usize| {
+            EmSettings { num_samples, draws_per_sample, ..EmSettings::from_env() }.hmc_settings(&settings, 0).num_draws
+        };
+        assert_eq!(draws(8, 10), 80);
+        assert_eq!(draws(2, 10), 50);
+        assert_eq!(draws(8, 3), 24);
+        assert_eq!(draws(2, 3), 15);
     }
 }
