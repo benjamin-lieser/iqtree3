@@ -44,6 +44,8 @@ pub struct BatchGradients {
     /// Gradient w.r.t. the unnormalized log frequencies of every site
     pub grad_log_pi: Vec<SVector<f64, 20>>,
     pub grad_branch_lengths: Vec<f64>,
+    /// Gradient w.r.t. the log site rates (0 without site rates)
+    pub grad_log_site_rates: Vec<f64>,
 }
 
 /// Mean substitution rate of Mu over the sites with the log frequencies log_pi, every site with its weight
@@ -64,7 +66,8 @@ pub fn total_weight(num_sites: usize, site_weights: Option<&[f64]>) -> f64 {
 /// Summed log likelihood of all sites and its gradients. parents is topologically sorted (see lib.rs), columns
 /// [num_sites] holds the leaf states of every site, log_pi [num_sites] are the log frequencies up to a constant
 /// per site, branch_lengths in the node order of parents. site_rates [num_sites] multiply the rate matrices of
-/// the sites on top of the scaling (only with RateScaling::Fixed). site_weights [num_sites] multiply the log
+/// the sites on top of the scaling; with MeanRate the scaling normalizes the mean of the rates including the site
+/// rates (the rate matrices are r_s S_s W / sum_t w_t r_t rate_t). site_weights [num_sites] multiply the log
 /// likelihood of every site (a pattern standing for that many identical alignment columns), None for 1; with
 /// MeanRate the mean rate is the weighted one.
 pub fn log_likelihood_and_gradients(
@@ -86,7 +89,6 @@ pub fn log_likelihood_and_gradients(
     let total = total_weight(num_sites, site_weights);
     if let Some(rates) = site_rates {
         assert_eq!(rates.len(), num_sites);
-        assert!(matches!(scaling, RateScaling::Fixed(_)), "site rates need a fixed rate scaling");
     }
     let site_rate = |site: usize| site_rates.map_or(1.0, |rates| rates[site]);
     // S and sqrt_pi of every site before the scaling
@@ -94,7 +96,10 @@ pub fn log_likelihood_and_gradients(
     let scale = match scaling {
         RateScaling::Fixed(scale) => scale,
         RateScaling::MeanRate => {
-            total / deterministic_sum(num_sites, 0.0, |site| weight(site) * substitution_rate(&models[site].0, &models[site].1))
+            total
+                / deterministic_sum(num_sites, 0.0, |site| {
+                    weight(site) * site_rate(site) * substitution_rate(&models[site].0, &models[site].1)
+                })
         }
     };
     let S: Vec<SMatrix<f64, 20, 20>> =
@@ -126,17 +131,32 @@ pub fn log_likelihood_and_gradients(
         grad_branch_lengths.iter_mut().zip(sum).for_each(|(s, g)| *s += g);
     }
 
-    // With MeanRate scale = W / sum_s w_s rate_s (W = sum_s w_s), so the log likelihood depends on every rate_s with
-    // d log_likelihood / d rate_s = -scale^2 w_s / W * sum_t w_t <grad_S_t, S_t> (S before scaling); grad_rate is
-    // that without the factor w_s
+    // G_s = <grad_S_s, S_s> with S before the scaling, the derivative of the log likelihood of site s w.r.t. its total
+    // factor scale * r_s
+    let G: Vec<f64> = (0..num_sites)
+        .into_par_iter()
+        .map(|site| result.grad_s[site].upper_triangle().component_mul(&models[site].0).sum())
+        .collect();
+    // With MeanRate scale = W / sum_s w_s r_s rate_s (W = sum_s w_s), so the log likelihood depends on every rate_s with
+    // d log_likelihood / d rate_s = -scale^2 w_s r_s / W * sum_t w_t r_t G_t; grad_rate is that without the factor
+    // w_s r_s
     let grad_rate = match scaling {
         RateScaling::Fixed(_) => 0.0,
         RateScaling::MeanRate => {
-            let d_scale = deterministic_sum(num_sites, 0.0, |site| {
-                weight(site) * result.grad_s[site].upper_triangle().component_mul(&models[site].0).sum()
-            });
+            let d_scale = deterministic_sum(num_sites, 0.0, |site| weight(site) * site_rate(site) * G[site]);
             -scale * scale / total * d_scale
         }
+    };
+    // d log_likelihood / d log r_s = w_s r_s (scale G_s + grad_rate rate_s)
+    let grad_log_site_rates: Vec<f64> = match site_rates {
+        None => vec![0.0; num_sites],
+        Some(_) => (0..num_sites)
+            .into_par_iter()
+            .map(|site| {
+                let rate = substitution_rate(&models[site].0, &models[site].1);
+                weight(site) * site_rate(site) * (scale * G[site] + grad_rate * rate)
+            })
+            .collect(),
     };
 
     let (grad_log_pi, grad_Mu): (Vec<SVector<f64, 20>>, Vec<SMatrix<f64, 20, 20>>) = models
@@ -146,7 +166,7 @@ pub fn log_likelihood_and_gradients(
         .enumerate()
         .map(|(site, (((S, sqrt_pi), log_pi), (grad_S, grad_sqrt_pi)))| {
             // phylo_grad only reads the upper triangle of S. rate = sum_{i != j} S_ij sqrt_pi_i sqrt_pi_j
-            let (w, grad_rate) = (weight(site), weight(site) * grad_rate);
+            let (w, grad_rate) = (weight(site), weight(site) * site_rate(site) * grad_rate);
             let grad_S = grad_S.upper_triangle() * (w * scale * site_rate(site)) + sqrt_pi * sqrt_pi.transpose() * grad_rate;
             let grad_sqrt_pi = grad_sqrt_pi * w + S * sqrt_pi * (2.0 * grad_rate);
             let (grad_Mu, grad_log_pi) = rate_matrix_backward(log_pi, S, sqrt_pi, Mu, &grad_S, &grad_sqrt_pi);
@@ -159,6 +179,7 @@ pub fn log_likelihood_and_gradients(
         grad_Mu: deterministic_sum(num_sites, SMatrix::<f64, 20, 20>::zeros(), |site| grad_Mu[site]),
         grad_log_pi,
         grad_branch_lengths,
+        grad_log_site_rates,
     }
 }
 
@@ -235,11 +256,28 @@ pub(crate) mod tests {
                 / (2.0 * h);
             check(fd, result.grad_branch_lengths[k], &format!("branch length {}", k));
         }
+        if let Some(rates) = site_rates {
+            for site in [0, 2, 6] {
+                let (mut plus, mut minus) = (rates.to_vec(), rates.to_vec());
+                plus[site] *= h.exp();
+                minus[site] *= (-h).exp();
+                let fd = (run(scaling, Some(&plus), &Mu, &log_pi, &branch_lengths).log_likelihood
+                    - run(scaling, Some(&minus), &Mu, &log_pi, &branch_lengths).log_likelihood)
+                    / (2.0 * h);
+                check(fd, result.grad_log_site_rates[site], &format!("log site rate {}", site));
+            }
+        }
     }
 
     #[test]
     fn mean_rate_gradients_match_finite_differences() {
         check_gradients(RateScaling::MeanRate, None);
+    }
+
+    #[test]
+    fn mean_rate_with_site_rates_gradients_match_finite_differences() {
+        let rates: Vec<f64> = (0..NUM_SITES).map(|site| 0.5 + 0.3 * site as f64).collect();
+        check_gradients(RateScaling::MeanRate, Some(&rates));
     }
 
     #[test]

@@ -202,6 +202,25 @@ fn map_objective(parents: &[i32], columns: &[&[u8]], prior: &Prior, x: &[f64], s
     (result.log_likelihood + log_prior_S + log_prior_pi.iter().sum::<f64>(), gradient)
 }
 
+/// The two step light PMSF initialization with the Mu of the log exchangeabilities log_S: light PMSF frequencies on
+/// the input tree, the branch lengths optimized for them, light PMSF frequencies on these branch lengths. Returns
+/// the site frequencies and the branch lengths.
+pub fn light_pmsf_init(
+    parents: &[i32],
+    columns: &[&[u8]],
+    log_S: &[f64],
+    branch_lengths: &[f64],
+    convergence: Convergence,
+    site_weights: Option<&[f64]>,
+) -> (Vec<SVector<f64, 20>>, Vec<f64>) {
+    let Mu = Mu(log_S);
+    let site_freq = light_pmsf(parents, columns, &Mu, crate::data::UDM256, crate::data::UDM256_WEIGHTS, branch_lengths);
+    let log_pi: Vec<SVector<f64, 20>> = site_freq.iter().map(|f| f.map(f64::ln)).collect();
+    let branch_lengths = optimize_branch_lengths(parents, columns, &Mu, &log_pi, branch_lengths, convergence, site_weights);
+    let site_freq = light_pmsf(parents, columns, &Mu, crate::data::UDM256, crate::data::UDM256_WEIGHTS, &branch_lengths);
+    (site_freq, branch_lengths)
+}
+
 pub struct MapEstimate {
     pub log_S: Vec<f64>,
     pub branch_lengths: Vec<f64>,
@@ -222,12 +241,7 @@ pub fn map_estimate(
     site_weights: Option<&[f64]>,
 ) -> MapEstimate {
     let num_sites = columns.len();
-    let prior_Mu = Mu(&prior.log_exchangeabilities);
-
-    let site_freq = light_pmsf(parents, columns, &prior_Mu, crate::data::UDM256, crate::data::UDM256_WEIGHTS, branch_lengths);
-    let log_pi: Vec<SVector<f64, 20>> = site_freq.iter().map(|f| f.map(f64::ln)).collect();
-    let branch_lengths = optimize_branch_lengths(parents, columns, &prior_Mu, &log_pi, branch_lengths, convergence, site_weights);
-    let site_freq = light_pmsf(parents, columns, &prior_Mu, crate::data::UDM256, crate::data::UDM256_WEIGHTS, &branch_lengths);
+    let (site_freq, branch_lengths) = light_pmsf_init(parents, columns, &prior.log_exchangeabilities, branch_lengths, convergence, site_weights);
 
     // x = [log exchangeabilities, Helmert coordinates of every site, log branch lengths]
     let num_coordinates = num_sites * NUM_COORDINATES;

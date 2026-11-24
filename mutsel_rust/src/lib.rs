@@ -2,6 +2,7 @@
 
 pub mod batch;
 pub mod data;
+pub mod gen_normal;
 mod helmert;
 pub mod hmc;
 mod hyperprior;
@@ -32,12 +33,11 @@ pub extern "C" fn rust_set_rayon_threads(num_threads: u32) {
 /// parents: [num_nodes]
 /// branch_lengths: [num_nodes]
 /// alignment: [num_sites * num_leaves] (row-major)
-/// model_str: MUTSEL{tau/rank/lambda}, see ModelParameters
-/// num_tree_draws: 1 returns the posterior mean site model of every site, more returns that many posterior draws
-/// per site (MUTSEL_TREE_DRAWS_MODE, see hmc::tree_draw_selection), which IQ-TREE uses as a weighted mixture
+/// model_str: MUTSEL{pi_reg/mu_reg/rate_reg}, the generalized-normal model (see gen_normal.rs)
+/// num_tree_draws: the number of models per site, all the MAP site model with weight 1 / num_tree_draws
 /// out_site_freq: [num_sites * num_tree_draws * 20] (row-major), the site frequencies of the models
 /// out_rate_matrix: [num_sites * num_tree_draws * 190] (row-major), the upper triangle of their rate matrices
-/// seed: the random seed of the sampling (IQ-TREE's -seed), overridden by MUTSEL_HMC_SEED
+/// seed: unused (the MAP estimate is deterministic)
 /// out_draw_weights: [num_sites * num_tree_draws], the weights of the draws of every site (summing to 1)
 /// out variables do not need to be initialized
 #[unsafe(no_mangle)]
@@ -98,13 +98,13 @@ pub unsafe extern "C" fn rust_mutsel(
     let model_cstr = unsafe { std::ffi::CStr::from_ptr(model_str) };
     let model_str = model_cstr.to_str().unwrap();
 
-    // The prior is the default prior or the file in MUTSEL_PRIOR (see prior.rs), the hierarchical prior and the
-    // weight of the site-frequency prior are set in the model string
-    let model = ModelParameters::parse(model_str).unwrap_or_else(|e| panic!("{}", e));
+    // The generalized-normal model: the strengths of the priors are set in the model string, the prior exchangeabilities
+    // are those of the default prior or the file in MUTSEL_PRIOR
+    let parameters = gen_normal::Parameters::parse(model_str).unwrap_or_else(|e| panic!("{}", e));
+    let _ = seed;
     println!("Starting mutsel optimization");
 
-    // Posterior sampling of the site frequencies (their Helmert coordinates) with Mu and the branch lengths from EM
-    let (S, sqrt_pi, weights) = hmc::sample_internal(
+    let (S, sqrt_pi, weights) = gen_normal::run(
         parents,
         branch_lengths,
         alignment,
@@ -112,9 +112,8 @@ pub unsafe extern "C" fn rust_mutsel(
         num_leaves as usize,
         crate::Verbosity::from_u8(verbose),
         out_prefix,
-        model,
+        parameters,
         num_tree_draws as usize,
-        seed,
     )
     .unwrap();
 

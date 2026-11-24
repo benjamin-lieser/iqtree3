@@ -62,19 +62,19 @@ fn alignment_columns(alignment: &[u8], num_leaves: usize) -> Vec<&[u8]> {
 
 /// The distinct columns (patterns) of an alignment: identical columns have the same posterior, so every pattern
 /// is sampled once and counts as many times as it occurs in the EM and the prior fit.
-struct Patterns {
+pub(crate) struct Patterns {
     /// [num_patterns * num_leaves], in the order of their first column
-    alignment: Vec<u8>,
+    pub(crate) alignment: Vec<u8>,
     /// Number of columns of every pattern
-    counts: Vec<f64>,
+    pub(crate) counts: Vec<f64>,
     /// Pattern of every column
-    site_to_pattern: Vec<usize>,
+    pub(crate) site_to_pattern: Vec<usize>,
     /// First column of every pattern
-    first_site: Vec<usize>,
+    pub(crate) first_site: Vec<usize>,
 }
 
 impl Patterns {
-    fn new(alignment: &[u8], num_leaves: usize) -> Patterns {
+    pub(crate) fn new(alignment: &[u8], num_leaves: usize) -> Patterns {
         let mut index: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
         let mut patterns = Patterns { alignment: Vec::new(), counts: Vec::new(), site_to_pattern: Vec::new(), first_site: Vec::new() };
         for (site, column) in alignment.chunks_exact(num_leaves).enumerate() {
@@ -90,17 +90,17 @@ impl Patterns {
         patterns
     }
 
-    fn num_patterns(&self) -> usize {
+    pub(crate) fn num_patterns(&self) -> usize {
         self.counts.len()
     }
 
     /// Per-pattern values for every column
-    fn expand<T: Clone>(&self, values: &[T]) -> Vec<T> {
+    pub(crate) fn expand<T: Clone>(&self, values: &[T]) -> Vec<T> {
         self.site_to_pattern.iter().map(|&p| values[p].clone()).collect()
     }
 
     /// Per-pattern rows of `width` values for every column
-    fn expand_rows<T: Clone>(&self, values: &[T], width: usize) -> Vec<T> {
+    pub(crate) fn expand_rows<T: Clone>(&self, values: &[T], width: usize) -> Vec<T> {
         self.site_to_pattern.iter().flat_map(|&p| values[p * width..(p + 1) * width].iter().cloned()).collect()
     }
 }
