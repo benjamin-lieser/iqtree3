@@ -1,16 +1,14 @@
 #![allow(non_snake_case)]
 
-pub mod batch;
-pub mod data;
-pub mod gen_normal;
-mod helmert;
-pub mod hmc;
-mod hyperprior;
+mod batch;
+mod data;
+mod gen_normal;
 mod io;
 mod lbfgs;
-pub mod model;
-pub mod npz;
-pub mod optimization;
+mod model;
+mod npz;
+mod optimization;
+mod pca;
 mod prior;
 
 use std::{io::Write, mem::MaybeUninit};
@@ -140,69 +138,6 @@ pub unsafe extern "C" fn rust_mutsel(
     io::restore_stdout_stderr(saved_stdout, saved_stderr, tee_handle);
 }
 
-/// Parameters of the model string MUTSEL{tau/rank/lambda} (case-insensitive name, ',' also separates them, but
-/// needs quotes in a shell). Trailing ones can be left out: MUTSEL, MUTSEL{tau} and MUTSEL{tau/rank} use the defaults.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelParameters {
-    /// tau, the strength of the prior file as hyperprior of the prior learned per alignment, in pseudo-sites (default
-    /// 1000). 0 learns the prior from the alignment alone, without regularization; inf keeps the prior file fixed.
-    pub prior_strength: f64,
-    /// Rank of the low-rank part of the covariances of the learned prior, 0 to 19 (default 3)
-    pub prior_rank: usize,
-    /// lambda > 0, the power of the site-frequency prior in the posterior of every site (default 1): below 1 it is
-    /// weaker, above 1 stronger than the (learned) prior. The prior of the site rates is not affected.
-    pub site_frequency_weight: f64,
-}
-
-impl Default for ModelParameters {
-    fn default() -> Self {
-        ModelParameters {
-            prior_strength: hyperprior::LearnSettings::DEFAULT_STRENGTH,
-            prior_rank: hyperprior::LearnSettings::DEFAULT_RANK,
-            site_frequency_weight: 1.0,
-        }
-    }
-}
-
-impl ModelParameters {
-    pub fn parse(model: &str) -> std::result::Result<ModelParameters, String> {
-        let model = model.trim();
-        let usage = || {
-            format!(
-                "invalid model {}: use MUTSEL{{tau/rank/lambda}}, trailing ones can be left out, e.g. MUTSEL, MUTSEL{{1000}}, \
-                 MUTSEL{{1000/3/0.5}} (tau >= 0, 0 to learn the prior from the alignment alone, inf to keep it fixed; \
-                 rank 0 to 19; lambda > 0, the power of the site-frequency prior)",
-                model
-            )
-        };
-        let mut parameters = ModelParameters::default();
-        if model.len() < 6 || !model[..6].eq_ignore_ascii_case("MUTSEL") {
-            return Err(usage());
-        }
-        let rest = &model[6..];
-        if rest.is_empty() {
-            return Ok(parameters);
-        }
-        let values = rest.strip_prefix('{').and_then(|r| r.strip_suffix('}')).ok_or_else(usage)?;
-        let values: Vec<&str> = values.split([',', '/']).map(str::trim).collect();
-        if values.len() > 3 {
-            return Err(usage());
-        }
-        parameters.prior_strength = values[0].parse().map_err(|_| usage())?;
-        if let Some(rank) = values.get(1) {
-            parameters.prior_rank = rank.parse().map_err(|_| usage())?;
-        }
-        if let Some(weight) = values.get(2) {
-            parameters.site_frequency_weight = weight.parse().map_err(|_| usage())?;
-        }
-        let weight = parameters.site_frequency_weight;
-        if !(parameters.prior_strength >= 0.0) || parameters.prior_rank > helmert::NUM_COORDINATES || !(weight > 0.0 && weight.is_finite()) {
-            return Err(usage());
-        }
-        Ok(parameters)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Verbosity {
     Quiet,
@@ -228,31 +163,5 @@ impl Verbosity {
     /// enables everything gated at Min. Quiet never prints.
     fn should_print(&self, level: Verbosity) -> bool {
         *self != Verbosity::Quiet && *self >= level
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ModelParameters;
-
-    #[test]
-    fn model_string() {
-        let parse = |s| ModelParameters::parse(s).map(|p| (p.prior_strength, p.prior_rank, p.site_frequency_weight));
-        assert_eq!(parse("MUTSEL"), Ok((1000.0, 3, 1.0)));
-        assert_eq!(parse(" mutsel "), Ok((1000.0, 3, 1.0)));
-        assert_eq!(parse("MUTSEL{100}"), Ok((100.0, 3, 1.0)));
-        assert_eq!(parse("MUTSEL{2.5e3, 5}"), Ok((2500.0, 5, 1.0)));
-        assert_eq!(parse("MUTSEL{inf}"), Ok((f64::INFINITY, 3, 1.0)));
-        assert_eq!(parse("MUTSEL{1000,19}"), Ok((1000.0, 19, 1.0)));
-        assert_eq!(parse("MUTSEL{300/0}"), Ok((300.0, 0, 1.0)));
-        assert_eq!(parse("MUTSEL{0}"), Ok((0.0, 3, 1.0)));
-        assert_eq!(parse("MUTSEL{inf/5}"), Ok((f64::INFINITY, 5, 1.0)));
-        assert_eq!(parse("MUTSEL{1000/3/0.5}"), Ok((1000.0, 3, 0.5)));
-        assert_eq!(parse("MUTSEL{inf,3,2}"), Ok((f64::INFINITY, 3, 2.0)));
-        for bad in ["MUTSEL{}", "MUTSEL{-1}", "MUTSEL{-inf}", "MUTSEL{nan}", "MUTSEL{1000,20}", "MUTSEL{1000/3/0}",
-                    "MUTSEL{1000/3/-1}", "MUTSEL{1000/3/inf}", "MUTSEL{1000/3/1/1}", "MUTSEL{1000//0.5}", "MUTSEL{1000,-3}",
-                    "MUTSEL{1000", "MUTSEL+G4", "LG"] {
-            assert!(parse(bad).is_err(), "{} parsed", bad);
-        }
     }
 }

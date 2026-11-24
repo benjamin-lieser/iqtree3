@@ -102,7 +102,7 @@ mod tests {
     use super::*;
 
     fn test_Mu() -> SMatrix<f64, 20, 20> {
-        crate::optimization::Mu(&crate::prior::tests::test_prior().log_exchangeabilities)
+        crate::optimization::Mu(&crate::prior::tests::test_log_exchangeabilities())
     }
 
     fn test_log_pi() -> SVector<f64, 20> {

@@ -44,26 +44,11 @@ impl Array {
         Array::new(&[rows.len(), N], rows.iter().flat_map(|row| row.iter().copied()).collect())
     }
 
-    pub fn to_scalar(&self) -> Result<f64> {
-        if self.data.len() != 1 {
-            return Err(format!("expected a scalar, got shape {:?}", self.shape).into());
-        }
-        Ok(self.data[0])
-    }
-
     pub fn to_matrix<const R: usize, const C: usize>(&self) -> Result<SMatrix<f64, R, C>> {
         if self.shape != [R, C] {
             return Err(format!("expected shape [{}, {}], got {:?}", R, C, self.shape).into());
         }
         Ok(SMatrix::<f64, R, C>::from_row_slice(&self.data))
-    }
-
-    /// The rows of an array whose last dimension is N, over all other dimensions in C order
-    pub fn rows<const N: usize>(&self) -> Result<Vec<SVector<f64, N>>> {
-        if self.shape.last() != Some(&N) {
-            return Err(format!("expected the last dimension {}, got shape {:?}", N, self.shape).into());
-        }
-        Ok(self.data.chunks_exact(N).map(SVector::<f64, N>::from_column_slice).collect())
     }
 }
 
@@ -102,10 +87,6 @@ impl Npz {
         self.arrays
             .get(name)
             .ok_or_else(|| format!("{} not found in {}", name, self.path.display()).into())
-    }
-
-    pub fn get_opt(&self, name: &str) -> Option<&Array> {
-        self.arrays.get(name)
     }
 }
 

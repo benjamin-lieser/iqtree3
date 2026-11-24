@@ -7,8 +7,6 @@ edition = "2024"
 phylo_grad = { git = "https://github.com/soedinglab/phylo_grad", branch = "main" }
 rayon = "1.11.0"
 libc = "0.2.182"
-nuts-rs = { git = "https://github.com/benjamin-lieser/nuts-rs", branch = "persistent-chain" }
-thiserror = "2.0.20"
 zip = { version = "9.2.0", default-features = false, features = ["deflate"] }
 
 [lib]

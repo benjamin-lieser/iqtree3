@@ -1,5 +1,4 @@
-//! The MAP estimate of Mu, the site frequencies and the branch lengths which the Monte Carlo EM starts from
-//! (see hmc::fit_with_em), initialized with the light PMSF procedure, and the parametrization of Mu.
+//! The parametrization of Mu and the light PMSF initialization of the MAP estimate (see gen_normal.rs).
 //!
 //! Mu is parametrized by the log exchangeabilities log S_ij of the entries (i, j), i > j, in row-major order,
 //! with the mutation equilibrium fixed to data::M_EQUI.
@@ -7,13 +6,7 @@
 use phylo_grad::nalgebra::{SMatrix, SVector};
 use rayon::prelude::*;
 
-use crate::{
-    Verbosity, batch,
-    data::M_EQUI,
-    helmert::{self, NUM_COORDINATES},
-    lbfgs::maximize_finite,
-    prior::Prior,
-};
+use crate::{batch, data::M_EQUI, lbfgs::maximize_finite};
 
 /// Number of log exchangeabilities
 pub const NUM_EXCHANGEABILITIES: usize = 190;
@@ -106,8 +99,7 @@ pub fn light_pmsf(
         .collect()
 }
 
-/// Branch lengths maximizing the log likelihood with Mu and the site frequencies fixed (the rate matrices
-/// normalized to a mean substitution rate of 1)
+/// Branch lengths maximizing the log likelihood with Mu and the site frequencies fixed
 fn optimize_branch_lengths(
     parents: &[i32],
     columns: &[&[u8]],
@@ -127,7 +119,6 @@ fn optimize_branch_lengths(
                 Mu,
                 log_pi,
                 &branch_lengths,
-                batch::RateScaling::MeanRate,
                 None,
                 site_weights,
             );
@@ -150,56 +141,11 @@ pub struct Convergence {
 }
 
 impl Convergence {
-    /// Criteria of the MAP estimate and the branch lengths of the light PMSF initialization
+    /// Criteria of the MAP estimate and of the branch lengths of the light PMSF initialization
     pub const MAP: Convergence = Convergence {
         max_iterations: 500,
         min_rel_improvement: 1e-7,
     };
-}
-
-/// Log posterior of the MAP estimate (log likelihood with the rate matrices normalized to a mean substitution rate
-/// of 1 plus the log priors of the exchangeabilities and the site frequencies) and its gradient at
-/// x = [log exchangeabilities, Helmert coordinates of every site, log branch lengths]
-/// site_weights: the number of alignment columns of every site (pattern), None for 1
-fn map_objective(parents: &[i32], columns: &[&[u8]], prior: &Prior, x: &[f64], site_weights: Option<&[f64]>) -> (f64, Vec<f64>) {
-    let num_coordinates = columns.len() * NUM_COORDINATES;
-    let log_S = &x[..NUM_EXCHANGEABILITIES];
-    let coordinates = &x[NUM_EXCHANGEABILITIES..NUM_EXCHANGEABILITIES + num_coordinates];
-    let branch_lengths: Vec<f64> = x[NUM_EXCHANGEABILITIES + num_coordinates..].iter().map(|l| l.exp()).collect();
-    let basis = helmert::basis();
-    let log_pi: Vec<SVector<f64, 20>> = coordinates
-        .par_chunks_exact(NUM_COORDINATES)
-        .map(|c| helmert::coordinates_to_log_freq(&SVector::from_column_slice(c)))
-        .collect();
-    let result = batch::log_likelihood_and_gradients(
-        parents,
-        columns,
-        &Mu(log_S),
-        &log_pi,
-        &branch_lengths,
-        batch::RateScaling::MeanRate,
-        None,
-        site_weights,
-    );
-
-    let (log_prior_S, grad_log_prior_S) = prior.evaluate_exchangeabilities(log_S);
-    let mut gradient: Vec<f64> =
-        Mu_backward(log_S, &result.grad_Mu).iter().zip(&grad_log_prior_S).map(|(g, p)| g + p).collect();
-
-    let (log_prior_pi, grad_coordinates): (Vec<f64>, Vec<SVector<f64, NUM_COORDINATES>>) = coordinates
-        .par_chunks_exact(NUM_COORDINATES)
-        .zip(result.grad_log_pi.par_iter())
-        .enumerate()
-        .map(|(site, (c, grad_log_pi))| {
-            let w = site_weights.map_or(1.0, |w| w[site]);
-            let (log_prior, grad_log_prior) = prior.evaluate_site_frequencies(&SVector::from_column_slice(c));
-            (w * log_prior, basis * grad_log_pi + grad_log_prior * w)
-        })
-        .unzip();
-    gradient.extend(grad_coordinates.iter().flat_map(|g| g.iter().copied()));
-    gradient.extend(branch_lengths.iter().zip(&result.grad_branch_lengths).map(|(b, g)| g * b));
-
-    (result.log_likelihood + log_prior_S + log_prior_pi.iter().sum::<f64>(), gradient)
 }
 
 /// The two step light PMSF initialization with the Mu of the log exchangeabilities log_S: light PMSF frequencies on
@@ -221,67 +167,13 @@ pub fn light_pmsf_init(
     (site_freq, branch_lengths)
 }
 
-pub struct MapEstimate {
-    pub log_S: Vec<f64>,
-    pub branch_lengths: Vec<f64>,
-    pub coordinates: Vec<SVector<f64, NUM_COORDINATES>>,
-}
-
-/// Joint MAP estimate of Mu, the Helmert coordinates of every site and the branch lengths, with the rate matrices
-/// normalized to a mean substitution rate of 1 over the sites. Initialized with the prior Mu and the two step
-/// light PMSF procedure: light PMSF frequencies on the input tree, the branch lengths optimized for them, light
-/// PMSF frequencies on these branch lengths.
-pub fn map_estimate(
-    parents: &[i32],
-    columns: &[&[u8]],
-    branch_lengths: &[f64],
-    prior: &Prior,
-    convergence: Convergence,
-    verbosity: Verbosity,
-    site_weights: Option<&[f64]>,
-) -> MapEstimate {
-    let num_sites = columns.len();
-    let (site_freq, branch_lengths) = light_pmsf_init(parents, columns, &prior.log_exchangeabilities, branch_lengths, convergence, site_weights);
-
-    // x = [log exchangeabilities, Helmert coordinates of every site, log branch lengths]
-    let num_coordinates = num_sites * NUM_COORDINATES;
-    let mut x = prior.log_exchangeabilities.clone();
-    x.extend(site_freq.iter().flat_map(|f| helmert::log_freq_to_coordinates(&f.map(f64::ln)).iter().copied().collect::<Vec<_>>()));
-    x.extend(branch_lengths.iter().map(|b| b.ln()));
-
-    let start = std::time::Instant::now();
-    let num_evaluations = maximize_finite(
-        |x| Some(map_objective(parents, columns, prior, x, site_weights)),
-        &mut x,
-        convergence.max_iterations,
-        convergence.min_rel_improvement,
-    );
-    if verbosity.should_print(Verbosity::Min) {
-        println!(
-            "MUTSEL MAP estimate: {} evaluations ({:.1}s)",
-            num_evaluations,
-            start.elapsed().as_secs_f64()
-        );
-    }
-
-    MapEstimate {
-        log_S: x[..NUM_EXCHANGEABILITIES].to_vec(),
-        branch_lengths: x[NUM_EXCHANGEABILITIES + num_coordinates..].iter().map(|l| l.exp()).collect(),
-        coordinates: x[NUM_EXCHANGEABILITIES..NUM_EXCHANGEABILITIES + num_coordinates]
-            .chunks_exact(NUM_COORDINATES)
-            .map(SVector::from_column_slice)
-            .collect(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Log exchangeabilities away from those of the test prior
     fn perturbed_log_S() -> Vec<f64> {
-        crate::prior::tests::test_prior()
-            .log_exchangeabilities
+        crate::prior::tests::test_log_exchangeabilities()
             .iter()
             .zip(lower_indices())
             .map(|(l, (i, j))| l + 0.3 * ((i * 20 + j) as f64 * 0.73).sin())
@@ -328,19 +220,5 @@ mod tests {
         let fd = finite_differences(|log_S| Mu(log_S).component_mul(&G).sum(), &log_S, 1e-6);
         let gradient = Mu_backward(&log_S, &G);
         assert!(max_difference(&fd, &gradient) < 1e-8 * max_abs(&gradient));
-    }
-
-    #[test]
-    fn map_objective_gradient_matches_finite_differences() {
-        use crate::batch::tests::*;
-        let alignment = alignment();
-        let columns: Vec<&[u8]> = alignment.chunks_exact(NUM_LEAVES).collect();
-        let prior = crate::prior::tests::test_prior();
-        let mut x = perturbed_log_S();
-        x.extend(log_pi().iter().flat_map(|lp| helmert::log_freq_to_coordinates(lp).iter().copied().collect::<Vec<_>>()));
-        x.extend(branch_lengths().iter().map(|b| b.ln()));
-        let (_, gradient) = map_objective(&PARENTS, &columns, &prior, &x, None);
-        let fd = finite_differences(|x| map_objective(&PARENTS, &columns, &prior, x, None).0, &x, 1e-5);
-        assert!(max_difference(&fd, &gradient) < 1e-5 * max_abs(&gradient), "{}", max_difference(&fd, &gradient));
     }
 }
