@@ -96,8 +96,7 @@ pub unsafe extern "C" fn rust_mutsel(
     let model_cstr = unsafe { std::ffi::CStr::from_ptr(model_str) };
     let model_str = model_cstr.to_str().unwrap();
 
-    // The generalized-normal model: the strengths of the priors are set in the model string, the prior exchangeabilities
-    // are those of the default prior or the file in MUTSEL_PRIOR
+    // The generalized-normal model, the strengths of the priors are set in the model string
     let parameters = gen_normal::Parameters::parse(model_str).unwrap_or_else(|e| panic!("{}", e));
     let _ = seed;
     println!("Starting mutsel optimization");

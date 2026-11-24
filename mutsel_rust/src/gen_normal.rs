@@ -303,11 +303,11 @@ pub fn run(
     parameters: Parameters,
     num_tree_draws: usize,
 ) -> Result<(Vec<SMatrix<f64, 20, 20>>, Vec<SVector<f64, 20>>, Vec<f64>)> {
-    let mu_prior = ExchangeabilityPrior::from_env(parameters.mu_reg);
+    let mu_prior = ExchangeabilityPrior::new(parameters.mu_reg);
     let convergence = Convergence::MAP;
     println!(
         "MUTSEL generalized normal model: joint MAP estimate (L-BFGS, at most {} iterations, relative improvement {:.0e}) of Mu \
-         (around the prior exchangeabilities, strength mu_reg {}), the site frequencies (generalized normal prior on their PCA \
+         (around the exchangeabilities of prior v1.20, strength mu_reg {}), the site frequencies (generalized normal prior on their PCA \
          coordinates, strength pi_reg {}), {} and the branch lengths",
         convergence.max_iterations,
         convergence.min_rel_improvement,

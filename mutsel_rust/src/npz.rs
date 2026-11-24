@@ -1,13 +1,6 @@
-//! Reading and writing of numpy npz files with f64 arrays in C order.
-//!
-//! Arrays are written as '<f8' without compression. Reading also accepts '<f4', '<i4' and '<i8' arrays
-//! (converted to f64) and compressed files (np.savez_compressed).
+//! Writing of numpy npz files with f64 arrays in C order ('<f8', without compression).
 
-use std::{
-    collections::HashMap,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use std::{io::Write, path::Path};
 
 use phylo_grad::nalgebra::{SMatrix, SVector};
 
@@ -44,50 +37,6 @@ impl Array {
         Array::new(&[rows.len(), N], rows.iter().flat_map(|row| row.iter().copied()).collect())
     }
 
-    pub fn to_matrix<const R: usize, const C: usize>(&self) -> Result<SMatrix<f64, R, C>> {
-        if self.shape != [R, C] {
-            return Err(format!("expected shape [{}, {}], got {:?}", R, C, self.shape).into());
-        }
-        Ok(SMatrix::<f64, R, C>::from_row_slice(&self.data))
-    }
-}
-
-/// The arrays of an npz file
-pub struct Npz {
-    path: PathBuf,
-    arrays: HashMap<String, Array>,
-}
-
-impl Npz {
-    pub fn read(path: &Path) -> Result<Npz> {
-        let file = std::fs::File::open(path).map_err(|e| format!("Could not open {}: {}", path.display(), e))?;
-        Npz::from_reader(file, path)
-    }
-
-    /// An npz file in memory, `name` is used in error messages
-    pub fn from_bytes(bytes: &[u8], name: &str) -> Result<Npz> {
-        Npz::from_reader(std::io::Cursor::new(bytes), Path::new(name))
-    }
-
-    fn from_reader<R: std::io::Read + std::io::Seek>(reader: R, path: &Path) -> Result<Npz> {
-        let mut archive = zip::ZipArchive::new(reader)?;
-        let mut arrays = HashMap::new();
-        for index in 0..archive.len() {
-            let mut entry = archive.by_index(index)?;
-            let name = entry.name()?.trim_end_matches(".npy").to_string();
-            let mut bytes = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut bytes)?;
-            let array = parse_npy(&bytes).map_err(|e| format!("{} in {}: {}", name, path.display(), e))?;
-            arrays.insert(name, array);
-        }
-        Ok(Npz { path: path.to_path_buf(), arrays })
-    }
-
-    pub fn get(&self, name: &str) -> Result<&Array> {
-        self.arrays
-            .get(name)
-            .ok_or_else(|| format!("{} not found in {}", name, self.path.display()).into())
-    }
 }
 
 pub fn write_npz(path: &Path, arrays: &[(&str, &Array)]) -> Result<()> {
@@ -130,92 +79,48 @@ fn npy_bytes(array: &Array) -> Vec<u8> {
     bytes
 }
 
-fn parse_npy(bytes: &[u8]) -> std::result::Result<Array, String> {
-    if bytes.len() < 10 || &bytes[..6] != MAGIC {
-        return Err("not an npy array".to_string());
-    }
-    let (header_len, header_start) = match bytes[6] {
-        1 => (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10),
-        2 | 3 => (u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize, 12),
-        version => return Err(format!("npy version {} is not supported", version)),
-    };
-    let header = std::str::from_utf8(&bytes[header_start..header_start + header_len]).map_err(|e| e.to_string())?;
-    let field = |key: &str| -> std::result::Result<&str, String> {
-        let start = header.find(&format!("'{}':", key)).ok_or(format!("no {} in the header", key))? + key.len() + 3;
-        Ok(header[start..].trim_start())
-    };
-    let descr = field("descr")?;
-    let descr = &descr[1..descr[1..].find('\'').ok_or("invalid descr")? + 1];
-    if field("fortran_order")?.starts_with("True") {
-        return Err("Fortran order is not supported".to_string());
-    }
-    let shape = field("shape")?;
-    let shape: Vec<usize> = shape[1..shape.find(')').ok_or("invalid shape")?]
-        .split(',')
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-        .map(|d| d.parse::<usize>().map_err(|e| e.to_string()))
-        .collect::<std::result::Result<_, _>>()?;
-
-    let data = &bytes[header_start + header_len..];
-    let count: usize = shape.iter().product();
-    let convert = |size: usize, f: &dyn Fn(&[u8]) -> f64| -> std::result::Result<Vec<f64>, String> {
-        if data.len() < count * size {
-            return Err("the data is shorter than the shape".to_string());
-        }
-        Ok(data[..count * size].chunks_exact(size).map(f).collect())
-    };
-    let values = match descr {
-        "<f8" => convert(8, &|b| f64::from_le_bytes(b.try_into().unwrap()))?,
-        "<f4" => convert(4, &|b| f32::from_le_bytes(b.try_into().unwrap()) as f64)?,
-        "<i8" => convert(8, &|b| i64::from_le_bytes(b.try_into().unwrap()) as f64)?,
-        "<i4" => convert(4, &|b| i32::from_le_bytes(b.try_into().unwrap()) as f64)?,
-        _ => return Err(format!("dtype {} is not supported", descr)),
-    };
-    Ok(Array { shape, data: values })
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
+    use phylo_grad::nalgebra::SMatrix;
+
     use super::*;
 
+    /// Shape and data of an npy array as written by npy_bytes
+    fn parse_npy(bytes: &[u8]) -> (String, Vec<f64>) {
+        assert_eq!(&bytes[..8], b"\x93NUMPY\x01\x00");
+        let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        assert_eq!((10 + header_len) % 64, 0);
+        let header = std::str::from_utf8(&bytes[10..10 + header_len]).unwrap();
+        assert!(header.starts_with("{'descr': '<f8', 'fortran_order': False, 'shape': ") && header.ends_with('\n'));
+        let shape = header[header.find('(').unwrap()..=header.find(')').unwrap()].to_string();
+        let data = bytes[10 + header_len..].chunks_exact(8).map(|b| f64::from_le_bytes(b.try_into().unwrap())).collect();
+        (shape, data)
+    }
+
     #[test]
-    fn npz_roundtrip() {
+    fn npz_contains_the_arrays() {
         let dir = std::env::temp_dir().join(format!("mutsel_npz_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.npz");
         let matrix = SMatrix::<f64, 2, 3>::new(1.0, 2.0, 3.0, 4.0, 5.0, -6.5);
         let arrays = [
-            ("scalar", Array::scalar(1.5)),
-            ("vector", Array::vector(vec![1.0, f64::NEG_INFINITY, 3.0])),
-            ("matrix", Array::from_matrix(&matrix)),
-            ("empty", Array::new(&[0, 20], vec![])),
-            ("cube", Array::new(&[2, 1, 3], (0..6).map(|i| i as f64).collect())),
+            ("scalar", Array::scalar(1.5), "()"),
+            ("vector", Array::vector(vec![1.0, f64::NEG_INFINITY, 3.0]), "(3,)"),
+            ("matrix", Array::from_matrix(&matrix), "(2, 3)"),
+            ("empty", Array::new(&[0, 20], vec![]), "(0, 20)"),
         ];
-        write_npz(&path, &arrays.iter().map(|(n, a)| (*n, a)).collect::<Vec<_>>()).unwrap();
-        let npz = Npz::read(&path).unwrap();
-        for (name, array) in &arrays {
-            assert_eq!(npz.get(name).unwrap(), array, "{}", name);
+        write_npz(&path, &arrays.iter().map(|(n, a, _)| (*n, a)).collect::<Vec<_>>()).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(archive.len(), arrays.len());
+        for (name, array, shape) in &arrays {
+            let mut bytes = Vec::new();
+            archive.by_name(&format!("{}.npy", name)).unwrap().read_to_end(&mut bytes).unwrap();
+            assert_eq!(parse_npy(&bytes), (shape.to_string(), array.data.clone()), "{}", name);
         }
-        assert_eq!(npz.get("matrix").unwrap().data, vec![1.0, 2.0, 3.0, 4.0, 5.0, -6.5]);
-        assert_eq!(npz.get("matrix").unwrap().to_matrix::<2, 3>().unwrap(), matrix);
-        assert!(npz.get("missing").is_err());
+        // row-major
+        assert_eq!(arrays[2].1.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, -6.5]);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn parses_numpy_headers() {
-        // Header as written by numpy for np.arange(6, dtype=np.int32).reshape(2, 3)
-        let header = "{'descr': '<i4', 'fortran_order': False, 'shape': (2, 3), }";
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&[1, 0]);
-        bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
-        bytes.extend_from_slice(header.as_bytes());
-        for i in 0..6i32 {
-            bytes.extend_from_slice(&i.to_le_bytes());
-        }
-        let array = parse_npy(&bytes).unwrap();
-        assert_eq!(array.shape, vec![2, 3]);
-        assert_eq!(array.data, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
     }
 }
